@@ -635,19 +635,31 @@ export class LifecycleManager {
         await this.boat.execOk(tempId, project.bakeCmd, 900);
       }
 
+      // Upload settings template during `bake base` so `prepareAcpAgents` / `installProviders` see enabled providerInstances
+      if (isBase && this.config.t3.settingsFile && existsSync(this.config.t3.settingsFile)) {
+        await this.boat.upload(tempId, this.config.t3.settingsFile, "~/.t3-sentinel/t3-settings.json");
+      }
+
       // Ensure zero ephemeral Klav keys ever leak into a golden snapshot
       await this.boat.execOk(tempId, "rm -rf ~/.config/klav/agents", 30);
 
-      // Update t3, smoke-test t3 serve, capture real descriptor/session templates, then wipe ~/.t3/userdata
+      // Update t3, smoke-test t3 serve, optionally pre-prepare ACP agents & provider runtimes, capture templates, then wipe per-VM userdata
+      const bakeEnv = [
+        `T3_VERSION=${shellQuote(this.config.t3.version)}`,
+        `T3_CHANNEL=${shellQuote(this.config.t3.channel)}`,
+        `BAKE_CLEAN=1`,
+      ];
+      if (isBase && this.config.t3.prepareAcpAgents && this.config.t3.prepareAcpAgents.length > 0) {
+        bakeEnv.push(`T3_PREPARE_ACP_AGENTS=${shellQuote(this.config.t3.prepareAcpAgents.join(","))}`);
+      }
+      if (isBase && this.config.t3.installProviders && this.config.t3.installProviders.length > 0) {
+        bakeEnv.push(`T3_INSTALL_PROVIDERS=${shellQuote(this.config.t3.installProviders.join(","))}`);
+      }
+      const bakeProvisionTimeout = isBase && (this.config.t3.prepareAcpAgents?.length || this.config.t3.installProviders?.length) ? 900 : 300;
       const out = await this.boat.execOk(
         tempId,
-        [
-          `T3_VERSION=${shellQuote(this.config.t3.version)}`,
-          `T3_CHANNEL=${shellQuote(this.config.t3.channel)}`,
-          `BAKE_CLEAN=1`,
-          `bash ~/.t3-sentinel/provision-base.sh`,
-        ].join(" "),
-        300,
+        `${bakeEnv.join(" ")} bash ~/.t3-sentinel/provision-base.sh`,
+        bakeProvisionTimeout,
       );
       const parsed = lastJsonLine<{
         t3Version?: string;

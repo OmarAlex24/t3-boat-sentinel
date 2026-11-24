@@ -55,7 +55,13 @@ wait_for_t3() {
 }
 
 if [ "$BAKE_CLEAN" = "1" ]; then
-  # Smoke-test t3 serve & capture real descriptor + auth session templates before wiping userdata
+  # If a t3-settings.json template was uploaded for base bake, install it temporarily so provider setup sees enabled providers
+  if [ -f "$sentinel_dir/t3-settings.json" ]; then
+    cp "$sentinel_dir/t3-settings.json" "$userdata_dir/settings.json"
+    chmod 600 "$userdata_dir/settings.json"
+  fi
+
+  # Smoke-test t3 serve & capture real descriptor + auth session templates before wiping per-VM userdata
   "$t3" service install --allow-downgrade >/dev/null
   systemctl --user daemon-reload
   systemctl --user restart t3code.service
@@ -66,6 +72,95 @@ if [ "$BAKE_CLEAN" = "1" ]; then
   auth_session="$(curl -sf --max-time 5 -H "Authorization: Bearer $smoke_token" http://127.0.0.1:3773/api/auth/session || echo '{}')"
   ver="$("$t3" --version 2>/dev/null || echo unknown)"
 
+  # Optionally pre-prepare ACP Registry agents (e.g. devin) and managed provider runtimes (e.g. antigravity)
+  if [ -n "${T3_PREPARE_ACP_AGENTS:-}" ] || [ -n "${T3_INSTALL_PROVIDERS:-}" ]; then
+    js_runner="node"
+    if command -v bun >/dev/null 2>&1; then js_runner="bun"; elif [ -x "$HOME/.bun/bin/bun" ]; then js_runner="$HOME/.bun/bin/bun"; fi
+    SMOKE_TOK="$smoke_token" ACP_LIST="${T3_PREPARE_ACP_AGENTS:-}" PROV_LIST="${T3_INSTALL_PROVIDERS:-}" "$js_runner" -e '
+      (async () => {
+      const tok = process.env.SMOKE_TOK;
+      const acpAgents = (process.env.ACP_LIST || "").split(",").map(s => s.trim()).filter(Boolean);
+      const installProvs = (process.env.PROV_LIST || "").split(",").map(s => s.trim()).filter(Boolean);
+      if (typeof WebSocket === "undefined") {
+        console.error("[bake] WebSocket global unavailable in JS runtime; skipping provider pre-install");
+        process.exit(0);
+      }
+      const tickRes = await fetch("http://127.0.0.1:3773/api/auth/websocket-ticket/rpc", {
+        method: "POST",
+        headers: { authorization: "Bearer " + tok },
+      });
+      if (!tickRes.ok) throw new Error("ws ticket failed: HTTP " + tickRes.status);
+      const { ticket } = await tickRes.json();
+      const ws = new WebSocket("ws://127.0.0.1:3773/ws?wsTicket=" + encodeURIComponent(ticket) + "&orchestrationProtocol=2");
+      await new Promise((res, rej) => {
+        ws.addEventListener("open", res);
+        ws.addEventListener("error", () => rej(new Error("local t3 ws failed")));
+      });
+      let seq = 1;
+      const waiters = new Map();
+      const streamHandlers = new Map();
+      ws.addEventListener("message", (ev) => {
+        const raw = JSON.parse(String(ev.data));
+        const frames = Array.isArray(raw) ? raw : [raw];
+        for (const f of frames) {
+          if (f._tag === "Ping") { ws.send(JSON.stringify({ _tag: "Pong" })); continue; }
+          const id = String(f.requestId ?? "");
+          if (f._tag === "Chunk" && streamHandlers.has(id)) {
+            ws.send(JSON.stringify({ _tag: "Ack", requestId: f.requestId }));
+            streamHandlers.get(id)(f.values || []);
+          } else if (f._tag === "Exit" && waiters.has(id)) {
+            const w = waiters.get(id);
+            waiters.delete(id);
+            w(f.exit);
+          }
+        }
+      });
+      function callUnary(tag, payload, timeoutMs = 600000) {
+        const id = seq++;
+        return new Promise((resolve, reject) => {
+          const t = setTimeout(() => { waiters.delete(String(id)); reject(new Error(tag + " timed out")); }, timeoutMs);
+          waiters.set(String(id), (exit) => {
+            clearTimeout(t);
+            if (exit && exit._tag === "Success") resolve(exit.value);
+            else reject(new Error(tag + " failed: " + JSON.stringify(exit)));
+          });
+          ws.send(JSON.stringify({ _tag: "Request", id, tag, payload, headers: [] }));
+        });
+      }
+      for (const agentId of acpAgents) {
+        console.error("[bake] preparing ACP Registry agent: " + agentId + "...");
+        const res = await callUnary("server.prepareAcpRegistryAgent", { agentId }, 300000);
+        console.error("[bake] prepared ACP agent " + agentId + ": " + JSON.stringify(res));
+      }
+      for (const instanceId of installProvs) {
+        console.error("[bake] installing managed provider runtime: " + instanceId + "...");
+        const subId = seq++;
+        let doneResolve, doneReject;
+        const donePromise = new Promise((res, rej) => { doneResolve = res; doneReject = rej; });
+        const t = setTimeout(() => doneReject(new Error("provider install timed out: " + instanceId)), 600000);
+        streamHandlers.set(String(subId), (vals) => {
+          for (const st of vals) {
+            if (!st || typeof st !== "object") continue;
+            console.error("[bake] provider " + instanceId + " phase=" + st.phase + (st.message ? " (" + st.message + ")" : ""));
+            if (st.phase === "succeeded") { clearTimeout(t); doneResolve(st); }
+            else if (st.phase === "failed" || st.phase === "cancelled") { clearTimeout(t); doneReject(new Error(st.error || st.message || st.phase)); }
+          }
+        });
+        ws.send(JSON.stringify({ _tag: "Request", id: subId, tag: "provider.install.subscribe", payload: { instanceId }, headers: [] }));
+        const startState = await callUnary("provider.install.start", { instanceId }, 120000);
+        console.error("[bake] provider.install.start(" + instanceId + ") -> phase=" + startState?.phase);
+        if (startState?.phase === "succeeded") { clearTimeout(t); doneResolve(startState); }
+        else if (startState?.phase === "failed") { clearTimeout(t); doneReject(new Error(startState.error || "failed")); }
+        await donePromise;
+        ws.send(JSON.stringify({ _tag: "Interrupt", requestId: subId }));
+        streamHandlers.delete(String(subId));
+        console.error("[bake] provider runtime ready: " + instanceId);
+      }
+      ws.close();
+      })().catch((err) => { console.error("[bake] provider pre-install error:", err); process.exit(1); });
+    '
+  fi
+
   # Stop services and wipe per-VM userdata (DB, environment-id, tokens, logs, worktrees, settings)
   # while preserving cached provider/ACP tool binaries (`providers/`, `cache/`, `tools/`, `acp-registry/`)
   systemctl --user stop t3code.service 2>/dev/null || true
@@ -75,7 +170,7 @@ if [ "$BAKE_CLEAN" = "1" ]; then
     "$userdata_dir/server-owner.sqlite" "$userdata_dir/server-owner.sqlite-journal" \
     "$userdata_dir/environment-id" "$userdata_dir/settings.json" "$userdata_dir/keybindings.json" \
     "$userdata_dir/logs" "$userdata_dir/worktrees" "$userdata_dir/attachments" "$userdata_dir/auth" \
-    "$sentinel_dir/watchdog.json" "$sentinel_dir/boot-secrets.json" "$sentinel_dir/saw-thread" \
+    "$sentinel_dir/watchdog.json" "$sentinel_dir/boot-secrets.json" "$sentinel_dir/t3-settings.json" "$sentinel_dir/saw-thread" \
     "$HOME/.klav-forward" "$units/t3code.service.d/klav-env.conf"
   mkdir -p "$userdata_dir"
 
