@@ -618,3 +618,325 @@ describe("MCP server handlers", () => {
     });
   });
 });
+
+describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", () => {
+  const cleanups: Array<() => void> = [];
+  afterEach(() => {
+    while (cleanups.length) cleanups.pop()!();
+  });
+
+  function startFakeVmT3Server(vmTag: string) {
+    const seenMethods: Array<{ tag: string; payload: unknown }> = [];
+    const vmProjectId = `vm-proj-${vmTag}`;
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req, srv) {
+        const url = new URL(req.url);
+        if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
+          srv.upgrade(req);
+          return undefined;
+        }
+        if (url.pathname === "/api/orchestration/shell") {
+          return Response.json({
+            projects: [{ id: vmProjectId, title: "my-app", workspaceRoot: "/home/user/my-app" }],
+            threads: [],
+          });
+        }
+        return Response.json({ ok: true, vmTag });
+      },
+      websocket: {
+        message(ws, raw) {
+          const frame = JSON.parse(String(raw)) as { _tag: string; id?: string; tag?: string; payload?: Record<string, unknown> };
+          if (frame._tag === "Ping") {
+            ws.sendText(JSON.stringify({ _tag: "Pong" }));
+            return;
+          }
+          if (frame._tag !== "Request" || !frame.id || !frame.tag) return;
+          seenMethods.push({ tag: frame.tag, payload: frame.payload });
+
+          if (frame.tag === "orchestration.subscribeShell") {
+            ws.sendText(
+              JSON.stringify({
+                _tag: "Chunk",
+                requestId: frame.id,
+                values: [
+                  {
+                    kind: "snapshot",
+                    snapshot: {
+                      schemaVersion: 2,
+                      snapshotSequence: 1,
+                      projects: [{ id: vmProjectId, title: "my-app", workspaceRoot: "/home/user/my-app" }],
+                      threads: [],
+                      archivedThreads: [],
+                    },
+                  },
+                ],
+              }),
+            );
+            return;
+          }
+          if (frame.tag === "server.getConfig") {
+            ws.sendText(
+              JSON.stringify({
+                _tag: "Exit",
+                requestId: frame.id,
+                exit: {
+                  _tag: "Success",
+                  value: { providers: [{ instanceId: "claudeAgent", status: "ready" }], settings: {} },
+                },
+              }),
+            );
+            return;
+          }
+          if (frame.tag === "subscribeServerLifecycle") {
+            ws.sendText(
+              JSON.stringify({
+                _tag: "Chunk",
+                requestId: frame.id,
+                values: [{ version: 1, sequence: 1, type: "ready", payload: {} }],
+              }),
+            );
+            return;
+          }
+          if (frame.tag === "orchestration.launchThread") {
+            const p = frame.payload ?? {};
+            const threadId = String(p.threadId);
+            const threadShell = {
+              id: threadId,
+              projectId: vmProjectId,
+              title: String(p.title ?? "Chat"),
+              worktreePath: `/home/user/.t3/worktrees/my-app/${vmTag}-${threadId}`,
+              status: "running",
+            };
+            ws.sendText(
+              JSON.stringify({
+                _tag: "Exit",
+                requestId: frame.id,
+                exit: {
+                  _tag: "Success",
+                  value: {
+                    threadId,
+                    projection: { thread: threadShell },
+                    resumed: false,
+                    sequence: 2,
+                  },
+                },
+              }),
+            );
+            // Also emit live shell delta
+            ws.sendText(
+              JSON.stringify({
+                _tag: "Chunk",
+                requestId: "hub-shell",
+                values: [{ kind: "thread.updated", sequence: 2, location: "active", thread: threadShell }],
+              }),
+            );
+            return;
+          }
+          if (frame.tag === "terminal.open") {
+            ws.sendText(
+              JSON.stringify({
+                _tag: "Exit",
+                requestId: frame.id,
+                exit: { _tag: "Success", value: { terminalId: `term-${vmTag}`, vmTag } },
+              }),
+            );
+            return;
+          }
+          ws.sendText(
+            JSON.stringify({
+              _tag: "Exit",
+              requestId: frame.id,
+              exit: { _tag: "Success", value: { vmTag, tag: frame.tag } },
+            }),
+          );
+        },
+      },
+    });
+    return { server, url: `http://127.0.0.1:${server.port}`, seenMethods, vmProjectId };
+  }
+
+  test("spawns 1 fresh Boat VM per chat behind 1 single Environment, routes RPCs strictly to owning VM, and destroys only the settled VM", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-hub-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+
+    const vm1 = startFakeVmT3Server("vm1");
+    const vm2 = startFakeVmT3Server("vm2");
+    cleanups.push(() => vm1.server.stop(true));
+    cleanups.push(() => vm2.server.stop(true));
+
+    const fakeLlmUpstream = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch() {
+        return Response.json({ ok: true });
+      },
+    });
+    cleanups.push(() => fakeLlmUpstream.stop(true));
+
+    const boat = new MockBoat();
+    boat.snapshots.add("base-t3");
+    boat.snapshots.add("env-my-app");
+    const origHostPublic = boat.hostPublic.bind(boat);
+    boat.hostPublic = async (id: string) => {
+      if (id === "sb-1") return vm1.url;
+      if (id === "sb-2") return vm2.url;
+      return origHostPublic(id);
+    };
+
+    const cfg: SentinelConfig = {
+      ...makeTestConfig(0),
+      stateDir: dir,
+      hub: { host: "boat.boat.example.com", label: "Boat", maxSandboxes: 5 },
+      llmProxy: {
+        host: "boat-llm.boat.example.com",
+        upstreamUrl: `http://127.0.0.1:${fakeLlmUpstream.port}`,
+        upstreamApiKey: "real-secret-key",
+      },
+    };
+
+    const handle = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+    cleanups.push(() => handle.stop());
+    const base = `http://127.0.0.1:${handle.server.port}`;
+
+    // 1. Pair ONCE to the single unified Hub environment
+    const pairRes = await fetch(`${base}/api/pair`, {
+      method: "POST",
+      headers: { host: cfg.controlHost, authorization: `Bearer ${cfg.controlSecret}`, "content-type": "application/json" },
+      body: JSON.stringify({ slot: "hub" }),
+    });
+    const pairData = (await pairRes.json()) as { code: string; url: string };
+    expect(pairData.url).toContain("https://boat.boat.example.com/pair#token=");
+
+    const tokenRes = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: { host: "boat.boat.example.com", "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ subject_token: pairData.code, client_label: "Mac" }),
+    });
+    const { access_token: bearer } = (await tokenRes.json()) as { access_token: string };
+    expect(bearer).toBeTruthy();
+
+    const ticketRes = await fetch(`${base}/api/auth/websocket-ticket/rpc`, {
+      method: "POST",
+      headers: { host: "boat.boat.example.com", authorization: `Bearer ${bearer}` },
+    });
+    const { ticket } = (await ticketRes.json()) as { ticket: string };
+
+    // 2. Open ONE WebSocket to the unified Hub
+    const ws = new WebSocket(`ws://127.0.0.1:${handle.server.port}/ws?wsTicket=${ticket}&orchestrationProtocol=2`, {
+      headers: { host: "boat.boat.example.com" },
+    } as unknown as string[]);
+    cleanups.push(() => ws.close());
+
+    const inbox: Array<Record<string, unknown>> = [];
+    const waiters: Array<() => void> = [];
+    await new Promise<void>((resolve, reject) => {
+      ws.addEventListener("open", () => resolve());
+      ws.addEventListener("error", () => reject(new Error("hub ws failed")));
+      ws.addEventListener("message", (ev) => {
+        inbox.push(JSON.parse(String(ev.data)) as Record<string, unknown>);
+        for (const w of waiters.splice(0)) w();
+      });
+    });
+
+    const waitForFrame = async (pred: (f: Record<string, unknown>) => boolean, timeoutMs = 5_000) => {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        const idx = inbox.findIndex(pred);
+        if (idx >= 0) return inbox.splice(idx, 1)[0];
+        await new Promise<void>((r) => {
+          waiters.push(r);
+          setTimeout(r, 50);
+        });
+      }
+      throw new Error(`Timed out waiting for WS frame; inbox=${JSON.stringify(inbox)}`);
+    };
+
+    // 3. Subscribe to shell with 0 VMs running -> gets permanent hubProjectId
+    ws.send(JSON.stringify({ _tag: "Request", id: "shell-1", tag: "orchestration.subscribeShell", payload: { requestCompletionMarker: true }, headers: [] }));
+    const shellChunk = await waitForFrame((f) => f._tag === "Chunk" && f.requestId === "shell-1");
+    const snapItem = (shellChunk.values as Array<Record<string, unknown>>)[0];
+    expect(snapItem.kind).toBe("snapshot");
+    const projects = ((snapItem.snapshot as Record<string, unknown>).projects as Array<Record<string, unknown>>);
+    expect(projects.length).toBe(1);
+    const hubProjectId = String(projects[0].id);
+
+    // 4. Launch TWO parallel chats on the SAME Hub -> spawns sb-1 and sb-2!
+    ws.send(JSON.stringify({
+      _tag: "Request",
+      id: "launch-a",
+      tag: "orchestration.launchThread",
+      payload: { threadId: "thread-A", projectId: hubProjectId, title: "Chat A", workspaceStrategy: { type: "root" } },
+      headers: [],
+    }));
+    ws.send(JSON.stringify({
+      _tag: "Request",
+      id: "launch-b",
+      tag: "orchestration.launchThread",
+      payload: { threadId: "thread-B", projectId: hubProjectId, title: "Chat B", workspaceStrategy: { type: "root" } },
+      headers: [],
+    }));
+
+    const exitA = await waitForFrame((f) => f._tag === "Exit" && f.requestId === "launch-a");
+    const exitB = await waitForFrame((f) => f._tag === "Exit" && f.requestId === "launch-b");
+    expect((exitA.exit as Record<string, unknown>)._tag).toBe("Success");
+    expect((exitB.exit as Record<string, unknown>)._tag).toBe("Success");
+    expect(handle.state.listHubSandboxes().length).toBe(2);
+
+    // Both projectIds were rewritten back to hubProjectId!
+    const projA = (((exitA.exit as { value: { projection: { thread: { projectId: string } } } }).value).projection.thread.projectId);
+    const projB = (((exitB.exit as { value: { projection: { thread: { projectId: string } } } }).value).projection.thread.projectId);
+    expect(projA).toBe(hubProjectId);
+    expect(projB).toBe(hubProjectId);
+
+    // 5. Thread-scoped terminal.open routes strictly to each thread's own VM!
+    ws.send(JSON.stringify({ _tag: "Request", id: "term-a", tag: "terminal.open", payload: { threadId: "thread-A" }, headers: [] }));
+    ws.send(JSON.stringify({ _tag: "Request", id: "term-b", tag: "terminal.open", payload: { threadId: "thread-B" }, headers: [] }));
+    const termA = await waitForFrame((f) => f._tag === "Exit" && f.requestId === "term-a");
+    const termB = await waitForFrame((f) => f._tag === "Exit" && f.requestId === "term-b");
+    const vmTagA = ((termA.exit as { value: { vmTag: string } }).value).vmTag;
+    const vmTagB = ((termB.exit as { value: { vmTag: string } }).value).vmTag;
+    expect(new Set([vmTagA, vmTagB])).toEqual(new Set(["vm1", "vm2"]));
+
+    // 6. Verify LlmProxy accepts sb-1's ephemeral token, then destroy ONLY sb-1 via watchdog `all-archived`
+    const sb1 = handle.state.getHubSandbox("sb-1")!;
+    const sb2 = handle.state.getHubSandbox("sb-2")!;
+    expect(sb1.llmToken).toBeTruthy();
+    const okLlm = await fetch(`${base}/v1/messages`, {
+      method: "POST",
+      headers: { host: "boat-llm.boat.example.com", "x-api-key": sb1.llmToken! },
+      body: "{}",
+    });
+    expect(okLlm.status).toBe(200);
+
+    const wdRes = await fetch(`${base}/internal/watchdog`, {
+      method: "POST",
+      headers: { host: cfg.controlHost, authorization: `Bearer ${sb1.watchdogSecret}`, "content-type": "application/json" },
+      body: JSON.stringify({ slot: "hub:sb-1", sandboxId: "sb-1", event: "all-archived", at: new Date().toISOString() }),
+    });
+    expect(wdRes.status).toBe(200);
+
+    // Wait for thread.removed broadcast on Hub WS
+    const removedChunk = await waitForFrame(
+      (f) => f._tag === "Chunk" && f.requestId === "shell-1" && Array.isArray(f.values) && (f.values[0] as Record<string, unknown>)?.kind === "thread.removed",
+    );
+    expect(removedChunk).toBeTruthy();
+    expect(handle.state.getHubSandbox("sb-1")).toBeUndefined();
+    expect(handle.state.getHubSandbox("sb-2")?.phase).toBe("running");
+
+    // sb-1's LLM token is immediately revoked (401), while sb-2's still returns 200!
+    const deadLlm = await fetch(`${base}/v1/messages`, {
+      method: "POST",
+      headers: { host: "boat-llm.boat.example.com", "x-api-key": sb1.llmToken! },
+      body: "{}",
+    });
+    expect(deadLlm.status).toBe(401);
+    const stillAliveLlm = await fetch(`${base}/v1/messages`, {
+      method: "POST",
+      headers: { host: "boat-llm.boat.example.com", "x-api-key": sb2.llmToken! },
+      body: "{}",
+    });
+    expect(stillAliveLlm.status).toBe(200);
+  });
+});

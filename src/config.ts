@@ -96,6 +96,15 @@ export interface LlmProxyConfig {
   upstreamApiKey: string;
 }
 
+export interface HubConfig {
+  /** Public hostname for the single unified T3 Environment multiplexer (e.g. "boat.example.com"). */
+  host: string;
+  /** Display label shown in T3 Code's Environments list (default "Boat"). */
+  label: string;
+  /** Maximum concurrent live Boat VMs managed by the Hub (default 10). */
+  maxSandboxes: number;
+}
+
 export interface SentinelConfig {
   domain: string;
   controlHost: string;
@@ -137,6 +146,8 @@ export interface SentinelConfig {
   };
   klav?: KlavGlobalConfig;
   llmProxy?: LlmProxyConfig;
+  /** Optional unified single-environment Hub multiplexer (1 T3 Environment -> N parallel Boat VMs, 1 chat = 1 VM). */
+  hub?: HubConfig;
   /**
    * Wake behavior for sleeping slots:
    * - "manual" (default): returns 503 while asleep (zero phantom wakes, zero dropped frames); wake via dashboard/MCP/CLI
@@ -253,11 +264,20 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
     };
   }
 
+  let hub: HubConfig | undefined;
+  if (parsed.hub) {
+    hub = {
+      host: requireString(parsed.hub.host, "hub.host").replace(/^https?:\/\//, "").replace(/\/+$/, "").toLowerCase(),
+      label: parsed.hub.label ? String(parsed.hub.label).trim() : "Boat",
+      maxSandboxes: Math.max(1, Number(parsed.hub.maxSandboxes ?? 10)),
+    };
+  }
+
   const wakePolicy = parsed.wakePolicy === "on-connect" ? "on-connect" : "manual";
 
   const slots = Array.isArray(parsed.slots) ? parsed.slots : [];
-  if (slots.length === 0) {
-    throw new Error("Config must define at least one slot in `slots`");
+  if (slots.length === 0 && !hub) {
+    throw new Error("Config must define at least one slot in `slots` or configure `hub`");
   }
   const seen = new Set<string>();
   for (const s of slots) {
@@ -295,6 +315,7 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
     boat,
     klav,
     llmProxy,
+    hub,
     wakePolicy,
     slots,
     projects,

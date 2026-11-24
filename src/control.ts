@@ -1,5 +1,6 @@
 import { extractBearer, safeEqual } from "./auth.ts";
 import type { SentinelConfig } from "./config.ts";
+import type { HubServer } from "./hub.ts";
 import type { JobManager } from "./jobs.ts";
 import type { LifecycleManager, WatchdogEventPayload } from "./lifecycle.ts";
 import type { SlotProxy } from "./proxy.ts";
@@ -7,7 +8,7 @@ import type { StateStore } from "./state.ts";
 
 /**
  * Control plane served on `https://ctrl.<domain>`:
- * - `/internal/watchdog`: authenticated with per-sandbox `slot.watchdogSecret` (never shared across VMs!)
+ * - `/internal/watchdog`: authenticated with per-sandbox `watchdogSecret` (never shared across VMs!)
  * - `/api/*`: authenticated strictly via `Authorization: Bearer <controlSecret>` header (no query tokens)
  * - `/api/jobs/:id`: poll async spawn/bake/wake/reset jobs without hitting HTTP timeouts
  * - `/`: mobile-first dashboard
@@ -19,6 +20,7 @@ export class ControlPlane {
     private readonly lifecycle: LifecycleManager,
     private readonly proxy: SlotProxy,
     private readonly jobs: JobManager,
+    private readonly hub?: HubServer,
   ) {}
 
   async handle(req: Request): Promise<Response> {
@@ -29,12 +31,23 @@ export class ControlPlane {
       return Response.json({ ok: true, slots: this.state.listSlots().length });
     }
 
-    // Per-sandbox watchdog callback (validates against THAT slot's unique secret!)
+    // Per-sandbox watchdog callback (validates against THAT slot or hub sandbox's unique secret!)
     if (req.method === "POST" && path === "/internal/watchdog") {
       const token = extractBearer(req.headers);
       if (!token) return Response.json({ error: "unauthorized" }, { status: 401 });
 
       const payload = (await req.json()) as WatchdogEventPayload;
+      if (this.hub && payload.slot?.startsWith("hub:")) {
+        const sb = this.state.getHubSandbox(payload.sandboxId);
+        if (!sb || !sb.watchdogSecret || !safeEqual(token, sb.watchdogSecret)) {
+          return Response.json({ error: "unauthorized" }, { status: 401 });
+        }
+        void this.hub.handleWatchdogEvent(payload).catch((err) => {
+          console.error("[control] hub watchdog event failed:", err);
+        });
+        return Response.json({ accepted: true });
+      }
+
       const slot = this.state.getSlot(payload.slot);
       if (!slot || !slot.watchdogSecret || slot.sandboxId !== payload.sandboxId || !safeEqual(token, slot.watchdogSecret)) {
         return Response.json({ error: "unauthorized" }, { status: 401 });
@@ -94,6 +107,27 @@ export class ControlPlane {
           };
         });
         const baseBake = this.state.getBake("base");
+        const hubState = this.state.getHub();
+        const hubInfo =
+          this.config.hub && hubState
+            ? {
+                url: `https://${this.config.hub.host}`,
+                label: hubState.label,
+                environmentId: hubState.environmentId,
+                maxSandboxes: this.config.hub.maxSandboxes,
+                pairedClients: hubState.clients.map((c) => ({ id: c.id, label: c.label, pairedAt: c.pairedAt })),
+                sandboxes: this.state.listHubSandboxes().map((sb) => ({
+                  sandboxId: sb.sandboxId,
+                  project: sb.project,
+                  phase: sb.phase,
+                  threadIds: sb.threadIds,
+                  klavAgent: sb.klavAgentName,
+                  createdAt: sb.createdAt,
+                  lastHeartbeatAt: sb.lastHeartbeatAt,
+                  sleepingSince: sb.sleepingSince,
+                })),
+              }
+            : null;
         return Response.json({
           t3: this.config.t3,
           wakePolicy: this.config.wakePolicy,
@@ -102,6 +136,7 @@ export class ControlPlane {
             lastBakeAt: baseBake?.bakedAt ?? null,
             t3Version: baseBake?.t3Version ?? null,
           },
+          ...(hubInfo ? { hub: hubInfo } : {}),
           slots,
           projects,
           pendingDeletes: this.state.listPendingDeletes().length,
@@ -196,18 +231,40 @@ export class ControlPlane {
 
       if (req.method === "POST" && path === "/api/reset") {
         const body = (await req.json()) as { slot: string };
+        if (this.hub && body.slot === "hub") {
+          for (const sb of this.state.listHubSandboxes()) {
+            await this.hub.destroyHubSandbox(sb.sandboxId, "api-reset-all");
+          }
+          return Response.json({ ok: true, slot: "hub", phase: "empty" });
+        }
+        if (this.hub && body.slot.startsWith("hub:")) {
+          const sbId = body.slot.slice(4);
+          await this.hub.destroyHubSandbox(sbId, "api-reset");
+          return Response.json({ ok: true, slot: body.slot, phase: "empty" });
+        }
         const slot = await this.lifecycle.destroy(body.slot, "api-reset");
         return Response.json({ ok: true, slot: slot.name, phase: slot.phase });
       }
 
       if (req.method === "POST" && path === "/api/pair") {
         const body = (await req.json()) as { slot: string };
+        if (body.slot === "hub") {
+          if (!this.hub) return Response.json({ ok: false, error: "Hub is not enabled in sentinel.yaml" }, { status: 400 });
+          const pair = this.hub.createPairingLink();
+          return Response.json({ ok: true, slot: "hub", ...pair });
+        }
         const pair = this.proxy.createPairingLink(body.slot);
         return Response.json({ ok: true, slot: body.slot, ...pair });
       }
 
       if (req.method === "POST" && path === "/api/revoke") {
         const body = (await req.json()) as { slot: string; clientId?: string };
+        if (body.slot === "hub") {
+          const hub = this.state.updateHub((h) => {
+            h.clients = body.clientId ? h.clients.filter((c) => c.id !== body.clientId) : [];
+          });
+          return Response.json({ ok: true, slot: "hub", pairedClients: hub.clients.length });
+        }
         const slot = this.state.updateSlot(body.slot, (s) => {
           s.clients = body.clientId ? s.clients.filter((c) => c.id !== body.clientId) : [];
         });

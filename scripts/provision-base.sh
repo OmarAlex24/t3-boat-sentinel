@@ -38,14 +38,13 @@ elif [ "$T3_VERSION" = "latest" ]; then
   new_ver="$("$t3" --version 2>/dev/null || true)"
   [ "$installed_ver" = "$new_ver" ] || restart_t3=1
 elif [ "$installed_ver" != "t3 v$T3_VERSION" ]; then
-  "$t3" update "$T3_VERSION" --channel "$T3_CHANNEL" --yes --allow-downgrade >"$sentinel_dir/update.log" 2>&1 || \
-    curl -fsSL https://t3.codes/install.sh | T3CODE_VERSION="$T3_VERSION" sh >"$sentinel_dir/install.log" 2>&1
+  curl -fsSL https://t3.codes/install.sh | T3CODE_VERSION="$T3_VERSION" sh >"$sentinel_dir/install.log" 2>&1
   restart_t3=1
 fi
 
 wait_for_t3() {
   for _ in $(seq 1 120); do
-    if curl -sf -o /dev/null http://127.0.0.1:3773/.well-known/t3/environment; then
+    if curl -sf --max-time 3 -o /dev/null http://127.0.0.1:3773/.well-known/t3/environment; then
       return 0
     fi
     sleep 0.5
@@ -62,9 +61,9 @@ if [ "$BAKE_CLEAN" = "1" ]; then
   systemctl --user restart t3code.service
   wait_for_t3
 
-  smoke_token="$("$t3" auth session issue --token-only --ttl 1h --label bake-smoke)"
-  descriptor="$(curl -sf http://127.0.0.1:3773/.well-known/t3/environment)"
-  auth_session="$(curl -sf -H "Authorization: Bearer $smoke_token" http://127.0.0.1:3773/api/auth/session || echo '{}')"
+  smoke_token="$(timeout 30 "$t3" auth session issue --token-only --ttl 1h --label bake-smoke)"
+  descriptor="$(curl -sf --max-time 5 http://127.0.0.1:3773/.well-known/t3/environment)"
+  auth_session="$(curl -sf --max-time 5 -H "Authorization: Bearer $smoke_token" http://127.0.0.1:3773/api/auth/session || echo '{}')"
   ver="$("$t3" --version 2>/dev/null || echo unknown)"
 
   # Stop services and wipe ALL of ~/.t3/userdata so no environment-id, sqlite DB, or tokens leak into snapshot

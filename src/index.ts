@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { BoatCli, type BoatClient } from "./boat.ts";
 import { loadConfig, type SentinelConfig } from "./config.ts";
 import { ControlPlane } from "./control.ts";
+import { HubServer, type HubWsData } from "./hub.ts";
 import { JobManager } from "./jobs.ts";
 import { KlavCliProvider, type KlavClient } from "./klav.ts";
 import { LifecycleManager } from "./lifecycle.ts";
@@ -13,11 +14,14 @@ import { runStdioMcp } from "./mcp.ts";
 import { SlotProxy, type WsData } from "./proxy.ts";
 import { StateStore } from "./state.ts";
 
+export type ServerWsData = WsData | HubWsData;
+
 export interface SentinelServerHandle {
-  server: Bun.Server<WsData>;
+  server: Bun.Server<ServerWsData>;
   state: StateStore;
   lifecycle: LifecycleManager;
   proxy: SlotProxy;
+  hub?: HubServer;
   control: ControlPlane;
   jobs: JobManager;
   stop: () => void;
@@ -32,15 +36,17 @@ export function createSentinelServer(
   const klav = opts.klav ?? (config.klav ? new KlavCliProvider(config.klav) : undefined);
   const lifecycle = new LifecycleManager(config, state, boat, klav);
   const proxy = new SlotProxy(config, state, lifecycle);
+  const hub = config.hub ? new HubServer(config, state, boat, lifecycle, klav) : undefined;
   const jobs = new JobManager();
-  const control = new ControlPlane(config, state, lifecycle, proxy, jobs);
+  const control = new ControlPlane(config, state, lifecycle, proxy, jobs, hub);
   const llmProxy = config.llmProxy ? new LlmProxy(config.llmProxy, state) : null;
 
   if (opts.startBackgroundLoops !== false) {
     lifecycle.startBackgroundLoops();
   }
 
-  const server = Bun.serve<WsData>({
+  const slotWs = proxy.wsHandlers();
+  const server = Bun.serve<ServerWsData>({
     hostname: config.listenHost,
     port: config.listenPort,
     // Bun defaults idleTimeout to 10s, which resets long proxy/control requests. Max is 255s.
@@ -50,16 +56,41 @@ export function createSentinelServer(
       if (llmProxy && config.llmProxy && host === config.llmProxy.host) {
         return llmProxy.handle(req);
       }
+      if (hub && config.hub && host === config.hub.host) {
+        return hub.handleHttp(req, srv as unknown as Bun.Server<HubWsData>);
+      }
       if (host === config.controlHost.toLowerCase() || host === "localhost" || host === "127.0.0.1") {
         return control.handle(req);
       }
       const slotName = proxy.resolveSlotFromHost(req.headers.get("host"));
       if (slotName) {
-        return proxy.handleHttp(slotName, req, srv);
+        return proxy.handleHttp(slotName, req, srv as unknown as Bun.Server<WsData>);
       }
       return new Response(`Unknown host "${host}"`, { status: 404 });
     },
-    websocket: proxy.wsHandlers(),
+    websocket: {
+      open(ws) {
+        if (hub && "kind" in ws.data && ws.data.kind === "hub") {
+          hub.onWsOpen(ws as Bun.ServerWebSocket<HubWsData>);
+        } else {
+          slotWs.open?.(ws as Bun.ServerWebSocket<WsData>);
+        }
+      },
+      message(ws, msg) {
+        if (hub && "kind" in ws.data && ws.data.kind === "hub") {
+          hub.onWsMessage(ws as Bun.ServerWebSocket<HubWsData>, msg);
+        } else {
+          slotWs.message?.(ws as Bun.ServerWebSocket<WsData>, msg);
+        }
+      },
+      close(ws, code, reason) {
+        if (hub && "kind" in ws.data && ws.data.kind === "hub") {
+          hub.onWsClose(ws as Bun.ServerWebSocket<HubWsData>);
+        } else {
+          slotWs.close?.(ws as Bun.ServerWebSocket<WsData>, code, reason);
+        }
+      },
+    },
   });
 
   return {
@@ -67,9 +98,11 @@ export function createSentinelServer(
     state,
     lifecycle,
     proxy,
+    hub,
     control,
     jobs,
     stop: () => {
+      hub?.stop();
       lifecycle.stopBackgroundLoops();
       server.stop(true);
     },
@@ -153,9 +186,14 @@ async function main(): Promise<void> {
       const handle = createSentinelServer(config);
       console.log(`[sentinel] listening on http://${handle.server.hostname}:${handle.server.port}`);
       console.log(`[sentinel] control panel: https://${config.controlHost}`);
-      console.log(
-        `[sentinel] slots: ${config.slots.map((s) => `https://${s.name}.${config.domain}`).join(", ")}`,
-      );
+      if (config.hub) {
+        console.log(`[sentinel] hub (1-env multiplexer): https://${config.hub.host} (max ${config.hub.maxSandboxes} sandboxes)`);
+      }
+      if (config.slots.length > 0) {
+        console.log(
+          `[sentinel] slots: ${config.slots.map((s) => `https://${s.name}.${config.domain}`).join(", ")}`,
+        );
+      }
 
       const shutdown = (sig: string) => {
         console.log(`[sentinel] received ${sig}, shutting down cleanly...`);

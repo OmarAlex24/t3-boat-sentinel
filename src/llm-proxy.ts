@@ -46,12 +46,19 @@ export class LlmProxy {
       .listSlots()
       .find((s) => s.phase === "running" && s.llmToken !== null && safeEqual(s.llmToken, presentedKey));
 
-    if (!activeSlot) {
+    const activeHubSandbox = activeSlot
+      ? null
+      : this.state
+          .listHubSandboxes()
+          .find((s) => s.phase === "running" && s.llmToken !== null && safeEqual(s.llmToken, presentedKey));
+
+    if (!activeSlot && !activeHubSandbox) {
       return Response.json(
         { error: { type: "authentication_error", message: "Sandbox token inactive or revoked" } },
         { status: 401 },
       );
     }
+    const ownerLabel = activeSlot ? `slot ${activeSlot.name}` : `hub sandbox ${activeHubSandbox!.sandboxId}`;
 
     const url = new URL(req.url);
     const target = `${this.cfg.upstreamUrl}${url.pathname}${url.search}`;
@@ -86,7 +93,7 @@ export class LlmProxy {
         headers: outHeaders,
       });
     } catch (err) {
-      console.error(`[llm-proxy] upstream error for slot ${activeSlot.name}:`, err);
+      console.error(`[llm-proxy] upstream error for ${ownerLabel}:`, err);
       return Response.json(
         { error: { type: "api_error", message: "Upstream LLM proxy unreachable" } },
         { status: 502 },

@@ -640,6 +640,23 @@ export class LifecycleManager {
 
     // 2. Reconcile slot states in BOTH directions & enforce optional maxSleepingHours
     const activeIds = new Set<string>();
+    for (const hubSb of this.state.listHubSandboxes()) {
+      activeIds.add(hubSb.sandboxId);
+      const remote = liveById.get(hubSb.sandboxId);
+      if (!remote && hubSb.phase !== "provisioning") {
+        console.warn(`[reaper] hub sandbox ${hubSb.sandboxId} disappeared remotely -> removing`);
+        if (hubSb.klavAgentName && this.klav) {
+          await this.klav.revokeForSandbox(hubSb.klavAgentName).catch(() => {});
+        }
+        this.state.removeHubSandbox(hubSb.sandboxId);
+      } else if (remote && remote.state === "stopped" && hubSb.phase === "running") {
+        this.state.updateHubSandbox(hubSb.sandboxId, (s) => {
+          s.phase = "sleeping";
+          s.llmToken = null;
+          s.sleepingSince = remote.stoppedAt ?? new Date().toISOString();
+        });
+      }
+    }
     const maxSleepMs = this.config.boat.maxSleepingHours > 0 ? this.config.boat.maxSleepingHours * 3600_000 : 0;
 
     for (const slot of this.state.listSlots()) {
@@ -723,20 +740,31 @@ export class LifecycleManager {
     }
   }
 
-  private async provisionRunningVm(
-    slotName: string,
-    sandboxId: string,
-    project: ProjectConfig | undefined,
-    watchdogSecret: string,
-    llmToken: string | null,
-    mintToken: boolean,
-  ): Promise<void> {
-    const slot = this.state.getSlot(slotName)!;
+  /**
+   * Reusable VM provisioning for both Slot mode and Hub mode:
+   * uploads scripts, watchdog secrets, ephemeral LLM proxy token, T3 settings, optional files/.env,
+   * runs `provision-base.sh`, and returns `{ descriptor, authSession, upstreamToken }`.
+   */
+  async provisionStandaloneVm(opts: {
+    sandboxId: string;
+    watchdogSlotKey: string;
+    environmentId: string;
+    label: string;
+    projectName: string;
+    project: ProjectConfig | undefined;
+    watchdogSecret: string;
+    llmToken: string | null;
+    mintToken: boolean;
+  }): Promise<{
+    descriptor?: Record<string, unknown>;
+    authSession?: Record<string, unknown>;
+    upstreamToken?: string;
+  }> {
+    const { sandboxId, watchdogSlotKey, environmentId, label, projectName, project, watchdogSecret, llmToken, mintToken } = opts;
     await this.boat.execOk(sandboxId, "mkdir -p ~/.t3-sentinel && chmod 700 ~/.t3-sentinel", 30);
     await this.boat.upload(sandboxId, PROVISION_SCRIPT, "~/.t3-sentinel/provision-base.sh");
     await this.boat.upload(sandboxId, WATCHDOG_SCRIPT, "~/.t3-sentinel/watchdog.mjs");
 
-    // Upload per-sandbox watchdog secrets + ephemeral LLM proxy config via `boat scp` (mode 0600)
     const tmpDir = mkdtempSync(join(tmpdir(), "t3-sentinel-boot-"));
     try {
       const bootSecretsPath = join(tmpDir, "boot-secrets.json");
@@ -744,7 +772,7 @@ export class LifecycleManager {
         bootSecretsPath,
         JSON.stringify(
           {
-            slot: slotName,
+            slot: watchdogSlotKey,
             sandboxId,
             callbackUrl: `https://${this.config.controlHost}/internal/watchdog`,
             watchdogSecret,
@@ -760,7 +788,6 @@ export class LifecycleManager {
       );
       await this.boat.upload(sandboxId, bootSecretsPath, "~/.t3-sentinel/boot-secrets.json");
 
-      // If llmProxy is configured, inject ONLY the ephemeral per-sandbox token (real API key never leaves sentinel!)
       if (this.config.llmProxy && llmToken) {
         const claudeSettingsPath = join(tmpDir, "claude-settings.json");
         writeFileSync(
@@ -788,12 +815,10 @@ export class LifecycleManager {
       rmSync(tmpDir, { recursive: true, force: true });
     }
 
-    // Optional T3 settings template (inherits enabled providers, default model, runtime mode on every fresh VM!)
     if (this.config.t3.settingsFile && existsSync(this.config.t3.settingsFile)) {
       await this.boat.upload(sandboxId, this.config.t3.settingsFile, "~/.t3-sentinel/t3-settings.json");
     }
 
-    // Optional per-boot injected config files (e.g. ~/.claude/settings.json) — never baked into golden snapshots
     for (const file of this.config.boat.injectFiles) {
       if (!existsSync(file.from)) continue;
       const remoteDir = file.to.includes("/") ? file.to.slice(0, file.to.lastIndexOf("/")) : ".";
@@ -802,7 +827,6 @@ export class LifecycleManager {
       await this.boat.execOk(sandboxId, `chmod ${file.mode ?? "600"} ${file.to}`, 30);
     }
 
-    // Plaintext .env injection (fallback when not using Klav)
     if (project?.envFile && existsSync(project.envFile)) {
       const target = project.envTarget ?? `${project.workdir}/.env`;
       await this.boat.upload(sandboxId, project.envFile, target);
@@ -815,22 +839,48 @@ export class LifecycleManager {
     const envVars = [
       `T3_VERSION=${shellQuote(this.config.t3.version)}`,
       `T3_CHANNEL=${shellQuote(this.config.t3.channel)}`,
-      `SLOT_ENV_ID=${shellQuote(slot.environmentId)}`,
-      `SLOT_LABEL=${shellQuote(slot.label)}`,
+      `SLOT_ENV_ID=${shellQuote(environmentId)}`,
+      `SLOT_LABEL=${shellQuote(label)}`,
       `MINT_UPSTREAM_TOKEN=${mintToken ? "1" : "0"}`,
     ];
     if (project && project.registerProject !== false) {
       envVars.push(`PROJECT_WORKDIR=${shellQuote(project.workdir)}`);
-      envVars.push(`PROJECT_TITLE=${shellQuote(slot.project ?? project.snapshot)}`);
+      envVars.push(`PROJECT_TITLE=${shellQuote(projectName)}`);
     }
 
     const out = await this.boat.execOk(sandboxId, `${envVars.join(" ")} bash ~/.t3-sentinel/provision-base.sh`, 300);
-
     const parsed = lastJsonLine<{
       descriptor?: Record<string, unknown>;
       authSession?: Record<string, unknown>;
       upstreamToken?: string;
     }>(out);
+
+    if (parsed.descriptor || parsed.authSession) {
+      this.state.setTemplates(parsed.descriptor ?? null, parsed.authSession ?? null);
+    }
+    return parsed;
+  }
+
+  private async provisionRunningVm(
+    slotName: string,
+    sandboxId: string,
+    project: ProjectConfig | undefined,
+    watchdogSecret: string,
+    llmToken: string | null,
+    mintToken: boolean,
+  ): Promise<void> {
+    const slot = this.state.getSlot(slotName)!;
+    const parsed = await this.provisionStandaloneVm({
+      sandboxId,
+      watchdogSlotKey: slotName,
+      environmentId: slot.environmentId,
+      label: slot.label,
+      projectName: slot.project ?? project?.snapshot ?? slotName,
+      project,
+      watchdogSecret,
+      llmToken,
+      mintToken,
+    });
 
     this.state.updateSlot(slotName, (s) => {
       if (parsed.upstreamToken) s.upstreamToken = parsed.upstreamToken;
@@ -845,9 +895,6 @@ export class LifecycleManager {
         s.authSession = parsed.authSession;
       }
     });
-    if (parsed.descriptor || parsed.authSession) {
-      this.state.setTemplates(parsed.descriptor ?? null, parsed.authSession ?? null);
-    }
   }
 
   private async waitUntilStopped(sandboxId: string, timeoutMs: number): Promise<void> {

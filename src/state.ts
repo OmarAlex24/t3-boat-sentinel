@@ -51,12 +51,54 @@ export interface BakeRecord {
   bakedAt: string;
 }
 
+export interface HubSandboxRecord {
+  sandboxId: string;
+  project: string;
+  hubProjectId: string;
+  vmProjectId: string;
+  snapshot: string;
+  size: string;
+  upstreamUrl: string;
+  upstreamToken: string;
+  watchdogSecret: string;
+  llmToken: string | null;
+  klavAgentName: string | null;
+  threadIds: string[];
+  worktreePaths: string[];
+  phase: "provisioning" | "running" | "sleeping" | "destroying";
+  createdAt: string;
+  lastActiveAt: string;
+  lastHeartbeatAt: string | null;
+  sleepingSince: string | null;
+}
+
+export interface HubProjectTemplate {
+  shell?: Record<string, unknown>;
+  vcsRefs?: unknown;
+}
+
+export interface HubStateRecord {
+  environmentId: string;
+  label: string;
+  sequence: number;
+  clients: ClientCredentialRecord[];
+  /** Permanent UUID per configured project key (e.g. "horizon-stack" -> "<uuid>"). */
+  projectIds: Record<string, string>;
+  /** Active Boat sandboxes managed by the Hub, keyed by sandboxId. */
+  sandboxes: Record<string, HubSandboxRecord>;
+  /** Cached real T3 templates captured from live `t3 serve` (bake or first VM boot). */
+  serverConfig: Record<string, unknown> | null;
+  lifecycleEvents: unknown[] | null;
+  projectTemplates: Record<string, HubProjectTemplate>;
+}
+
 export interface PersistedState {
   version: 2;
   /** Captured real T3 descriptor & session templates from last bake so never-spawned slots serve valid schemas. */
   templateDescriptor: Record<string, unknown> | null;
   templateAuthSession: Record<string, unknown> | null;
   slots: Record<string, SlotRecord>;
+  hub?: HubStateRecord;
   pendingDeletes: PendingDelete[];
   bakes: Record<string, BakeRecord>;
 }
@@ -118,11 +160,42 @@ export class StateStore {
       };
     }
 
+    let hub: HubStateRecord | undefined = existing.hub;
+    if (config.hub || hub) {
+      const prevHub = existing.hub;
+      const projectIds: Record<string, string> = { ...(prevHub?.projectIds ?? {}) };
+      for (const key of Object.keys(config.projects)) {
+        if (!projectIds[key]) projectIds[key] = randomUUID();
+      }
+      const sandboxes: Record<string, HubSandboxRecord> = {};
+      for (const [id, sb] of Object.entries(prevHub?.sandboxes ?? {})) {
+        if (!sb || sb.phase === "destroying") continue;
+        sandboxes[id] = {
+          ...sb,
+          phase: sb.phase === "provisioning" ? "sleeping" : sb.phase,
+          threadIds: Array.isArray(sb.threadIds) ? sb.threadIds : [],
+          worktreePaths: Array.isArray(sb.worktreePaths) ? sb.worktreePaths : [],
+        };
+      }
+      hub = {
+        environmentId: prevHub?.environmentId ?? randomUUID(),
+        label: config.hub?.label ?? prevHub?.label ?? "Boat",
+        sequence: typeof prevHub?.sequence === "number" ? prevHub.sequence : 1,
+        clients: Array.isArray(prevHub?.clients) ? prevHub.clients : [],
+        projectIds,
+        sandboxes,
+        serverConfig: prevHub?.serverConfig ?? null,
+        lifecycleEvents: Array.isArray(prevHub?.lifecycleEvents) ? prevHub.lifecycleEvents : null,
+        projectTemplates: prevHub?.projectTemplates ?? {},
+      };
+    }
+
     return {
       version: 2,
       templateDescriptor: existing.templateDescriptor ?? null,
       templateAuthSession: existing.templateAuthSession ?? null,
       slots,
+      ...(hub ? { hub } : {}),
       pendingDeletes: Array.isArray(existing.pendingDeletes) ? existing.pendingDeletes : [],
       bakes: existing.bakes ?? {},
     };
@@ -191,5 +264,72 @@ export class StateStore {
 
   getBake(target: string): BakeRecord | null {
     return this.data.bakes[target] ?? null;
+  }
+
+  getHub(): HubStateRecord | undefined {
+    return this.data.hub;
+  }
+
+  ensureHub(label = "Boat", projectKeys: string[] = []): HubStateRecord {
+    if (!this.data.hub) {
+      const projectIds: Record<string, string> = {};
+      for (const k of projectKeys) projectIds[k] = randomUUID();
+      this.data.hub = {
+        environmentId: randomUUID(),
+        label,
+        sequence: 1,
+        clients: [],
+        projectIds,
+        sandboxes: {},
+        serverConfig: null,
+        lifecycleEvents: null,
+        projectTemplates: {},
+      };
+      this.save();
+    }
+    return this.data.hub;
+  }
+
+  updateHub(fn: (hub: HubStateRecord) => void): HubStateRecord {
+    const hub = this.ensureHub();
+    fn(hub);
+    this.save();
+    return hub;
+  }
+
+  nextHubSequence(): number {
+    const hub = this.ensureHub();
+    hub.sequence += 1;
+    this.save();
+    return hub.sequence;
+  }
+
+  getHubSandbox(sandboxId: string): HubSandboxRecord | undefined {
+    return this.data.hub?.sandboxes[sandboxId];
+  }
+
+  listHubSandboxes(): HubSandboxRecord[] {
+    return Object.values(this.data.hub?.sandboxes ?? {});
+  }
+
+  setHubSandbox(record: HubSandboxRecord): void {
+    const hub = this.ensureHub();
+    hub.sandboxes[record.sandboxId] = record;
+    this.save();
+  }
+
+  updateHubSandbox(sandboxId: string, fn: (sb: HubSandboxRecord) => void): HubSandboxRecord | undefined {
+    const sb = this.data.hub?.sandboxes[sandboxId];
+    if (!sb) return undefined;
+    fn(sb);
+    this.save();
+    return sb;
+  }
+
+  removeHubSandbox(sandboxId: string): void {
+    if (this.data.hub?.sandboxes[sandboxId]) {
+      delete this.data.hub.sandboxes[sandboxId];
+      this.save();
+    }
   }
 }
