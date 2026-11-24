@@ -103,10 +103,20 @@ function readDbActivity() {
   if (!existsSync(DB_PATH)) return { personActed: false, sawCreatedEvent: false };
   const db = new DatabaseSync(DB_PATH, { readOnly: true });
   try {
+    let table = "orchestration_events";
+    try {
+      const hasV2 = db
+        .prepare("SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = 'orchestration_v2_events'")
+        .get();
+      if (hasV2?.ok) table = "orchestration_v2_events";
+    } catch {
+      // fall back to v1 table name
+    }
+
     let sawCreatedEvent = false;
     try {
       const created = db
-        .prepare("SELECT 1 AS ok FROM orchestration_events WHERE event_type = 'thread.created' LIMIT 1")
+        .prepare(`SELECT 1 AS ok FROM ${table} WHERE event_type = 'thread.created' LIMIT 1`)
         .get();
       sawCreatedEvent = Boolean(created?.ok);
     } catch {
@@ -115,7 +125,7 @@ function readDbActivity() {
 
     if (eventCursor === null) {
       try {
-        eventCursor = db.prepare("SELECT MAX(sequence) AS s FROM orchestration_events").get()?.s ?? 0;
+        eventCursor = db.prepare(`SELECT MAX(sequence) AS s FROM ${table}`).get()?.s ?? 0;
       } catch {
         eventCursor = 0;
       }
@@ -127,7 +137,7 @@ function readDbActivity() {
       const row = db
         .prepare(
           `SELECT MAX(sequence) AS last, SUM(event_type IN (${placeholders})) AS person
-           FROM orchestration_events WHERE sequence > ?`,
+           FROM ${table} WHERE sequence > ?`,
         )
         .get(...PERSON_EVENTS, eventCursor);
       eventCursor = row?.last ?? eventCursor;
@@ -138,6 +148,13 @@ function readDbActivity() {
   } finally {
     db.close();
   }
+}
+
+function isThreadSettled(t) {
+  if (t.settled === true) return true;
+  if (t.settledOverride === "settled") return true;
+  if (t.settledOverride === "unsettled") return false;
+  return t.settledAt != null;
 }
 
 async function inspectShell() {
@@ -156,7 +173,7 @@ async function inspectShell() {
   const activeTopLevel = threads.filter((t) => {
     if (t.lineage?.relationshipToParent === "subagent") return false;
     if (t.archivedAt != null || t.deletedAt != null) return false;
-    if (includeSettled && t.settled === true) return false;
+    if (includeSettled && isThreadSettled(t)) return false;
     return true;
   });
 
