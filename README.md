@@ -23,6 +23,8 @@
 
 ## Architecture (Hub Mode — Recommended)
 
+![t3-boat-sentinel architecture](docs/architecture.svg)
+
 ```text
 T3 Code Desktop (Mac/Linux/Win) + T3 Mobile
    │  wss://boat.example.com       (paired ONCE forever — 1 Environment for all repos & chats!)
