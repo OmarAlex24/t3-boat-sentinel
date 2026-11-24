@@ -37,6 +37,14 @@ export interface KlavGlobalConfig {
   proxyPort: number;
   /** Proxy mode: default sandbox TTL (e.g. "8h"). */
   defaultTtl: string;
+  /**
+   * Proxy mode (ADR 0042 §4): optional 0600 file containing `client_id=...` and `client_secret=...`
+   * for a Tailscale OAuth client scoped strictly to `auth_keys` + `tag:klav-sandbox`.
+   * Sentinel mints a single-use, ephemeral, preauthorized auth key per sandbox and runs `klav-tailnet-up`.
+   */
+  tailscaleOauthFile?: string;
+  /** Tailscale tailnet name for key creation (default "-" = the OAuth client's own tailnet). */
+  tailnetName?: string;
   /** Agent mode only: central Klav server HTTPS URL. */
   server?: string;
   email?: string;
@@ -105,6 +113,8 @@ export interface SentinelConfig {
     bin?: string;
     defaultSize: string;
     baseSnapshot: string;
+    /** Optional starting Boat snapshot when baking `baseSnapshot` (e.g. a Klav template like `klav-sandbox-4ff6ca3a`). */
+    baseFrom?: string;
     baseBakeHourUtc?: number;
     sleepAfterSecs: number;
     archiveGraceSecs: number;
@@ -167,6 +177,7 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
     bin: parsed.boat?.bin,
     defaultSize: parsed.boat?.defaultSize ?? "default",
     baseSnapshot: parsed.boat?.baseSnapshot ?? "base-t3",
+    baseFrom: parsed.boat?.baseFrom ? String(parsed.boat.baseFrom).trim() : undefined,
     baseBakeHourUtc: parsed.boat?.baseBakeHourUtc,
     sleepAfterSecs: Number(parsed.boat?.sleepAfterSecs ?? 600),
     archiveGraceSecs: Number(parsed.boat?.archiveGraceSecs ?? 20),
@@ -197,6 +208,8 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
         issuerAgent: parsed.klav.issuerAgent,
         proxyPort: Number(parsed.klav.proxyPort ?? 8790),
         defaultTtl: parsed.klav.defaultTtl ?? "8h",
+        tailscaleOauthFile: parsed.klav.tailscaleOauthFile ? resolve(parsed.klav.tailscaleOauthFile) : undefined,
+        tailnetName: parsed.klav.tailnetName ? String(parsed.klav.tailnetName).trim() : "-",
         linuxBinaryPath: parsed.klav.linuxBinaryPath ? resolve(parsed.klav.linuxBinaryPath) : undefined,
         skillPath: parsed.klav.skillPath ? resolve(parsed.klav.skillPath) : undefined,
         defaultAllow: parsed.klav.defaultAllow ?? ["list", "inject"],

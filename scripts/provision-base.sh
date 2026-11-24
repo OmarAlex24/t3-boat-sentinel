@@ -70,7 +70,7 @@ if [ "$BAKE_CLEAN" = "1" ]; then
   # Stop services and wipe ALL of ~/.t3/userdata so no environment-id, sqlite DB, or tokens leak into snapshot
   systemctl --user stop t3code.service 2>/dev/null || true
   systemctl --user stop t3-sentinel-watchdog.service 2>/dev/null || true
-  rm -rf "$userdata_dir" "$sentinel_dir/watchdog.json" "$sentinel_dir/boot-secrets.json" "$sentinel_dir/saw-thread"
+  rm -rf "$userdata_dir" "$sentinel_dir/watchdog.json" "$sentinel_dir/boot-secrets.json" "$sentinel_dir/saw-thread" "$HOME/.klav-forward" "$units/t3code.service.d/klav-env.conf"
   mkdir -p "$userdata_dir"
 
   DESC="$descriptor" SESS="$auth_session" VER="$ver" node -e '
@@ -121,6 +121,11 @@ node -e '
 [ "$before_settings" = "$(cat "$settings")" ] || restart_t3=1
 
 "$t3" service install --allow-downgrade >/dev/null
+if [ -f "$HOME/.klav-forward/env.systemd" ]; then
+  mkdir -p "$units/t3code.service.d"
+  printf '[Service]\nEnvironmentFile=-%%h/.klav-forward/env.systemd\n' > "$units/t3code.service.d/klav-env.conf"
+  restart_t3=1
+fi
 systemctl --user daemon-reload
 systemctl --user is-active --quiet t3code.service || restart_t3=1
 [ "$restart_t3" = "0" ] || systemctl --user restart t3code.service

@@ -326,8 +326,17 @@ export class LifecycleManager {
           throw new Error("Sandbox disk expired; slot reset to empty");
         }
 
+        const project = current.project ? this.config.projects[current.project] : undefined;
+        let nextKlavAgent = current.klavAgentName;
+        if (this.config.klav?.mode === "proxy" && project?.klav && this.klav) {
+          if (current.klavAgentName) {
+            await this.klav.revokeForSandbox(current.klavAgentName).catch(() => {});
+          }
+          const prov = await this.klav.provisionForSandbox(this.boat, sandboxId, project.klav);
+          nextKlavAgent = prov.agentName;
+        }
+
         if (this.config.t3.autoUpdateOnWake || !current.upstreamToken) {
-          const project = current.project ? this.config.projects[current.project] : undefined;
           const wdSecret = current.watchdogSecret ?? randomToken(32);
           await this.provisionRunningVm(slotName, sandboxId, project, wdSecret, current.llmToken, !current.upstreamToken);
         }
@@ -336,6 +345,7 @@ export class LifecycleManager {
         const now = new Date().toISOString();
         const updated = this.state.updateSlot(slotName, (s) => {
           s.upstreamUrl = url;
+          s.klavAgentName = nextKlavAgent;
           s.phase = "running";
           s.lastActiveAt = now;
           s.lastHeartbeatAt = now;
@@ -512,9 +522,11 @@ export class LifecycleManager {
     // Always build project snapshots from base-t3 so base OS/t3/klav updates always propagate
     let fromSnapshot: string | undefined;
     if (isBase) {
-      fromSnapshot = existingSnapshots.includes(this.config.boat.baseSnapshot)
-        ? this.config.boat.baseSnapshot
-        : undefined;
+      if (this.config.boat.baseFrom && existingSnapshots.includes(this.config.boat.baseFrom)) {
+        fromSnapshot = this.config.boat.baseFrom;
+      } else if (existingSnapshots.includes(this.config.boat.baseSnapshot)) {
+        fromSnapshot = this.config.boat.baseSnapshot;
+      }
     } else if (existingSnapshots.includes(this.config.boat.baseSnapshot)) {
       fromSnapshot = this.config.boat.baseSnapshot;
     }

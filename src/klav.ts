@@ -122,6 +122,73 @@ export class KlavCliProvider implements KlavClient {
     console.log(`[klav] revoked ephemeral agent "${handle}"`);
   }
 
+  private async mintTailscaleSandboxKey(): Promise<string> {
+    const file = this.cfg.tailscaleOauthFile!;
+    const raw = readFileSync(file, "utf8");
+    let clientId = "";
+    let clientSecret = "";
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eq = trimmed.indexOf("=");
+      if (eq <= 0) continue;
+      const k = trimmed.slice(0, eq).trim();
+      const v = trimmed.slice(eq + 1).trim();
+      if (k === "client_id") clientId = v;
+      if (k === "client_secret") clientSecret = v;
+    }
+    if (!clientId || !clientSecret) {
+      throw new Error(`Invalid Tailscale OAuth file at ${file}: expected client_id=... and client_secret=...`);
+    }
+
+    const tokenRes = await fetch("https://api.tailscale.com/api/v2/oauth/token", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ client_id: clientId, client_secret: clientSecret }).toString(),
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!tokenRes.ok) {
+      throw new Error(`Tailscale OAuth token exchange failed (HTTP ${tokenRes.status})`);
+    }
+    const tokenJson = (await tokenRes.json()) as { access_token?: string };
+    if (!tokenJson.access_token) {
+      throw new Error("Tailscale OAuth token response missing access_token");
+    }
+
+    const tailnet = encodeURIComponent(this.cfg.tailnetName || "-");
+    const keyRes = await fetch(`https://api.tailscale.com/api/v2/tailnet/${tailnet}/keys`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${tokenJson.access_token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        keyType: "auth",
+        description: "t3-boat-sentinel klav sandbox",
+        expirySeconds: 3600,
+        capabilities: {
+          devices: {
+            create: {
+              reusable: false,
+              ephemeral: true,
+              preauthorized: true,
+              tags: ["tag:klav-sandbox"],
+            },
+          },
+        },
+      }),
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!keyRes.ok) {
+      throw new Error(`Tailscale auth key creation failed (HTTP ${keyRes.status})`);
+    }
+    const keyJson = (await keyRes.json()) as { key?: string };
+    if (!keyJson.key || keyJson.key.startsWith("tskey-client-")) {
+      throw new Error("Tailscale returned invalid auth key");
+    }
+    return keyJson.key;
+  }
+
   private async provisionProxySandbox(
     boat: BoatClient,
     sandboxId: string,
@@ -135,6 +202,7 @@ export class KlavCliProvider implements KlavClient {
     const ttl = projectKlav.ttl ?? this.cfg.defaultTtl;
     const tempDir = mkdtempSync(join(tmpdir(), "t3-sentinel-klav-pkg-"));
     const pkgPath = join(tempDir, "sandbox.pkg"); // must NOT exist before `klav sandbox start --package-file`
+    let klavSandboxId: string | null = null;
 
     try {
       const args = [
@@ -157,13 +225,27 @@ export class KlavCliProvider implements KlavClient {
 
       const res = await this.runKlav(args, { klavHome: this.cfg.issuerHome });
       const parsed = JSON.parse(res.stdout.trim()) as { sandbox_id?: string; setup?: string[] };
-      const klavSandboxId = parsed.sandbox_id;
+      klavSandboxId = parsed.sandbox_id ?? null;
       if (!klavSandboxId) {
         throw new Error(`klav sandbox start returned no sandbox_id: ${res.stdout.slice(0, 300)}`);
       }
 
-      // Upload one-time package into tmpfs (/run/klav-sandbox.pkg), claim with klav-forward, and delete immediately!
-      await boat.upload(sandboxId, pkgPath, "/run/klav-sandbox.pkg");
+      const shortId = klavSandboxId.replace(/[^a-z0-9]/gi, "").slice(0, 8).toLowerCase() || "sandbox";
+      const tailnetSteps: string[] = [];
+      if (this.cfg.tailscaleOauthFile) {
+        const tsKey = await this.mintTailscaleSandboxKey();
+        const tsKeyPath = join(tempDir, "tailnet.key");
+        writeFileSync(tsKeyPath, tsKey, { mode: 0o600 });
+        await boat.upload(sandboxId, tsKeyPath, "/dev/shm/klav-tailnet.key");
+        tailnetSteps.push(
+          `chmod 600 /dev/shm/klav-tailnet.key`,
+          `sudo -n /usr/local/sbin/klav-tailnet-up "klav-${shortId}" < /dev/shm/klav-tailnet.key`,
+          `rm -f /dev/shm/klav-tailnet.key`,
+        );
+      }
+
+      // Upload one-time package into tmpfs (/dev/shm), claim with klav-forward, and delete immediately!
+      await boat.upload(sandboxId, pkgPath, "/dev/shm/klav-sandbox.pkg");
       const setupLines = parsed.setup ?? [
         "klav-forward down --if-other-package",
         "klav-forward up --daemon",
@@ -173,22 +255,31 @@ export class KlavCliProvider implements KlavClient {
         sandboxId,
         [
           `set -euo pipefail`,
-          `chmod 600 /run/klav-sandbox.pkg`,
-          `KLAV_SANDBOX="$(cat /run/klav-sandbox.pkg)"`,
-          `rm -f /run/klav-sandbox.pkg`,
+          `trap 'rm -f /dev/shm/klav-sandbox.pkg /dev/shm/klav-tailnet.key' EXIT`,
+          ...tailnetSteps,
+          `chmod 600 /dev/shm/klav-sandbox.pkg`,
+          `KLAV_SANDBOX="$(cat /dev/shm/klav-sandbox.pkg)"`,
+          `rm -f /dev/shm/klav-sandbox.pkg`,
           `export KLAV_SANDBOX`,
           ...setupLines,
+          `unset KLAV_SANDBOX`,
           `mkdir -p ${remoteHome}/.klav-forward`,
           `klav-forward env > ${remoteHome}/.klav-forward/env.sh`,
           `chmod 600 ${remoteHome}/.klav-forward/env.sh`,
+          `sed -E "s/^export //; s/'//g" ${remoteHome}/.klav-forward/env.sh > ${remoteHome}/.klav-forward/env.systemd`,
+          `chmod 600 ${remoteHome}/.klav-forward/env.systemd`,
           `grep -q 'klav-forward/env.sh' ${remoteHome}/.bashrc 2>/dev/null || echo '[ -f "$HOME/.klav-forward/env.sh" ] && source "$HOME/.klav-forward/env.sh"' >> ${remoteHome}/.bashrc`,
-          `unset KLAV_SANDBOX`,
         ].join("\n"),
-        60,
+        90,
       );
 
       console.log(`[klav-proxy] started sandbox "${klavSandboxId}" (profiles=${profiles.join(",")}) for Boat ${sandboxId}`);
       return { agentName: klavSandboxId, project: profiles.join(",") };
+    } catch (err) {
+      if (klavSandboxId) {
+        await this.revokeForSandbox(klavSandboxId).catch(() => {});
+      }
+      throw err;
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }
