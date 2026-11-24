@@ -80,6 +80,8 @@ export interface SentinelConfig {
     channel: "stable" | "nightly";
     /** Default false: update cleanly during bake rather than mutating a live chat VM mid-session. */
     autoUpdateOnWake: boolean;
+    /** Optional JSON file on sentinel merged into `~/.t3/userdata/settings.json` on every VM boot (inherits providers & preferences). */
+    settingsFile?: string;
   };
   boat: {
     bin?: string;
@@ -137,6 +139,7 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
     version: String(parsed.t3?.version ?? "latest"),
     channel: (parsed.t3?.channel === "nightly" ? "nightly" : "stable") as "stable" | "nightly",
     autoUpdateOnWake: parsed.t3?.autoUpdateOnWake ?? false,
+    settingsFile: parsed.t3?.settingsFile ? resolve(parsed.t3.settingsFile) : undefined,
   };
 
   const boat = {

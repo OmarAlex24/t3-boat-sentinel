@@ -100,14 +100,25 @@ if [ -n "${SLOT_LABEL:-}" ]; then
   fi
 fi
 
-# Enable linked environments
+# Merge optional T3 settings template (providers, default model, runtime mode) & enable linked environments
 settings="$userdata_dir/settings.json"
+before_settings="$(cat "$settings" 2>/dev/null || true)"
 node -e '
-  const fs = require("fs"), f = process.argv[1];
-  const s = fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, "utf8")) : {};
-  s.linkedEnvironmentsEnabled = true;
-  fs.writeFileSync(f, JSON.stringify(s, null, 2));
-' "$settings"
+  const fs = require("fs");
+  const target = process.argv[1];
+  const tpl = process.argv[2];
+  const cur = fs.existsSync(target) ? JSON.parse(fs.readFileSync(target, "utf8")) : {};
+  const extra = fs.existsSync(tpl) ? JSON.parse(fs.readFileSync(tpl, "utf8")) : {};
+  const merged = {
+    ...cur,
+    ...extra,
+    providerInstances: { ...(cur.providerInstances || {}), ...(extra.providerInstances || {}) },
+    linkedEnvironmentsEnabled: true,
+  };
+  fs.writeFileSync(target, JSON.stringify(merged, null, 2), { mode: 0o600 });
+  if (fs.existsSync(tpl)) fs.unlinkSync(tpl);
+' "$settings" "$sentinel_dir/t3-settings.json"
+[ "$before_settings" = "$(cat "$settings")" ] || restart_t3=1
 
 "$t3" service install --allow-downgrade >/dev/null
 systemctl --user daemon-reload

@@ -23,6 +23,8 @@ t3:
   channel: stable
   # Default false: update cleanly during `bake`, never mutate a live chat VM mid-session
   autoUpdateOnWake: false
+  # Optional JSON file merged into `~/.t3/userdata/settings.json` on every VM boot (inherits providers & defaults!)
+  # settingsFile: /opt/t3-boat-sentinel/t3-settings.json
 
 boat:
   # Optional explicit path to boat binary (auto-detects ~/.ascii/bin/boat or PATH)

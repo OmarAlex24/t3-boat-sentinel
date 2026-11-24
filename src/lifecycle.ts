@@ -725,6 +725,11 @@ export class LifecycleManager {
       rmSync(tmpDir, { recursive: true, force: true });
     }
 
+    // Optional T3 settings template (inherits enabled providers, default model, runtime mode on every fresh VM!)
+    if (this.config.t3.settingsFile && existsSync(this.config.t3.settingsFile)) {
+      await this.boat.upload(sandboxId, this.config.t3.settingsFile, "~/.t3-sentinel/t3-settings.json");
+    }
+
     // Plaintext .env injection (fallback when not using Klav)
     if (project?.envFile && existsSync(project.envFile)) {
       const target = project.envTarget ?? `${project.workdir}/.env`;
