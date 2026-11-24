@@ -1333,4 +1333,76 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     expect(sb.phase).toBe("running");
     expect(boat.deleted).not.toContain(sb.sandboxId);
   });
+
+  test("server.updateServerWithProgress rebakes base-t3 + project snapshots and streams progress to T3 Desktop", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-selfupd-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+
+    const boat = new MockBoat();
+    const cfg: SentinelConfig = {
+      ...makeTestConfig(0),
+      stateDir: dir,
+      hub: { host: "boat.boat.example.com", label: "Boat", maxSandboxes: 5 },
+    };
+    const handle = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+    cleanups.push(() => handle.stop());
+    const base = `http://127.0.0.1:${handle.server.port}`;
+
+    const pairRes = await fetch(`${base}/api/pair`, {
+      method: "POST",
+      headers: { host: cfg.controlHost, authorization: `Bearer ${cfg.controlSecret}`, "content-type": "application/json" },
+      body: JSON.stringify({ slot: "hub" }),
+    });
+    const { code } = (await pairRes.json()) as { code: string };
+    const tokRes = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: { host: "boat.boat.example.com", "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ subject_token: code, client_label: "Mac" }),
+    });
+    const { access_token: bearer } = (await tokRes.json()) as { access_token: string };
+    const tickRes = await fetch(`${base}/api/auth/websocket-ticket/rpc`, {
+      method: "POST",
+      headers: { host: "boat.boat.example.com", authorization: `Bearer ${bearer}` },
+    });
+    const { ticket } = (await tickRes.json()) as { ticket: string };
+
+    const ws = new WebSocket(`ws://127.0.0.1:${handle.server.port}/ws?wsTicket=${ticket}&orchestrationProtocol=2`, {
+      headers: { host: "boat.boat.example.com" },
+    } as unknown as string[]);
+    cleanups.push(() => ws.close());
+
+    const frames: Array<Record<string, unknown>> = [];
+    await new Promise<void>((resolve, reject) => {
+      ws.addEventListener("open", () => {
+        ws.send(
+          JSON.stringify({
+            _tag: "Request",
+            id: 77,
+            tag: "server.updateServerWithProgress",
+            payload: { targetVersion: "0.1.12-nightly.20261124.5204", channel: "nightly" },
+            headers: [],
+          }),
+        );
+      });
+      ws.addEventListener("error", () => reject(new Error("ws error")));
+      ws.addEventListener("message", (ev) => {
+        const parsed = JSON.parse(String(ev.data)) as Record<string, unknown>;
+        frames.push(parsed);
+        if (parsed._tag === "Exit" && parsed.requestId === 77) resolve();
+      });
+    });
+
+    const chunkVals = frames
+      .filter((f) => f._tag === "Chunk" && f.requestId === 77)
+      .flatMap((f) => (f.values as Array<Record<string, unknown>>) ?? []);
+    expect(chunkVals.map((v) => v.type)).toEqual(["progress", "progress", "complete"]);
+    expect(boat.snapshots.has("base-t3")).toBe(true);
+    expect(boat.snapshots.has("env-my-app")).toBe(true);
+    expect(boat.execScripts.some((s) => s.includes("T3_VERSION='0.1.12-nightly.20261124.5204'"))).toBe(true);
+
+    const desc = (await (await fetch(`${base}/.well-known/t3/environment`, { headers: { host: "boat.boat.example.com" } })).json()) as {
+      serverVersion: string;
+    };
+    expect(desc.serverVersion).toBe("0.1.12-nightly.20261124.5204");
+  });
 });

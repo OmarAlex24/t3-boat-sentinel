@@ -1181,6 +1181,10 @@ export class HubServer {
       sendRpcExitSuccess(ws, reqId, merged);
       return;
     }
+    if (tag === "server.updateServer" || tag === "server.updateServerWithProgress") {
+      await this.handleServerSelfUpdate(ws, reqId, tag, (payload ?? {}) as Record<string, unknown>);
+      return;
+    }
     if (tag === "server.probe") {
       const live = this.anyRunningSandbox();
       const bridge = live ? this.bridges.get(live.sandboxId) : undefined;
@@ -2157,6 +2161,68 @@ export class HubServer {
           sendRpcFrame(client, { _tag: "Chunk", requestId: sub.rawId, values: [list] });
         }
       }
+    }
+  }
+
+  private async handleServerSelfUpdate(
+    ws: ServerWebSocket<HubWsData>,
+    reqId: string | number,
+    tag: "server.updateServer" | "server.updateServerWithProgress",
+    payload: Record<string, unknown>,
+  ): Promise<void> {
+    const targetVersion =
+      typeof payload.targetVersion === "string" && payload.targetVersion.trim()
+        ? payload.targetVersion.trim()
+        : this.config.t3.version;
+    const channel =
+      payload.channel === "nightly" || payload.channel === "stable"
+        ? payload.channel
+        : targetVersion.includes("nightly")
+          ? "nightly"
+          : this.config.t3.channel;
+    const isStream = tag === "server.updateServerWithProgress";
+    const sendProgress = (stage: "downloading" | "installing") => {
+      if (isStream) {
+        sendRpcFrame(ws, { _tag: "Chunk", requestId: reqId, values: [{ type: "progress", stage }] });
+      }
+    };
+
+    try {
+      console.log(`[hub] T3 UI requested server update -> ${targetVersion} (${channel}); rebaking golden snapshots`);
+      sendProgress("downloading");
+      await this.lifecycle.bake("base", { t3Version: targetVersion, t3Channel: channel });
+
+      // Update in-memory config & cached descriptor serverVersion so future boots and clients see the new version
+      this.config.t3.version = targetVersion;
+      this.config.t3.channel = channel;
+
+      sendProgress("installing");
+      const allProjects = this.state.getAllProjects(this.config);
+      for (const [name, proj] of Object.entries(allProjects)) {
+        if (proj.snapshot === this.config.boat.baseSnapshot) continue;
+        await this.lifecycle.bake(name, { t3Version: targetVersion, t3Channel: channel });
+      }
+
+      const prevTpl = this.state.getTemplates().descriptor;
+      if (prevTpl) {
+        this.state.setTemplates({ ...prevTpl, serverVersion: targetVersion }, null);
+      }
+
+      const result = { targetVersion, method: "boot-service" as const };
+      if (isStream) {
+        sendRpcFrame(ws, { _tag: "Chunk", requestId: reqId, values: [{ type: "complete", result }] });
+        sendRpcExitSuccess(ws, reqId, undefined);
+      } else {
+        sendRpcExitSuccess(ws, reqId, result);
+      }
+      console.log(`[hub] golden snapshots updated to T3 ${targetVersion}`);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      sendRpcFrame(ws, {
+        _tag: "Exit",
+        requestId: reqId,
+        exit: { _tag: "Failure", cause: { _tag: "Fail", error: { _tag: "ServerSelfUpdateError", reason } } },
+      });
     }
   }
 

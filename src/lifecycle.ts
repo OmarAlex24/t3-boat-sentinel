@@ -571,10 +571,15 @@ export class LifecycleManager {
    * - Keeps temp VM out of `pendingDeletes` until `finally` so the reaper never kills a live bake.
    * - Runs a live T3 smoke check & captures real descriptor/session templates before wiping `~/.t3/userdata`.
    */
-  async bake(target: string): Promise<{ snapshot: string; t3Version: string }> {
+  async bake(
+    target: string,
+    opts?: { t3Version?: string; t3Channel?: "stable" | "nightly" },
+  ): Promise<{ snapshot: string; t3Version: string }> {
     if (!hasCapability(this.boat, "snapshots") || !this.boat.saveSnapshot || !this.boat.listSnapshots) {
       throw new Error(`Provider "${this.boat.name}" does not support named snapshots (bake is unavailable).`);
     }
+    const effectiveT3Version = opts?.t3Version?.trim() || this.config.t3.version;
+    const effectiveT3Channel = opts?.t3Channel ?? this.config.t3.channel;
     const allProjects = this.state.getAllProjects(this.config);
     const isBase = target === "base" || target === this.config.boat.baseSnapshot;
     const project = isBase ? undefined : allProjects[target];
@@ -645,8 +650,8 @@ export class LifecycleManager {
 
       // Update t3, smoke-test t3 serve, optionally pre-prepare ACP agents & provider runtimes, capture templates, then wipe per-VM userdata
       const bakeEnv = [
-        `T3_VERSION=${shellQuote(this.config.t3.version)}`,
-        `T3_CHANNEL=${shellQuote(this.config.t3.channel)}`,
+        `T3_VERSION=${shellQuote(effectiveT3Version)}`,
+        `T3_CHANNEL=${shellQuote(effectiveT3Channel)}`,
         `BAKE_CLEAN=1`,
       ];
       if (isBase && this.config.t3.prepareAcpAgents && this.config.t3.prepareAcpAgents.length > 0) {
