@@ -73,7 +73,18 @@ Disposable Boat VMs (`boat new --type large --from env-<project>`)
 
 ## Quickstart
 
-### Option A: Proxmox LXC / Linux host (recommended, ~512MB RAM)
+### Fastest Path: Let Your Coding Agent Deploy It (Recommended)
+
+Don't wire tunnels, DNS, snapshots, and Cloudflare Access by hand — paste this into **Claude Code / T3 Code / Codex / Antigravity**:
+
+```text
+Read https://github.com/OmarAlex24/t3-boat-sentinel/blob/main/docs/AGENT-DEPLOY.md and deploy t3-boat-sentinel for me.
+Ask me first whether I want self-hosted (Proxmox LXC / VPS / Docker) or serverless on Cloudflare Workers (no VPS required), then configure everything and verify end-to-end.
+```
+
+See [**`docs/AGENT-DEPLOY.md`**](docs/AGENT-DEPLOY.md) for the full agent runbook (both self-hosted and **No-VPS Cloudflare Workers + Durable Objects**).
+
+### Option A: Proxmox LXC / Linux host (recommended, ~512MB RAM, $0 extra)
 
 ```bash
 git clone https://github.com/OmarAlex24/t3-boat-sentinel /opt/t3-boat-sentinel
@@ -111,6 +122,12 @@ docker compose up -d
 # Or with bundled cloudflared sidecar:
 docker compose --profile tunnel up -d
 ```
+
+### Option C: No VPS? Deploy on Cloudflare Workers + Durable Objects ($5/mo Workers Paid)
+
+If you don't have a homelab or VPS, Sentinel's core (`HubServer`, `ControlPlane`, `src/security.ts`, and `SandboxSdkProvider`) is built on Web Standard APIs (`fetch`, `WebSocket`, `crypto.subtle`) and can run serverless on **Cloudflare Workers + Durable Objects** using an HTTP sandbox provider (`@opencoredev/sandbox-sdk` with Daytona, E2B, Freestyle, Upstash Box, Railway, boxd, or Boat's HTTP API).
+
+Follow the agent-ready blueprint in [**`docs/AGENT-DEPLOY.md`**](docs/AGENT-DEPLOY.md#path-b-agent-blueprint--serverless-on-cloudflare-workers-no-vps-required) (your coding agent can scaffold & deploy it for you).
 
 ---
 
