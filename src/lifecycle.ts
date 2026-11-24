@@ -541,6 +541,14 @@ export class LifecycleManager {
       await this.boat.upload(tempId, PROVISION_SCRIPT, "~/.t3-sentinel/provision-base.sh");
       await this.boat.upload(tempId, WATCHDOG_SCRIPT, "~/.t3-sentinel/watchdog.mjs");
 
+      if (isBase && this.config.klav?.forwardBinaryPath && existsSync(this.config.klav.forwardBinaryPath)) {
+        await this.boat.upload(tempId, this.config.klav.forwardBinaryPath, "/tmp/klav-forward-bin");
+        await this.boat.execOk(tempId, "sudo install -m 755 -o root -g root /tmp/klav-forward-bin /usr/local/bin/klav-forward && rm -f /tmp/klav-forward-bin", 30);
+      }
+      if (isBase && this.config.klav?.tailnetUpScriptPath && existsSync(this.config.klav.tailnetUpScriptPath)) {
+        await this.boat.upload(tempId, this.config.klav.tailnetUpScriptPath, "/tmp/klav-tailnet-up");
+        await this.boat.execOk(tempId, "sudo install -m 755 -o root -g root /tmp/klav-tailnet-up /usr/local/sbin/klav-tailnet-up && rm -f /tmp/klav-tailnet-up", 30);
+      }
       if (isBase && this.config.klav?.linuxBinaryPath && existsSync(this.config.klav.linuxBinaryPath)) {
         await this.boat.upload(tempId, this.config.klav.linuxBinaryPath, "/tmp/klav-bin");
         await this.boat.execOk(tempId, "sudo install -m 755 /tmp/klav-bin /usr/local/bin/klav && rm -f /tmp/klav-bin", 30);
@@ -548,6 +556,11 @@ export class LifecycleManager {
       if (isBase && this.config.klav?.skillPath && existsSync(this.config.klav.skillPath)) {
         await this.boat.execOk(tempId, "mkdir -p ~/.claude/skills/klav", 30);
         await this.boat.upload(tempId, this.config.klav.skillPath, "~/.claude/skills/klav/SKILL.md");
+      }
+
+      if (isBase && this.config.boat.baseBakeCmd) {
+        console.log(`[bake] running baseBakeCmd...`);
+        await this.boat.execOk(tempId, this.config.boat.baseBakeCmd, 600);
       }
 
       if (project?.bakeCmd) {

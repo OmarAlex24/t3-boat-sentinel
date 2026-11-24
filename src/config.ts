@@ -37,6 +37,10 @@ export interface KlavGlobalConfig {
   proxyPort: number;
   /** Proxy mode: default sandbox TTL (e.g. "8h"). */
   defaultTtl: string;
+  /** Proxy mode: path on sentinel host to Linux x86_64 `klav-forward` binary installed into `baseSnapshot` during bake. */
+  forwardBinaryPath?: string;
+  /** Proxy mode: path on sentinel host to `klav-tailnet-up` script installed to `/usr/local/sbin/klav-tailnet-up` during bake. */
+  tailnetUpScriptPath?: string;
   /**
    * Proxy mode (ADR 0042 §4): optional 0600 file containing `client_id=...` and `client_secret=...`
    * for a Tailscale OAuth client scoped strictly to `auth_keys` + `tag:klav-sandbox`.
@@ -115,6 +119,8 @@ export interface SentinelConfig {
     baseSnapshot: string;
     /** Optional starting Boat snapshot when baking `baseSnapshot` (e.g. a Klav template like `klav-sandbox-4ff6ca3a`). */
     baseFrom?: string;
+    /** Optional shell command run during `bake base` (e.g. install dormant `tailscale`, `northflank` CLI, etc.). */
+    baseBakeCmd?: string;
     baseBakeHourUtc?: number;
     sleepAfterSecs: number;
     archiveGraceSecs: number;
@@ -178,6 +184,7 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
     defaultSize: parsed.boat?.defaultSize ?? "default",
     baseSnapshot: parsed.boat?.baseSnapshot ?? "base-t3",
     baseFrom: parsed.boat?.baseFrom ? String(parsed.boat.baseFrom).trim() : undefined,
+    baseBakeCmd: parsed.boat?.baseBakeCmd ? String(parsed.boat.baseBakeCmd) : undefined,
     baseBakeHourUtc: parsed.boat?.baseBakeHourUtc,
     sleepAfterSecs: Number(parsed.boat?.sleepAfterSecs ?? 600),
     archiveGraceSecs: Number(parsed.boat?.archiveGraceSecs ?? 20),
@@ -208,6 +215,8 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
         issuerAgent: parsed.klav.issuerAgent,
         proxyPort: Number(parsed.klav.proxyPort ?? 8790),
         defaultTtl: parsed.klav.defaultTtl ?? "8h",
+        forwardBinaryPath: parsed.klav.forwardBinaryPath ? resolve(parsed.klav.forwardBinaryPath) : undefined,
+        tailnetUpScriptPath: parsed.klav.tailnetUpScriptPath ? resolve(parsed.klav.tailnetUpScriptPath) : undefined,
         tailscaleOauthFile: parsed.klav.tailscaleOauthFile ? resolve(parsed.klav.tailscaleOauthFile) : undefined,
         tailnetName: parsed.klav.tailnetName ? String(parsed.klav.tailnetName).trim() : "-",
         linuxBinaryPath: parsed.klav.linuxBinaryPath ? resolve(parsed.klav.linuxBinaryPath) : undefined,
