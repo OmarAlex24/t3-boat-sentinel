@@ -20,16 +20,16 @@ import { ensureT3Project } from "./t3rpc.ts";
 export interface HubWsData {
   kind: "hub";
   clientId: string;
-  /** Streams this downstream client is subscribed to locally on the Hub (e.g. subscribeShell, subscribeServerConfig). */
-  localStreams: Map<string, string>;
-  /** Active upstream-forwarded RPC requests owned by this client: clientReqId -> { sandboxId, upReqId }. */
+  /** Streams this downstream client is subscribed to locally on the Hub: String(id) -> { rawId, tag }. */
+  localStreams: Map<string, { rawId: string | number; tag: string }>;
+  /** Active upstream-forwarded RPC requests owned by this client: String(clientReqId) -> { sandboxId, upReqId }. */
   upstreamRequests: Map<string, { sandboxId: string; upReqId: string }>;
 }
 
 interface RpcClientFrame {
   _tag: "Request" | "Ack" | "Interrupt" | "Ping" | "Pong" | string;
-  id?: string;
-  requestId?: string;
+  id?: string | number;
+  requestId?: string | number;
   tag?: string;
   payload?: unknown;
   headers?: unknown;
@@ -37,7 +37,7 @@ interface RpcClientFrame {
 
 interface RpcServerFrame {
   _tag: "Chunk" | "Exit" | "Pong" | "Ping" | "Defect" | string;
-  requestId?: string;
+  requestId?: string | number;
   values?: unknown[];
   exit?: { _tag: "Success"; value: unknown } | { _tag: "Failure"; cause: unknown };
   defect?: unknown;
@@ -47,7 +47,7 @@ interface PendingUpstreamCall {
   resolve?: (exit: { _tag: "Success"; value: unknown } | { _tag: "Failure"; cause: unknown }) => void;
   onChunk?: (values: unknown[]) => void;
   clientWs?: ServerWebSocket<HubWsData>;
-  clientReqId?: string;
+  clientReqId?: string | number;
   vmProjectId?: string;
   hubProjectId?: string;
   tag?: string;
@@ -347,7 +347,7 @@ class HubVmBridge {
 
   forwardToClient(
     clientWs: ServerWebSocket<HubWsData>,
-    clientReqId: string,
+    clientReqId: string | number,
     tag: string,
     payload: unknown,
     headers: unknown = [],
@@ -361,7 +361,7 @@ class HubVmBridge {
       hubProjectId: this.sandbox.hubProjectId,
       tag,
     });
-    clientWs.data.upstreamRequests.set(clientReqId, { sandboxId: this.sandbox.sandboxId, upReqId });
+    clientWs.data.upstreamRequests.set(String(clientReqId), { sandboxId: this.sandbox.sandboxId, upReqId });
     this.sendRaw({ _tag: "Request", id: upReqId, tag, payload: rewrittenPayload, headers });
     return upReqId;
   }
@@ -418,8 +418,8 @@ class HubVmBridge {
         call.resolve(frame.exit);
         return;
       }
-      if (call.clientWs && call.clientReqId) {
-        call.clientWs.data.upstreamRequests.delete(call.clientReqId);
+      if (call.clientWs && call.clientReqId !== undefined) {
+        call.clientWs.data.upstreamRequests.delete(String(call.clientReqId));
         let exit: { _tag: "Success"; value: unknown } | { _tag: "Failure"; cause: unknown } = frame.exit;
         if (exit._tag === "Success") {
           // Track asset/upload URL tokens issued by this VM so HTTP GET /api/assets & POST /api/attachments route back to it
@@ -848,7 +848,7 @@ export class HubServer {
     }
     for (const frame of frames) {
       if (frame._tag === "Request") {
-        console.log(`[hub-ws] req id=${frame.id} tag=${frame.tag}`);
+        console.log(`[hub-ws] req id=${JSON.stringify(frame.id)} (${typeof frame.id}) tag=${frame.tag}`);
       }
       void this.handleClientFrame(ws, frame).catch((err) => {
         console.error("[hub] client frame error:", err);
@@ -864,8 +864,8 @@ export class HubServer {
     if (frame._tag === "Pong") return;
 
     if (frame._tag === "Ack") {
-      const reqId = frame.requestId !== undefined ? String(frame.requestId) : "";
-      const ref = ws.data.upstreamRequests.get(reqId);
+      const reqKey = frame.requestId !== undefined ? String(frame.requestId) : "";
+      const ref = ws.data.upstreamRequests.get(reqKey);
       if (ref) {
         this.bridges.get(ref.sandboxId)?.sendAck(ref.upReqId);
       }
@@ -873,23 +873,25 @@ export class HubServer {
     }
 
     if (frame._tag === "Interrupt") {
-      const reqId = frame.requestId !== undefined ? String(frame.requestId) : "";
-      ws.data.localStreams.delete(reqId);
-      const ref = ws.data.upstreamRequests.get(reqId);
+      const rawReqId = frame.requestId ?? "";
+      const reqKey = String(rawReqId);
+      ws.data.localStreams.delete(reqKey);
+      const ref = ws.data.upstreamRequests.get(reqKey);
       if (ref) {
-        ws.data.upstreamRequests.delete(reqId);
+        ws.data.upstreamRequests.delete(reqKey);
         this.bridges.get(ref.sandboxId)?.sendInterrupt(ref.upReqId);
       }
       sendRpcFrame(ws, {
         _tag: "Exit",
-        requestId: reqId,
+        requestId: rawReqId,
         exit: { _tag: "Success", value: undefined },
       });
       return;
     }
 
     if (frame._tag !== "Request" || frame.id === undefined || !frame.tag) return;
-    const reqId = String(frame.id);
+    const reqId = frame.id;
+    const reqKey = String(frame.id);
     const tag = frame.tag;
     const payload = frame.payload;
     const headers = frame.headers ?? [];
@@ -900,7 +902,7 @@ export class HubServer {
       return;
     }
     if (tag === "subscribeServerConfig") {
-      ws.data.localStreams.set(reqId, tag);
+      ws.data.localStreams.set(reqKey, { rawId: reqId, tag });
       sendRpcFrame(ws, {
         _tag: "Chunk",
         requestId: reqId,
@@ -909,7 +911,7 @@ export class HubServer {
       return;
     }
     if (tag === "subscribeServerLifecycle") {
-      ws.data.localStreams.set(reqId, tag);
+      ws.data.localStreams.set(reqKey, { rawId: reqId, tag });
       const hub = this.state.getHub();
       const desc = this.buildDescriptor();
       const events =
@@ -936,7 +938,7 @@ export class HubServer {
       return;
     }
     if (tag === "subscribeAuthAccess") {
-      ws.data.localStreams.set(reqId, tag);
+      ws.data.localStreams.set(reqKey, { rawId: reqId, tag });
       const hub = this.state.getHub();
       sendRpcFrame(ws, {
         _tag: "Chunk",
@@ -957,7 +959,7 @@ export class HubServer {
       return;
     }
     if (tag === "orchestration.subscribeShell") {
-      ws.data.localStreams.set(reqId, tag);
+      ws.data.localStreams.set(reqKey, { rawId: reqId, tag });
       const snapshot = this.buildMergedShellSnapshot();
       const items: unknown[] = [{ kind: "snapshot", snapshot }];
       if ((payload as Record<string, unknown> | undefined)?.requestCompletionMarker) {
@@ -981,12 +983,12 @@ export class HubServer {
       return;
     }
     if (tag === "subscribeTerminalMetadata") {
-      ws.data.localStreams.set(reqId, tag);
+      ws.data.localStreams.set(reqKey, { rawId: reqId, tag });
       sendRpcFrame(ws, { _tag: "Chunk", requestId: reqId, values: [{ kind: "snapshot", threads: [] }] });
       return;
     }
     if (KEEP_OPEN_SUBSCRIPTIONS.has(tag)) {
-      ws.data.localStreams.set(reqId, tag);
+      ws.data.localStreams.set(reqKey, { rawId: reqId, tag });
       const live = this.anyRunningSandbox();
       const bridge = live ? this.bridges.get(live.sandboxId) : undefined;
       if (bridge?.isOpen()) {
@@ -1087,7 +1089,7 @@ export class HubServer {
 
   private async handleLaunchThread(
     ws: ServerWebSocket<HubWsData>,
-    reqId: string,
+    reqId: string | number,
     payload: Record<string, unknown>,
     headers: unknown,
   ): Promise<void> {
@@ -1136,7 +1138,7 @@ export class HubServer {
 
   private async handleDispatchCommand(
     ws: ServerWebSocket<HubWsData>,
-    reqId: string,
+    reqId: string | number,
     payload: Record<string, unknown>,
     headers: unknown,
   ): Promise<void> {
@@ -1187,7 +1189,7 @@ export class HubServer {
 
   private async handleWorkspaceRpc(
     ws: ServerWebSocket<HubWsData>,
-    reqId: string,
+    reqId: string | number,
     tag: string,
     payload: unknown,
     headers: unknown,
@@ -1701,11 +1703,11 @@ export class HubServer {
       // Push updated real ServerConfig to any already-connected clients
       const cfg = this.buildHubServerConfig();
       for (const client of this.clients) {
-        for (const [reqId, tag] of client.data.localStreams) {
-          if (tag === "subscribeServerConfig") {
+        for (const [, sub] of client.data.localStreams) {
+          if (sub.tag === "subscribeServerConfig") {
             sendRpcFrame(client, {
               _tag: "Chunk",
-              requestId: reqId,
+              requestId: sub.rawId,
               values: [{ version: 1, type: "providerStatuses", payload: { providers: cfg.providers } }],
             });
           }
@@ -1731,9 +1733,9 @@ export class HubServer {
 
   private broadcastShellItem(item: Record<string, unknown>): void {
     for (const client of this.clients) {
-      for (const [reqId, tag] of client.data.localStreams) {
-        if (tag === "orchestration.subscribeShell") {
-          sendRpcFrame(client, { _tag: "Chunk", requestId: reqId, values: [item] });
+      for (const [, sub] of client.data.localStreams) {
+        if (sub.tag === "orchestration.subscribeShell") {
+          sendRpcFrame(client, { _tag: "Chunk", requestId: sub.rawId, values: [item] });
         }
       }
     }
@@ -1843,7 +1845,7 @@ function sendRpcFrame(ws: ServerWebSocket<HubWsData>, frame: Record<string, unkn
   }
 }
 
-function sendRpcExitSuccess(ws: ServerWebSocket<HubWsData>, requestId: string, value: unknown): void {
+function sendRpcExitSuccess(ws: ServerWebSocket<HubWsData>, requestId: string | number, value: unknown): void {
   sendRpcFrame(ws, {
     _tag: "Exit",
     requestId,
@@ -1851,7 +1853,7 @@ function sendRpcExitSuccess(ws: ServerWebSocket<HubWsData>, requestId: string, v
   });
 }
 
-function sendRpcExitFailure(ws: ServerWebSocket<HubWsData>, requestId: string, message: string): void {
+function sendRpcExitFailure(ws: ServerWebSocket<HubWsData>, requestId: string | number, message: string): void {
   sendRpcFrame(ws, {
     _tag: "Exit",
     requestId,
