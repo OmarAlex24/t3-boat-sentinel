@@ -520,6 +520,65 @@ describe("End-to-end HTTP & WebSocket proxy + ControlPlane + Job API", () => {
     });
     expect(goodWd.status).toBe(200);
   });
+
+  test("LlmProxy swaps per-sandbox ephemeral token -> real upstream key only while running, and rejects sleeping/deleted VMs with 401", async () => {
+    const seenUpstreamKeys: Array<string | null> = [];
+    const mockLlmUpstream = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(req) {
+        seenUpstreamKeys.push(req.headers.get("x-api-key"));
+        return Response.json({ ok: true, model: "claude-opus-5-5" });
+      },
+    });
+    cleanups.push(() => mockLlmUpstream.stop(true));
+
+    const boat = new MockBoat();
+    boat.snapshots.add("env-my-app");
+    const config = makeTestConfig(0);
+    config.llmProxy = {
+      host: "boat-llm.boat.example.com",
+      upstreamUrl: `http://127.0.0.1:${mockLlmUpstream.port}`,
+      upstreamApiKey: "real-secret-upstream-key",
+    };
+
+    const handle = createSentinelServer(config, boat, { startBackgroundLoops: false });
+    cleanups.push(() => handle.stop());
+    const base = `http://127.0.0.1:${handle.server.port}`;
+
+    const { slot } = await handle.lifecycle.spawn("my-app", { slot: "boat-1" });
+    const ephemeral = slot.llmToken!;
+    expect(ephemeral).toStartWith("t3llm_");
+    expect(ephemeral).not.toBe("real-secret-upstream-key");
+
+    // While running: ephemeral token works and upstream receives real key
+    const okRes = await fetch(`${base}/v1/messages`, {
+      method: "POST",
+      headers: { host: "boat-llm.boat.example.com", "x-api-key": ephemeral },
+      body: JSON.stringify({ model: "claude-opus-5-5" }),
+    });
+    expect(okRes.status).toBe(200);
+    expect(seenUpstreamKeys).toEqual(["real-secret-upstream-key"]);
+
+    // Once sleeping: same ephemeral token is IMMEDIATELY rejected with 401!
+    await handle.lifecycle.sleep("boat-1");
+    const sleepRes = await fetch(`${base}/v1/messages`, {
+      method: "POST",
+      headers: { host: "boat-llm.boat.example.com", "x-api-key": ephemeral },
+      body: "{}",
+    });
+    expect(sleepRes.status).toBe(401);
+
+    // Once deleted: still 401 and slot.llmToken is wiped
+    await handle.lifecycle.destroy("boat-1", "test");
+    expect(handle.state.getSlot("boat-1")!.llmToken).toBeNull();
+    const deadRes = await fetch(`${base}/v1/messages`, {
+      method: "POST",
+      headers: { host: "boat-llm.boat.example.com", "x-api-key": ephemeral },
+      body: "{}",
+    });
+    expect(deadRes.status).toBe(401);
+  });
 });
 
 describe("MCP server handlers", () => {

@@ -19,6 +19,8 @@ export interface SlotRecord {
   sandboxId: string | null;
   /** Per-sandbox secret for watchdog -> sentinel callbacks (unique per VM, never shared). */
   watchdogSecret: string | null;
+  /** Per-sandbox ephemeral token for sentinel's LLM proxy (active ONLY while phase === "running"). */
+  llmToken: string | null;
   project: string | null;
   snapshot: string | null;
   size: string;
@@ -97,6 +99,7 @@ export class StateStore {
         clients: Array.isArray(prev?.clients) ? prev.clients : [],
         sandboxId: prev?.sandboxId ?? null,
         watchdogSecret: prev?.watchdogSecret ?? null,
+        llmToken: prev?.llmToken ?? null,
         project: prev?.project ?? null,
         snapshot: prev?.snapshot ?? null,
         size: s.size ?? prev?.size ?? config.boat.defaultSize,

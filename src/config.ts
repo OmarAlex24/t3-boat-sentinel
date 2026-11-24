@@ -75,6 +75,15 @@ export interface InjectFileConfig {
   mode?: string;
 }
 
+export interface LlmProxyConfig {
+  /** Hostname exposed via Cloudflare Tunnel wildcard (e.g. "boat-llm.example.com"). */
+  host: string;
+  /** Private LAN / Tailscale upstream LLM API URL reachable from sentinel (e.g. "http://192.168.1.248:8317"). */
+  upstreamUrl: string;
+  /** Real upstream API key/token — stays strictly on sentinel; VMs receive a per-sandbox ephemeral token! */
+  upstreamApiKey: string;
+}
+
 export interface SentinelConfig {
   domain: string;
   controlHost: string;
@@ -111,6 +120,7 @@ export interface SentinelConfig {
     injectFiles: InjectFileConfig[];
   };
   klav?: KlavGlobalConfig;
+  llmProxy?: LlmProxyConfig;
   /**
    * Wake behavior for sleeping slots:
    * - "manual" (default): returns 503 while asleep (zero phantom wakes, zero dropped frames); wake via dashboard/MCP/CLI
@@ -212,6 +222,15 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
     }
   }
 
+  let llmProxy: LlmProxyConfig | undefined;
+  if (parsed.llmProxy) {
+    llmProxy = {
+      host: requireString(parsed.llmProxy.host, "llmProxy.host").replace(/^https?:\/\//, "").replace(/\/+$/, "").toLowerCase(),
+      upstreamUrl: requireString(parsed.llmProxy.upstreamUrl, "llmProxy.upstreamUrl").replace(/\/+$/, ""),
+      upstreamApiKey: requireSecret(parsed.llmProxy.upstreamApiKey, "llmProxy.upstreamApiKey"),
+    };
+  }
+
   const wakePolicy = parsed.wakePolicy === "on-connect" ? "on-connect" : "manual";
 
   const slots = Array.isArray(parsed.slots) ? parsed.slots : [];
@@ -253,6 +272,7 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
     t3,
     boat,
     klav,
+    llmProxy,
     wakePolicy,
     slots,
     projects,

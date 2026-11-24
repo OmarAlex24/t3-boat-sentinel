@@ -8,6 +8,7 @@ import { ControlPlane } from "./control.ts";
 import { JobManager } from "./jobs.ts";
 import { KlavCliProvider, type KlavClient } from "./klav.ts";
 import { LifecycleManager } from "./lifecycle.ts";
+import { LlmProxy } from "./llm-proxy.ts";
 import { runStdioMcp } from "./mcp.ts";
 import { SlotProxy, type WsData } from "./proxy.ts";
 import { StateStore } from "./state.ts";
@@ -33,6 +34,7 @@ export function createSentinelServer(
   const proxy = new SlotProxy(config, state, lifecycle);
   const jobs = new JobManager();
   const control = new ControlPlane(config, state, lifecycle, proxy, jobs);
+  const llmProxy = config.llmProxy ? new LlmProxy(config.llmProxy, state) : null;
 
   if (opts.startBackgroundLoops !== false) {
     lifecycle.startBackgroundLoops();
@@ -45,6 +47,9 @@ export function createSentinelServer(
     idleTimeout: 255,
     fetch(req, srv) {
       const host = (req.headers.get("host") ?? "").split(":")[0].toLowerCase();
+      if (llmProxy && config.llmProxy && host === config.llmProxy.host) {
+        return llmProxy.handle(req);
+      }
       if (host === config.controlHost.toLowerCase() || host === "localhost" || host === "127.0.0.1") {
         return control.handle(req);
       }

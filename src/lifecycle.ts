@@ -162,6 +162,7 @@ export class LifecycleManager {
         const size = project.size ?? current.size ?? this.config.boat.defaultSize;
         const sandboxName = `${this.config.boat.sandboxPrefix}${slotName}-${Date.now().toString(36)}`;
         const perSandboxWatchdogSecret = randomToken(32);
+        const perSandboxLlmToken = this.config.llmProxy ? `t3llm_${randomToken(24)}` : null;
 
         this.state.updateSlot(slotName, (s) => {
           s.phase = "provisioning";
@@ -183,7 +184,14 @@ export class LifecycleManager {
             klavAgentName = prov.agentName;
           }
 
-          await this.provisionRunningVm(slotName, sandboxId, project, perSandboxWatchdogSecret, true);
+          await this.provisionRunningVm(
+            slotName,
+            sandboxId,
+            project,
+            perSandboxWatchdogSecret,
+            perSandboxLlmToken,
+            true,
+          );
 
           const url = await this.boat.hostPublic(sandboxId, 3773);
           const now = new Date().toISOString();
@@ -191,6 +199,7 @@ export class LifecycleManager {
           const live = this.state.updateSlot(slotName, (s) => {
             s.sandboxId = sandboxId;
             s.watchdogSecret = perSandboxWatchdogSecret;
+            s.llmToken = perSandboxLlmToken;
             s.klavAgentName = klavAgentName;
             s.upstreamUrl = url;
             s.generation += 1;
@@ -257,6 +266,7 @@ export class LifecycleManager {
           this.state.updateSlot(slotName, (s) => {
             s.sandboxId = null;
             s.watchdogSecret = null;
+            s.llmToken = null;
             s.klavAgentName = null;
             s.t3ProjectId = null;
             s.upstreamUrl = null;
@@ -302,6 +312,7 @@ export class LifecycleManager {
           this.state.updateSlot(slotName, (s) => {
             s.sandboxId = null;
             s.watchdogSecret = null;
+            s.llmToken = null;
             s.klavAgentName = null;
             s.t3ProjectId = null;
             s.upstreamUrl = null;
@@ -318,7 +329,7 @@ export class LifecycleManager {
         if (this.config.t3.autoUpdateOnWake || !current.upstreamToken) {
           const project = current.project ? this.config.projects[current.project] : undefined;
           const wdSecret = current.watchdogSecret ?? randomToken(32);
-          await this.provisionRunningVm(slotName, sandboxId, project, wdSecret, !current.upstreamToken);
+          await this.provisionRunningVm(slotName, sandboxId, project, wdSecret, current.llmToken, !current.upstreamToken);
         }
 
         const url = await this.boat.hostPublic(sandboxId, 3773);
@@ -412,6 +423,7 @@ export class LifecycleManager {
     const updated = this.state.updateSlot(slotName, (s) => {
       s.sandboxId = null;
       s.watchdogSecret = null;
+      s.llmToken = null;
       s.klavAgentName = null;
       s.t3ProjectId = null;
       s.project = null;
@@ -691,6 +703,7 @@ export class LifecycleManager {
     sandboxId: string,
     project: ProjectConfig | undefined,
     watchdogSecret: string,
+    llmToken: string | null,
     mintToken: boolean,
   ): Promise<void> {
     const slot = this.state.getSlot(slotName)!;
@@ -698,7 +711,7 @@ export class LifecycleManager {
     await this.boat.upload(sandboxId, PROVISION_SCRIPT, "~/.t3-sentinel/provision-base.sh");
     await this.boat.upload(sandboxId, WATCHDOG_SCRIPT, "~/.t3-sentinel/watchdog.mjs");
 
-    // Upload per-sandbox watchdog secrets via `boat scp` (mode 0600) — NEVER on the `boat exec` CLI!
+    // Upload per-sandbox watchdog secrets + ephemeral LLM proxy config via `boat scp` (mode 0600)
     const tmpDir = mkdtempSync(join(tmpdir(), "t3-sentinel-boot-"));
     try {
       const bootSecretsPath = join(tmpDir, "boot-secrets.json");
@@ -721,6 +734,31 @@ export class LifecycleManager {
         { mode: 0o600 },
       );
       await this.boat.upload(sandboxId, bootSecretsPath, "~/.t3-sentinel/boot-secrets.json");
+
+      // If llmProxy is configured, inject ONLY the ephemeral per-sandbox token (real API key never leaves sentinel!)
+      if (this.config.llmProxy && llmToken) {
+        const claudeSettingsPath = join(tmpDir, "claude-settings.json");
+        writeFileSync(
+          claudeSettingsPath,
+          JSON.stringify(
+            {
+              env: {
+                CLAUDE_CODE_DISABLE_TERMINAL_TITLE: "1",
+                CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: "1",
+                ANTHROPIC_BASE_URL: `https://${this.config.llmProxy.host}`,
+                ANTHROPIC_AUTH_TOKEN: llmToken,
+              },
+              skipDangerousModePermissionPrompt: true,
+            },
+            null,
+            2,
+          ),
+          { mode: 0o600 },
+        );
+        await this.boat.execOk(sandboxId, "mkdir -p ~/.claude", 30);
+        await this.boat.upload(sandboxId, claudeSettingsPath, "~/.claude/settings.json");
+        await this.boat.execOk(sandboxId, "chmod 600 ~/.claude/settings.json", 30);
+      }
     } finally {
       rmSync(tmpDir, { recursive: true, force: true });
     }

@@ -64,6 +64,14 @@ boat:
 #   proxyPort: 8790
 #   defaultTtl: 8h
 
+# Optional: Zero-trust per-sandbox LLM API proxy (e.g. forwarding to a private LAN/Tailscale CLIProxy).
+# Boat VMs NEVER join your Tailnet/LAN and NEVER see `upstreamApiKey` — each running VM receives
+# a unique ephemeral `t3llm_...` token that immediately returns 401 when the VM sleeps or is deleted!
+# llmProxy:
+#   host: boat-llm.example.com
+#   upstreamUrl: http://192.168.1.248:8317
+#   upstreamApiKey: ${LLM_UPSTREAM_API_KEY}
+
 # Wake behavior when T3 Mobile/Desktop connects to a sleeping slot:
 # - "manual" (default): returns 503 while asleep (0 phantom wakes, 0 dropped frames); wake from ctrl/MCP/CLI
 # - "on-connect": transparently wakes the sleeping VM when a client connects
