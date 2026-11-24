@@ -1295,4 +1295,42 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     expect(ep.url).toBe(`http://127.0.0.1:${gateServer.port}`);
     expect(ep.headers).toEqual({ cookie: "_port_auth=signed-cookie-val" });
   });
+
+  test("reaperTick never kills an in-flight Hub VM while it is still provisioning", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-reaper-hub-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+
+    const vm = startFakeVmT3Server("vm-reaper");
+    cleanups.push(() => vm.server.stop(true));
+
+    const boat = new MockBoat();
+    boat.snapshots.add("env-my-app");
+    boat.upstreamBaseUrl = vm.url;
+
+    const cfg: SentinelConfig = {
+      ...makeTestConfig(0),
+      stateDir: dir,
+      hub: { host: "boat.boat.example.com", label: "Boat", maxSandboxes: 5 },
+    };
+    const handle = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+    cleanups.push(() => handle.stop());
+
+    // Fire reaperTick RIGHT in the middle of provisioning the Hub VM (before setHubSandbox is called!)
+    const origExec = boat.exec.bind(boat);
+    let reaperRanDuringSpawn = false;
+    boat.exec = async (id: string, script: string) => {
+      if (!reaperRanDuringSpawn && script.includes("provision-base.sh")) {
+        reaperRanDuringSpawn = true;
+        await handle.lifecycle.reaperTick();
+        expect(boat.deleted).not.toContain(id);
+        expect(boat.sandboxes.has(id)).toBe(true);
+      }
+      return origExec(id, script);
+    };
+
+    const sb = await handle.hub!.spawnSandboxForThread("my-app", "thread-reaper-safe");
+    expect(reaperRanDuringSpawn).toBe(true);
+    expect(sb.phase).toBe("running");
+    expect(boat.deleted).not.toContain(sb.sandboxId);
+  });
 });

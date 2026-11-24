@@ -1667,6 +1667,7 @@ export class HubServer {
         `[hub] spawning fresh VM ${sandboxName} via ${this.boat.name} for project="${projectKey}" thread=${threadId} (snapshot=${snapshotToUse ?? "base-image"})`,
       );
       sandboxId = await this.boat.create({ name: sandboxName, size, fromSnapshot: snapshotToUse });
+      this.lifecycle.trackInFlightSandbox(sandboxId);
 
       if (effectiveProject.klav && this.klav) {
         emitStage("checkout", `VM ${sandboxId} created — attaching zero-trust Klav proxy...`, 40);
@@ -1753,6 +1754,10 @@ export class HubServer {
         await this.klav.revokeForSandbox(klavAgentName).catch(() => {});
       }
       throw err;
+    } finally {
+      if (sandboxId) {
+        this.lifecycle.untrackInFlightSandbox(sandboxId);
+      }
     }
   }
 

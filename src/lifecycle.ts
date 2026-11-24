@@ -49,8 +49,9 @@ export class LifecycleManager {
   private locks = new Map<string, Promise<unknown>>();
   /** Synchronously reserved slot names so concurrent spawns never race on pickFreeSlot(). */
   private reservedSlots = new Set<string>();
-  /** Temporary VM ids owned by active bakes so reaperTick() never kills a live bake. */
+  /** Temporary VM ids owned by active bakes or in-flight Hub spawns so reaperTick() never kills a booting VM. */
   private inFlightBakes = new Set<string>();
+  private inFlightSpawns = new Set<string>();
   private reaperTimer: ReturnType<typeof setInterval> | null = null;
   private bakeTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -67,6 +68,15 @@ export class LifecycleManager {
 
   getProvider(): SandboxProvider {
     return this.boat;
+  }
+
+  /** Protect a newly created Hub VM from orphan reaping while it is still provisioning. */
+  trackInFlightSandbox(sandboxId: string): void {
+    this.inFlightSpawns.add(sandboxId);
+  }
+
+  untrackInFlightSandbox(sandboxId: string): void {
+    this.inFlightSpawns.delete(sandboxId);
   }
 
   startBackgroundLoops(): void {
@@ -765,12 +775,12 @@ export class LifecycleManager {
       }
     }
 
-    // 3. Kill orphan sandboxes matching our prefix (never touch in-flight bakes or active slots)
+    // 3. Kill orphan sandboxes matching our prefix (never touch in-flight bakes, in-flight Hub spawns, or active slots)
     for (const sb of liveList) {
       if (!sb.name?.startsWith(this.config.boat.sandboxPrefix)) continue;
-      if (activeIds.has(sb.id) || this.inFlightBakes.has(sb.id)) continue;
+      if (activeIds.has(sb.id) || this.inFlightBakes.has(sb.id) || this.inFlightSpawns.has(sb.id)) continue;
       if (this.state.listPendingDeletes().some((d) => d.sandboxId === sb.id)) continue;
-      if (this.locks.size > 0 || this.reservedSlots.size > 0) continue;
+      if (this.locks.size > 0 || this.reservedSlots.size > 0 || this.inFlightSpawns.size > 0) continue;
       console.warn(`[reaper] found orphan sentinel sandbox ${sb.id} (${sb.name}) -> queueing delete`);
       this.state.queueDelete(sb.id, "orphan");
       await this.boat.delete(sb.id).catch((e) => console.warn("[reaper] orphan delete failed:", e));
