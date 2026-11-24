@@ -170,6 +170,10 @@ class HubVmBridge {
   private readonly pending = new Map<string, PendingUpstreamCall>();
   private readonly openWaiters: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
   private readonly shellReqId = "hub-shell";
+  /** Persistent `subscribeServerConfig` stream: the VM publishes corrected provider status after boot on it. */
+  private readonly configReqId = "hub-config";
+  /** Latest `providerStatuses` list seen on the current connection; overrides the (possibly stale) boot snapshot. */
+  private latestProviders: unknown[] | null = null;
 
   constructor(
     public sandbox: HubSandboxRecord,
@@ -179,6 +183,7 @@ class HubVmBridge {
       sandbox: HubSandboxRecord,
       templates: { serverConfig?: Record<string, unknown>; lifecycleEvents?: unknown[]; vcsRefs?: unknown },
     ) => void,
+    private readonly onProviderStatuses: (sandboxId: string, providers: unknown[]) => void = () => {},
   ) {}
 
   start(): void {
@@ -198,6 +203,9 @@ class HubVmBridge {
     }
     for (const waiter of this.openWaiters.splice(0)) {
       waiter.reject(new Error("VM bridge stopped"));
+    }
+    if (this.pending.has(this.configReqId)) {
+      this.sendRaw({ _tag: "Interrupt", requestId: this.configReqId });
     }
     for (const [upId, call] of this.pending) {
       this.pending.delete(upId);
@@ -279,8 +287,10 @@ class HubVmBridge {
         if (this.isOpen()) this.sendRaw({ _tag: "Ping" });
       }, 25_000);
 
-      // Harvest real ServerConfig / lifecycle / vcsRefs in background
-      void this.harvestTemplates();
+      // Follow this VM's ServerConfig stream for the life of the connection, and harvest
+      // real ServerConfig / lifecycle / vcsRefs in background from its first snapshot.
+      const firstConfig = this.subscribeServerConfig();
+      void this.harvestTemplates(ws, firstConfig);
     });
 
     ws.addEventListener("message", (ev) => {
@@ -301,6 +311,11 @@ class HubVmBridge {
       for (const [upId, call] of this.pending) {
         this.pending.delete(upId);
         if (upId === this.shellReqId) continue;
+        if (upId === this.configReqId) {
+          // Settle a still-waiting first-snapshot promise; reconnect re-subscribes
+          call.resolve?.({ _tag: "Failure", cause: { _tag: "Fail", error: { message: "Upstream VM disconnected" } } });
+          continue;
+        }
         if (call.resolve) {
           call.resolve({ _tag: "Failure", cause: { _tag: "Fail", error: { message: "Upstream VM disconnected" } } });
         } else if (call.clientWs && call.clientReqId) {
@@ -317,15 +332,70 @@ class HubVmBridge {
     });
   }
 
-  private async harvestTemplates(): Promise<void> {
+  /**
+   * Opens the persistent `subscribeServerConfig` stream on the current connection. Every chunk is
+   * Acked. Resolves with the first `snapshot` config, or null if none arrives within 10s or the
+   * stream ends first. Later `providerStatuses` items (T3 publishes the real check result after
+   * booting from its on-disk cache) go to `onProviderStatuses`.
+   */
+  private subscribeServerConfig(): Promise<Record<string, unknown> | null> {
+    this.latestProviders = null;
+    return new Promise((resolve) => {
+      let settled = false;
+      const settle = (cfg: Record<string, unknown> | null) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(cfg);
+      };
+      const timer = setTimeout(() => settle(null), 10_000);
+      this.pending.set(this.configReqId, {
+        onChunk: (values) => {
+          this.sendRaw({ _tag: "Ack", requestId: this.configReqId });
+          for (const raw of values) {
+            if (!raw || typeof raw !== "object") continue;
+            const item = raw as { type?: unknown; config?: unknown; payload?: unknown };
+            if (item.type === "snapshot" && item.config && typeof item.config === "object") {
+              const config = item.config as Record<string, unknown>;
+              if (!settled) {
+                settle(config);
+              } else if (Array.isArray(config.providers)) {
+                this.handleProviderStatuses(config.providers);
+              }
+            } else if (item.type === "providerStatuses") {
+              const providers = (item.payload as { providers?: unknown } | undefined)?.providers;
+              if (Array.isArray(providers)) this.handleProviderStatuses(providers);
+            }
+          }
+        },
+        // Stream ended (Exit) or bridge stopped before a snapshot arrived
+        resolve: () => settle(null),
+      });
+      this.sendRaw({
+        _tag: "Request",
+        id: this.configReqId,
+        tag: "subscribeServerConfig",
+        payload: { workspaceSnapshotsOnDemand: true },
+        headers: [],
+      });
+    });
+  }
+
+  private handleProviderStatuses(providers: unknown[]): void {
+    this.latestProviders = providers;
+    this.onProviderStatuses(this.sandbox.sandboxId, providers);
+  }
+
+  private async harvestTemplates(
+    ws: WebSocket,
+    firstConfig: Promise<Record<string, unknown> | null>,
+  ): Promise<void> {
     try {
       const templates: { serverConfig?: Record<string, unknown>; lifecycleEvents?: unknown[]; vcsRefs?: unknown } = {};
-      const cfgChunk = await this.captureFirstChunk("subscribeServerConfig", {
-        workspaceSnapshotsOnDemand: true,
-      });
-      const firstCfg = cfgChunk?.[0] as { type?: string; config?: Record<string, unknown> } | undefined;
-      if (firstCfg?.type === "snapshot" && firstCfg.config) {
-        templates.serverConfig = firstCfg.config;
+      const snapshot = await firstConfig;
+      if (this.ws !== ws) return; // reconnected meanwhile; the new connection harvests again
+      if (snapshot) {
+        templates.serverConfig = snapshot;
       } else {
         const cfg = await this.callUnary("server.getConfig", {});
         if (cfg._tag === "Success" && cfg.value && typeof cfg.value === "object") {
@@ -336,6 +406,11 @@ class HubVmBridge {
       const lifecycle = await this.captureFirstChunk("subscribeServerLifecycle", {});
       if (lifecycle && lifecycle.length > 0) {
         templates.lifecycleEvents = lifecycle;
+      }
+      if (this.ws !== ws) return;
+      // A live status published while harvesting is newer than the boot snapshot
+      if (templates.serverConfig && this.latestProviders) {
+        templates.serverConfig = { ...templates.serverConfig, providers: this.latestProviders };
       }
       this.onTemplatesHarvested(this.sandbox, templates);
     } catch {
@@ -1253,6 +1328,11 @@ export class HubServer {
       return;
     }
     if (tag === "server.refreshProviders") {
+      const forwarded = await this.forwardRefreshProviders(payload);
+      if (forwarded) {
+        sendRpcExitSuccess(ws, reqId, forwarded);
+        return;
+      }
       const cfg = this.buildHubServerConfig();
       sendRpcExitSuccess(ws, reqId, { providers: cfg.providers ?? [] });
       return;
@@ -2057,6 +2137,7 @@ export class HubServer {
       (sandboxId, items) => this.handleVmShellItems(sandboxId, items),
       (sandboxId, token) => this.urlTokenToSandbox.set(token, sandboxId),
       (sandbox, templates) => this.handleTemplatesHarvested(sandbox, templates),
+      (sandboxId, providers) => this.handleVmProviderStatuses(sandboxId, providers),
     );
     this.bridges.set(sb.sandboxId, bridge);
     bridge.start();
@@ -2140,6 +2221,83 @@ export class HubServer {
     }
   }
 
+  /** Sends the Hub's current provider list to every client subscribed to `subscribeServerConfig`. */
+  private broadcastProviderStatuses(): void {
+    const cfg = this.buildHubServerConfig();
+    for (const client of this.clients) {
+      for (const [, sub] of client.data.localStreams) {
+        if (sub.tag === "subscribeServerConfig") {
+          sendRpcFrame(client, {
+            _tag: "Chunk",
+            requestId: sub.rawId,
+            values: [{ version: 1, type: "providerStatuses", payload: { providers: cfg.providers } }],
+          });
+        }
+      }
+    }
+  }
+
+  /**
+   * Replaces only `serverConfig.providers` in Hub state and broadcasts it. No-op when unchanged or
+   * when no config was harvested yet (the bridge folds live statuses into its first harvest).
+   * With several VMs the last writer wins.
+   */
+  private applyProviderStatuses(providers: unknown[]): boolean {
+    const current = this.state.getHub()?.serverConfig;
+    if (!current || typeof current !== "object") return false;
+    if (JSON.stringify(current.providers) === JSON.stringify(providers)) return false;
+    this.state.updateHub((h) => {
+      if (h.serverConfig && typeof h.serverConfig === "object") {
+        h.serverConfig = { ...h.serverConfig, providers };
+      }
+    });
+    this.broadcastProviderStatuses();
+    return true;
+  }
+
+  private handleVmProviderStatuses(sandboxId: string, providers: unknown[]): void {
+    if (!this.state.getHubSandbox(sandboxId)) return;
+    this.applyProviderStatuses(providers);
+  }
+
+  /**
+   * Forwards `server.refreshProviders` to a live VM and caches its answer. Returns null with no
+   * open VM bridge or when the forward fails, so the caller replies from the Hub cache.
+   */
+  private async forwardRefreshProviders(payload: unknown): Promise<Record<string, unknown> | null> {
+    const bridge = this.state
+      .listHubSandboxes()
+      .filter((s) => s.phase === "running")
+      .map((s) => this.bridges.get(s.sandboxId))
+      .find((b) => b?.isOpen());
+    if (!bridge) return null;
+    const input = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {};
+    // Antigravity validation alone can take ~90s on a VM
+    const exit = await bridge.callUnary("server.refreshProviders", input, 150_000);
+    if (exit._tag !== "Success" || !exit.value || typeof exit.value !== "object") return null;
+    const value = exit.value as Record<string, unknown>;
+    const replied = value.providers;
+    // An empty reply (omitProviders / modelCatalogOnly) and per-cwd snapshots are not the machine list
+    if (Array.isArray(replied) && replied.length > 0 && input.cwd === undefined) {
+      const cached = this.state.getHub()?.serverConfig?.providers;
+      let next: unknown[] = replied;
+      if (typeof input.instanceId === "string" && Array.isArray(cached)) {
+        const byId = new Map<unknown, unknown>();
+        for (const p of replied) byId.set((p as { instanceId?: unknown } | null)?.instanceId, p);
+        next = cached.map((p) => {
+          const id = (p as { instanceId?: unknown } | null)?.instanceId;
+          if (!byId.has(id)) return p;
+          const replacement = byId.get(id);
+          byId.delete(id);
+          return replacement;
+        });
+        next.push(...byId.values());
+      }
+      this.applyProviderStatuses(next);
+    }
+    return value;
+  }
+
   private handleTemplatesHarvested(
     sandbox: HubSandboxRecord,
     templates: { serverConfig?: Record<string, unknown>; lifecycleEvents?: unknown[]; vcsRefs?: unknown },
@@ -2157,18 +2315,7 @@ export class HubServer {
     });
     if (changed && templates.serverConfig) {
       // Push updated real ServerConfig to any already-connected clients
-      const cfg = this.buildHubServerConfig();
-      for (const client of this.clients) {
-        for (const [, sub] of client.data.localStreams) {
-          if (sub.tag === "subscribeServerConfig") {
-            sendRpcFrame(client, {
-              _tag: "Chunk",
-              requestId: sub.rawId,
-              values: [{ version: 1, type: "providerStatuses", payload: { providers: cfg.providers } }],
-            });
-          }
-        }
-      }
+      this.broadcastProviderStatuses();
     }
     // Also harvest vcsRefs for this project if missing
     const project = this.state.getAllProjects(this.config)[sandbox.project];

@@ -626,9 +626,19 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     while (cleanups.length) cleanups.pop()!();
   });
 
-  function startFakeVmT3Server(vmTag: string) {
+  function startFakeVmT3Server(
+    vmTag: string,
+    opts: {
+      /** Answer `subscribeServerConfig` with this snapshot and keep the stream open (default: plain Exit). */
+      configSnapshot?: Record<string, unknown>;
+      /** Answer `server.refreshProviders` with these providers. */
+      refreshProviders?: unknown[];
+    } = {},
+  ) {
     const seenMethods: Array<{ tag: string; payload: unknown }> = [];
+    const acks: string[] = [];
     const vmProjectId = `vm-proj-${vmTag}`;
+    let configStream: { ws: { sendText(data: string): unknown }; requestId: string } | null = null;
     const server = Bun.serve({
       port: 0,
       hostname: "127.0.0.1",
@@ -653,8 +663,34 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
             ws.sendText(JSON.stringify({ _tag: "Pong" }));
             return;
           }
+          if (frame._tag === "Ack") {
+            acks.push(String((frame as { requestId?: unknown }).requestId));
+            return;
+          }
           if (frame._tag !== "Request" || !frame.id || !frame.tag) return;
           seenMethods.push({ tag: frame.tag, payload: frame.payload });
+
+          if (frame.tag === "subscribeServerConfig" && opts.configSnapshot) {
+            configStream = { ws, requestId: frame.id };
+            ws.sendText(
+              JSON.stringify({
+                _tag: "Chunk",
+                requestId: frame.id,
+                values: [{ version: 1, type: "snapshot", config: opts.configSnapshot }],
+              }),
+            );
+            return;
+          }
+          if (frame.tag === "server.refreshProviders" && opts.refreshProviders) {
+            ws.sendText(
+              JSON.stringify({
+                _tag: "Exit",
+                requestId: frame.id,
+                exit: { _tag: "Success", value: { providers: opts.refreshProviders } },
+              }),
+            );
+            return;
+          }
 
           if (frame.tag === "orchestration.subscribeShell") {
             ws.sendText(
@@ -755,8 +791,230 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
         },
       },
     });
-    return { server, url: `http://127.0.0.1:${server.port}`, seenMethods, vmProjectId };
+    const pushConfigItems = (values: unknown[]) => {
+      if (!configStream) throw new Error("no open subscribeServerConfig stream on fake VM");
+      configStream.ws.sendText(JSON.stringify({ _tag: "Chunk", requestId: configStream.requestId, values }));
+    };
+    return { server, url: `http://127.0.0.1:${server.port}`, seenMethods, acks, vmProjectId, pushConfigItems };
   }
+
+  /** Pairs with the Hub and opens one client WebSocket; returns helpers to send and await frames. */
+  async function connectHubClient(handle: SentinelServerHandle, cfg: SentinelConfig) {
+    const base = `http://127.0.0.1:${handle.server.port}`;
+    const pairRes = await fetch(`${base}/api/pair`, {
+      method: "POST",
+      headers: { host: cfg.controlHost, authorization: `Bearer ${cfg.controlSecret}`, "content-type": "application/json" },
+      body: JSON.stringify({ slot: "hub" }),
+    });
+    const { code } = (await pairRes.json()) as { code: string };
+    const tokRes = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: { host: cfg.hub!.host, "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ subject_token: code, client_label: "Mac" }),
+    });
+    const { access_token: bearer } = (await tokRes.json()) as { access_token: string };
+    const tickRes = await fetch(`${base}/api/auth/websocket-ticket/rpc`, {
+      method: "POST",
+      headers: { host: cfg.hub!.host, authorization: `Bearer ${bearer}` },
+    });
+    const { ticket } = (await tickRes.json()) as { ticket: string };
+
+    const ws = new WebSocket(`ws://127.0.0.1:${handle.server.port}/ws?wsTicket=${ticket}&orchestrationProtocol=2`, {
+      headers: { host: cfg.hub!.host },
+    } as unknown as string[]);
+    cleanups.push(() => ws.close());
+
+    const inbox: Array<Record<string, unknown>> = [];
+    const waiters: Array<() => void> = [];
+    await new Promise<void>((resolve, reject) => {
+      ws.addEventListener("open", () => resolve());
+      ws.addEventListener("error", () => reject(new Error("hub ws failed")));
+      ws.addEventListener("message", (ev) => {
+        inbox.push(JSON.parse(String(ev.data)) as Record<string, unknown>);
+        for (const w of waiters.splice(0)) w();
+      });
+    });
+    const waitForFrame = async (pred: (f: Record<string, unknown>) => boolean, timeoutMs = 5_000) => {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        const idx = inbox.findIndex(pred);
+        if (idx >= 0) return inbox.splice(idx, 1)[0];
+        await new Promise<void>((r) => {
+          waiters.push(r);
+          setTimeout(r, 40);
+        });
+      }
+      throw new Error(`Timed out waiting for frame; inbox=${JSON.stringify(inbox)}`);
+    };
+    const request = (id: string | number, tag: string, payload: unknown = {}) =>
+      ws.send(JSON.stringify({ _tag: "Request", id, tag, payload, headers: [] }));
+    return { ws, inbox, waitForFrame, request };
+  }
+
+  type ProviderStub = { instanceId: string; installed?: boolean };
+  const providerById = (providers: unknown, id: string) =>
+    (providers as ProviderStub[] | undefined)?.find((p) => p.instanceId === id);
+  const providerStatusesChunk = (requestId: string | number, id: string, installed: boolean) =>
+    (f: Record<string, unknown>) =>
+      f._tag === "Chunk" &&
+      f.requestId === requestId &&
+      (f.values as Array<{ type?: string; payload?: { providers?: unknown } }>)?.some(
+        (v) => v.type === "providerStatuses" && providerById(v.payload?.providers, id)?.installed === installed,
+      );
+
+  async function startHubWithVm(vm: ReturnType<typeof startFakeVmT3Server>, dirPrefix: string) {
+    const dir = mkdtempSync(join(tmpdir(), dirPrefix));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const boat = new MockBoat();
+    boat.snapshots.add("base-t3");
+    boat.snapshots.add("env-my-app");
+    boat.upstreamBaseUrl = vm.url;
+    const cfg: SentinelConfig = {
+      ...makeTestConfig(0),
+      stateDir: dir,
+      hub: { host: "boat.boat.example.com", label: "Boat", maxSandboxes: 5 },
+    };
+    const handle = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+    cleanups.push(() => handle.stop());
+    return { cfg, handle };
+  }
+
+  async function launchThreadOnHub(client: Awaited<ReturnType<typeof connectHubClient>>, threadId: string) {
+    client.request("shell", "orchestration.subscribeShell");
+    const shellSnap = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "shell");
+    const hubProjectId = String(
+      (((shellSnap.values as Array<Record<string, unknown>>)[0].snapshot as Record<string, unknown>).projects as Array<
+        Record<string, unknown>
+      >)[0].id,
+    );
+    client.request(`launch-${threadId}`, "orchestration.launchThread", {
+      threadId,
+      projectId: hubProjectId,
+      title: "Providers",
+      workspaceStrategy: { type: "root" },
+    });
+    const exit = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === `launch-${threadId}`);
+    expect((exit.exit as Record<string, unknown>)._tag).toBe("Success");
+  }
+
+  test("follows live providerStatuses from a VM after its stale boot snapshot and pushes them to clients", async () => {
+    const staleSnapshot = {
+      providers: [
+        { instanceId: "claudeAgent", driver: "claudeAgent", enabled: true, installed: true },
+        { instanceId: "antigravity", driver: "antigravity", enabled: true, installed: false, message: "Antigravity ACP runtime is not installed" },
+      ],
+      settings: { theme: "dark" },
+      keybindings: [],
+    };
+    const vm = startFakeVmT3Server("vm-prov", { configSnapshot: staleSnapshot });
+    cleanups.push(() => vm.server.stop(true));
+    const { cfg, handle } = await startHubWithVm(vm, "t3-sentinel-hub-prov-");
+    const client = await connectHubClient(handle, cfg);
+
+    client.request("cfg", "subscribeServerConfig", { workspaceSnapshotsOnDemand: true });
+    await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "cfg");
+
+    await launchThreadOnHub(client, "thread-prov");
+
+    // Boot snapshot from the VM's stale on-disk cache reaches the Hub first
+    await client.waitForFrame(providerStatusesChunk("cfg", "antigravity", false));
+    expect(providerById(handle.state.getHub()?.serverConfig?.providers, "antigravity")?.installed).toBe(false);
+    const sub = vm.seenMethods.find((m) => m.tag === "subscribeServerConfig");
+    expect(sub?.payload).toEqual({ workspaceSnapshotsOnDemand: true });
+
+    // The VM's real check then publishes the corrected status on the same stream
+    vm.pushConfigItems([
+      {
+        version: 1,
+        type: "providerStatuses",
+        payload: {
+          providers: [
+            { instanceId: "claudeAgent", driver: "claudeAgent", enabled: true, installed: true },
+            { instanceId: "antigravity", driver: "antigravity", enabled: true, installed: true },
+          ],
+        },
+      },
+    ]);
+    await client.waitForFrame(providerStatusesChunk("cfg", "antigravity", true));
+    const hubCfg = handle.state.getHub()?.serverConfig;
+    expect(providerById(hubCfg?.providers, "antigravity")?.installed).toBe(true);
+    // Only providers were replaced; the rest of the harvested config is untouched
+    expect(hubCfg?.settings).toEqual({ theme: "dark" });
+    // The Hub Acks every chunk of the persistent stream and did not interrupt it
+    expect(vm.acks.filter((id) => id === "hub-config").length).toBeGreaterThanOrEqual(2);
+
+    // An identical status is not re-broadcast
+    const before = client.inbox.length;
+    vm.pushConfigItems([
+      {
+        version: 1,
+        type: "providerStatuses",
+        payload: { providers: hubCfg?.providers },
+      },
+    ]);
+    await new Promise((r) => setTimeout(r, 200));
+    expect(client.inbox.slice(before).some((f) => f._tag === "Chunk" && f.requestId === "cfg")).toBe(false);
+  });
+
+  test("forwards server.refreshProviders to a live VM, replies with its result and caches it", async () => {
+    const refreshed = [
+      { instanceId: "claudeAgent", driver: "claudeAgent", enabled: true, installed: true },
+      { instanceId: "antigravity", driver: "antigravity", enabled: true, installed: true },
+      { instanceId: "acpRegistry_devin", driver: "acpRegistry", enabled: true, installed: true },
+    ];
+    const vm = startFakeVmT3Server("vm-refresh", {
+      configSnapshot: {
+        providers: [{ instanceId: "antigravity", driver: "antigravity", enabled: true, installed: false }],
+        settings: {},
+      },
+      refreshProviders: refreshed,
+    });
+    cleanups.push(() => vm.server.stop(true));
+    const { cfg, handle } = await startHubWithVm(vm, "t3-sentinel-hub-refresh-");
+    const client = await connectHubClient(handle, cfg);
+
+    client.request("cfg", "subscribeServerConfig", {});
+    await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "cfg");
+    await launchThreadOnHub(client, "thread-refresh");
+    await client.waitForFrame(providerStatusesChunk("cfg", "antigravity", false));
+
+    client.request("refresh", "server.refreshProviders", { fresh: true });
+    const exit = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "refresh");
+    const result = exit.exit as { _tag: string; value: { providers: unknown[] } };
+    expect(result._tag).toBe("Success");
+    expect(result.value.providers).toEqual(refreshed);
+    expect(vm.seenMethods.find((m) => m.tag === "server.refreshProviders")?.payload).toEqual({ fresh: true });
+
+    expect(handle.state.getHub()?.serverConfig?.providers).toEqual(refreshed);
+    await client.waitForFrame(providerStatusesChunk("cfg", "acpRegistry_devin", true));
+  });
+
+  test("server.refreshProviders with no live VM returns the Hub's cached providers", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-hub-refresh-cache-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const boat = new MockBoat();
+    boat.snapshots.add("base-t3");
+    const cfg: SentinelConfig = {
+      ...makeTestConfig(0),
+      stateDir: dir,
+      hub: { host: "boat.boat.example.com", label: "Boat", maxSandboxes: 5 },
+    };
+    const handle = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+    cleanups.push(() => handle.stop());
+    const cached = [{ instanceId: "antigravity", driver: "antigravity", enabled: true, installed: true }];
+    handle.state.ensureHub("Boat", Object.keys(handle.state.getAllProjects(cfg)));
+    handle.state.updateHub((h) => {
+      h.serverConfig = { providers: cached, settings: {} };
+    });
+
+    const client = await connectHubClient(handle, cfg);
+    client.request("refresh", "server.refreshProviders", {});
+    const exit = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "refresh");
+    const result = exit.exit as { _tag: string; value: { providers: unknown[] } };
+    expect(result._tag).toBe("Success");
+    expect(result.value.providers).toEqual(cached);
+    expect(handle.state.listHubSandboxes().length).toBe(0);
+  });
 
   test("spawns 1 fresh Boat VM per chat behind 1 single Environment, routes RPCs strictly to owning VM, and destroys only the settled VM", async () => {
     const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-hub-"));
