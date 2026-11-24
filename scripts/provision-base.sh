@@ -261,6 +261,11 @@ if [ "$BAKE_CLEAN" = "1" ]; then
   # while preserving cached provider/ACP tool binaries (`providers/`, `cache/`, `tools/`, `acp-registry/`)
   systemctl --user stop t3code.service 2>/dev/null || true
   systemctl --user stop t3-sentinel-watchdog.service 2>/dev/null || true
+  # Agent/probe helpers (e.g. Devin's background ACP checks) run in app-t3code.slice, outside t3code.service's cgroup
+  systemctl --user stop app-t3code.slice 2>/dev/null || true
+  # Unlinking a still-open DB fails with EBUSY on the sandbox filesystem; wait for holders to exit, name them if not
+  for _ in $(seq 1 30); do grep -q "$userdata_dir/statev2" < <(ls -l /proc/[0-9]*/fd 2>/dev/null) || break; sleep 1; done
+  for p in /proc/[0-9]*; do grep -q "$userdata_dir/statev2" < <(ls -l "$p/fd" 2>/dev/null) && echo "[bake] still holding statev2: $(tr "\0" " " < "$p/cmdline")" >&2; done
   rm -rf \
     "$userdata_dir/statev2.sqlite" "$userdata_dir/statev2.sqlite-wal" "$userdata_dir/statev2.sqlite-shm" \
     "$userdata_dir/server-owner.sqlite" "$userdata_dir/server-owner.sqlite-journal" \
