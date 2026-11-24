@@ -2,7 +2,12 @@ import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { BoatCli, type BoatClient } from "./boat.ts";
+import {
+  asSandboxProvider,
+  createSandboxProvider,
+  type LegacyBoatClient,
+  type SandboxProvider,
+} from "./providers/index.ts";
 import { loadConfig, type SentinelConfig } from "./config.ts";
 import { ControlPlane } from "./control.ts";
 import { HubServer, type HubWsData } from "./hub.ts";
@@ -12,6 +17,7 @@ import { LifecycleManager } from "./lifecycle.ts";
 import { LlmProxy } from "./llm-proxy.ts";
 import { runStdioMcp } from "./mcp.ts";
 import { SlotProxy, type WsData } from "./proxy.ts";
+import { AuthRateLimiter, applySecurityHeaders } from "./security.ts";
 import { StateStore } from "./state.ts";
 
 export type ServerWsData = WsData | HubWsData;
@@ -29,17 +35,19 @@ export interface SentinelServerHandle {
 
 export function createSentinelServer(
   config: SentinelConfig,
-  boat: BoatClient = new BoatCli(config.boat.bin),
+  providerOrLegacy?: SandboxProvider | LegacyBoatClient,
   opts: { startBackgroundLoops?: boolean; klav?: KlavClient } = {},
 ): SentinelServerHandle {
+  const provider = providerOrLegacy ? asSandboxProvider(providerOrLegacy) : createSandboxProvider(config);
   const state = new StateStore(config.stateDir, config);
   const klav = opts.klav ?? (config.klav ? new KlavCliProvider(config.klav) : undefined);
-  const lifecycle = new LifecycleManager(config, state, boat, klav);
-  const proxy = new SlotProxy(config, state, lifecycle);
-  const hub = config.hub ? new HubServer(config, state, boat, lifecycle, klav) : undefined;
+  const rateLimiter = config.security?.disableRateLimit ? undefined : new AuthRateLimiter();
+  const lifecycle = new LifecycleManager(config, state, provider, klav);
+  const proxy = new SlotProxy(config, state, lifecycle, rateLimiter);
+  const hub = config.hub ? new HubServer(config, state, provider, lifecycle, klav, rateLimiter) : undefined;
   const jobs = new JobManager();
-  const control = new ControlPlane(config, state, lifecycle, proxy, jobs, hub);
-  const llmProxy = config.llmProxy ? new LlmProxy(config.llmProxy, state) : null;
+  const control = new ControlPlane(config, state, lifecycle, proxy, jobs, hub, rateLimiter);
+  const llmProxy = config.llmProxy ? new LlmProxy(config.llmProxy, state, rateLimiter) : null;
 
   if (opts.startBackgroundLoops !== false) {
     lifecycle.startBackgroundLoops();
@@ -66,7 +74,7 @@ export function createSentinelServer(
       if (slotName) {
         return proxy.handleHttp(slotName, req, srv as unknown as Bun.Server<WsData>);
       }
-      return new Response(`Unknown host "${host}"`, { status: 404 });
+      return applySecurityHeaders(new Response("Not found", { status: 404 }));
     },
     websocket: {
       open(ws) {

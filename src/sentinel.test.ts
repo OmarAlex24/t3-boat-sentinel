@@ -10,6 +10,7 @@ import { createSentinelServer, type SentinelServerHandle } from "./index.ts";
 import type { KlavClient } from "./klav.ts";
 import { LifecycleManager } from "./lifecycle.ts";
 import { handleMcpRequest } from "./mcp.ts";
+import { SandboxSdkProvider, type ExternalSdkProviderLike } from "./providers/index.ts";
 import { StateStore } from "./state.ts";
 
 class MockBoat implements BoatClient {
@@ -1103,5 +1104,155 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     );
     expect(cloneDone).toBeTruthy();
     expect(boat.snapshots.has("env-cloned-app")).toBe(true);
+  });
+
+  test("modular SandboxSdkProvider works without snapshots, forwards private preview Cookie headers, and degrades pause gracefully", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-sdk-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+
+    const seenCookies: Array<string | null> = [];
+    const upstream = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        seenCookies.push(req.headers.get("cookie"));
+        const url = new URL(req.url);
+        if (url.pathname === "/api/orchestration/shell") {
+          return Response.json({ projects: [{ id: "vm-p1", title: "my-app", workspaceRoot: "/home/user/my-app" }], threads: [] });
+        }
+        return Response.json({ ok: true });
+      },
+    });
+    cleanups.push(() => upstream.stop(true));
+
+    const createdInputs: Array<Record<string, unknown>> = [];
+    const execCommands: string[] = [];
+    const uploadedPaths: string[] = [];
+    const fakeSdk: ExternalSdkProviderLike = {
+      name: "fake-daytona",
+      capabilities: [], // no snapshots, no pause!
+      async create(input) {
+        createdInputs.push(input);
+        return { id: "sdk-box-1" };
+      },
+      async list() {
+        return [{ id: "sdk-box-1", name: "t3s-boat-1", state: "running" }];
+      },
+      async destroy() {},
+      async exec(_id, input) {
+        execCommands.push(input.command);
+        if (input.command.includes("provision-base.sh")) {
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              environmentId: "sdk-env",
+              descriptor: { environmentId: "sdk-env", label: "Boat 1", platform: { os: "linux", arch: "x64" }, serverVersion: "0.1.0", orchestrationProtocolVersion: 2, capabilities: {} },
+              authSession: { authenticated: true, scopes: ["orchestration:read"], permissions: ["orchestration:read"] },
+              upstreamToken: "sdk-upstream-tok",
+              t3Version: "t3 v0.1.0",
+            }),
+            stderr: "",
+          };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+      files: {
+        async write(_id, path) {
+          uploadedPaths.push(path);
+        },
+      },
+      async previewUrl() {
+        return { url: `http://127.0.0.1:${upstream.port}`, headers: { cookie: "boat_gate=secret123" } };
+      },
+    };
+
+    const provider = new SandboxSdkProvider({ adapter: "fake-daytona" }, fakeSdk);
+    expect(provider.capabilities.has("snapshots")).toBe(false);
+    expect(provider.capabilities.has("pause")).toBe(false);
+
+    const cfg: SentinelConfig = { ...makeTestConfig(0), stateDir: dir };
+    const handle = createSentinelServer(cfg, provider, { startBackgroundLoops: false });
+    cleanups.push(() => handle.stop());
+
+    // Baking on a snapshot-less provider throws a clear capability error
+    await expect(handle.lifecycle.bake("my-app")).rejects.toThrow(/does not support named snapshots/);
+
+    // Spawning works cleanly without snapshots (runs bakeCmd on boot!) and sends private preview Cookie header!
+    const res = await handle.lifecycle.spawn("my-app", { slot: "boat-1" });
+    expect(res.slot.phase).toBe("running");
+    expect(res.slot.upstreamHeaders).toEqual({ cookie: "boat_gate=secret123" });
+    expect(createdInputs[0].snapshot).toBeUndefined();
+    expect(execCommands.some((c) => c.includes("pnpm install"))).toBe(true);
+    expect(uploadedPaths.some((p) => p.includes("boot-secrets.json"))).toBe(true);
+    expect(seenCookies).toContain("boat_gate=secret123");
+
+    // Sleep degrades cleanly without crashing when provider has no pause capability
+    const afterSleep = await handle.lifecycle.sleep("boat-1");
+    expect(afterSleep.phase).toBe("running");
+  });
+
+  test("security hardening: robots.txt, anti-indexing/CSP headers, /oauth/token rate limiting (429), and origin Cloudflare Access gate", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-sec-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+
+    const boat = new MockBoat();
+    const cfg: SentinelConfig = {
+      ...makeTestConfig(0),
+      stateDir: dir,
+      hub: { host: "boat.boat.example.com", label: "Boat", maxSandboxes: 5 },
+      security: {
+        cloudflareAccess: {
+          teamDomain: "example.cloudflareaccess.com",
+          aud: "test-aud-tag",
+        },
+      },
+    };
+
+    const handle = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+    cleanups.push(() => handle.stop());
+    const base = `http://127.0.0.1:${handle.server.port}`;
+
+    // 1. robots.txt + X-Robots-Tag on Hub & Control
+    const robots = await fetch(`${base}/robots.txt`, { headers: { host: "boat.boat.example.com" } });
+    expect(robots.status).toBe(200);
+    expect(await robots.text()).toContain("Disallow: /");
+    expect(robots.headers.get("x-robots-tag")).toContain("noindex");
+
+    // 2. Control plane blocks public host without Cf-Access-Jwt-Assertion (403), while loopback CLI still works!
+    const blockedDash = await fetch(`${base}/`, { headers: { host: cfg.controlHost } });
+    expect(blockedDash.status).toBe(403);
+    const localDash = await fetch(`${base}/`, { headers: { host: "127.0.0.1" } });
+    expect(localDash.status).toBe(200);
+    expect(localDash.headers.get("x-frame-options")).toBe("DENY");
+    expect(localDash.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+
+    // /health returns minimal { ok: true } without exposing slot count
+    const health = await fetch(`${base}/health`, { headers: { host: cfg.controlHost } });
+    expect(await health.json()).toEqual({ ok: true });
+
+    // 3. Brute-forcing /oauth/token locks out IP with 429 after 5 bad guesses
+    for (let i = 0; i < 5; i++) {
+      const bad = await fetch(`${base}/oauth/token`, {
+        method: "POST",
+        headers: {
+          host: "boat.boat.example.com",
+          "cf-connecting-ip": "203.0.113.99",
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body: "subject_token=wrong-guess",
+      });
+      expect(bad.status).toBe(400);
+    }
+    const locked = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: {
+        host: "boat.boat.example.com",
+        "cf-connecting-ip": "203.0.113.99",
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: "subject_token=wrong-guess-6",
+    });
+    expect(locked.status).toBe(429);
+    expect(locked.headers.get("retry-after")).toBeTruthy();
   });
 });

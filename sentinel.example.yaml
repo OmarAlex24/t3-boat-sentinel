@@ -24,6 +24,23 @@ hub:
   label: Boat
   maxSandboxes: 20
 
+# Optional: Modular sandbox backend (defaults to native Boat CLI when omitted).
+# Swap to any `@opencoredev/sandbox-sdk` provider (daytona, e2b, docker, vercel, upstash,
+# railway, freestyle, boxd, superserve, sandboxer, tenki) after `bun add @opencoredev/sandbox-sdk`:
+# provider:
+#   type: sandbox-sdk
+#   adapter: daytona
+#   options: {}
+
+# Optional: Origin-side link security hardening (in addition to Cloudflare Zero Trust edge policies).
+# Verifies `Cf-Access-Jwt-Assertion` (RS256 JWKS) on `controlHost` (exempts `/internal/watchdog`, `/health`, and loopback CLI).
+# security:
+#   cloudflareAccess:
+#     teamDomain: your-team.cloudflareaccess.com
+#     aud: ${CF_ACCESS_AUD}
+#     allowedEmails:
+#       - you@example.com
+
 t3:
   # Recommended: pin an exact T3 version matching your Desktop/Mobile clients, or "latest"
   version: latest
@@ -37,6 +54,8 @@ t3:
 boat:
   # Optional explicit path to boat binary (auto-detects ~/.ascii/bin/boat or PATH)
   # bin: /root/.ascii/bin/boat
+  # Upstream port visibility on Boat: "public" (default, still requires T3 Bearer token) or "private" (Boat cookie/token-gated)
+  hostVisibility: public
   # Default VM size for new chats ("default" = 2vCPU/4GB, "medium", "large" = 4vCPU/8GB)
   defaultSize: large
   # Immutable golden base snapshot (Ubuntu + t3 + watchdog + optional klav-forward)

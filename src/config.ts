@@ -105,6 +105,33 @@ export interface HubConfig {
   maxSandboxes: number;
 }
 
+export type SandboxProviderConfig =
+  | { type: "boat" }
+  | {
+      type: "sandbox-sdk";
+      /** Adapter name in `@opencoredev/sandbox-sdk/<adapter>` (e.g. daytona, e2b, docker, vercel, upstash, railway, freestyle, boxd). */
+      adapter: string;
+      options?: Record<string, unknown>;
+      sizeMap?: Record<string, unknown>;
+      sentinelLabel?: string;
+    };
+
+export interface CloudflareAccessConfig {
+  /** Your Cloudflare Zero Trust team domain (e.g. "your-team.cloudflareaccess.com"). */
+  teamDomain: string;
+  /** Application Audience (AUD) tag from Cloudflare Zero Trust -> Access -> Applications. */
+  aud: string;
+  /** Optional email allow-list checked in addition to Cloudflare Access policy. */
+  allowedEmails?: string[];
+}
+
+export interface SecurityConfig {
+  /** Optional cryptographic Cloudflare Access JWT verification on `controlHost` (except `/internal/watchdog` and `/health`). */
+  cloudflareAccess?: CloudflareAccessConfig;
+  /** Disable built-in auth failure rate limiting (default false). */
+  disableRateLimit?: boolean;
+}
+
 export interface SentinelConfig {
   domain: string;
   controlHost: string;
@@ -124,6 +151,8 @@ export interface SentinelConfig {
   };
   boat: {
     bin?: string;
+    /** Exposure mode for Boat's hosted port 3773: "public" (default, protected by T3 Bearer token) or "private" (Boat token/cookie-gated). */
+    hostVisibility?: "public" | "private";
     defaultSize: string;
     baseSnapshot: string;
     /** Optional starting Boat snapshot when baking `baseSnapshot` (e.g. a Klav template like `klav-sandbox-4ff6ca3a`). */
@@ -148,6 +177,10 @@ export interface SentinelConfig {
   llmProxy?: LlmProxyConfig;
   /** Optional unified single-environment Hub multiplexer (1 T3 Environment -> N parallel Boat VMs, 1 chat = 1 VM). */
   hub?: HubConfig;
+  /** Optional modular sandbox provider backend (defaults to native Boat CLI when omitted). */
+  provider?: SandboxProviderConfig;
+  /** Optional link security hardening (Cloudflare Access JWT verification + rate limiting). */
+  security?: SecurityConfig;
   /**
    * Wake behavior for sleeping slots:
    * - "manual" (default): returns 503 while asleep (zero phantom wakes, zero dropped frames); wake via dashboard/MCP/CLI
@@ -192,6 +225,7 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
 
   const boat = {
     bin: parsed.boat?.bin,
+    hostVisibility: (parsed.boat?.hostVisibility === "private" ? "private" : "public") as "public" | "private",
     defaultSize: parsed.boat?.defaultSize ?? "default",
     baseSnapshot: parsed.boat?.baseSnapshot ?? "base-t3",
     baseFrom: parsed.boat?.baseFrom ? String(parsed.boat.baseFrom).trim() : undefined,
@@ -273,6 +307,40 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
     };
   }
 
+  let provider: SandboxProviderConfig | undefined;
+  if (parsed.provider) {
+    if (parsed.provider.type === "sandbox-sdk") {
+      provider = {
+        type: "sandbox-sdk",
+        adapter: requireString(parsed.provider.adapter, "provider.adapter"),
+        options: parsed.provider.options,
+        sizeMap: parsed.provider.sizeMap,
+        sentinelLabel: parsed.provider.sentinelLabel,
+      };
+    } else {
+      provider = { type: "boat" };
+    }
+  }
+
+  let security: SecurityConfig | undefined;
+  if (parsed.security) {
+    const cfa = parsed.security.cloudflareAccess;
+    security = {
+      disableRateLimit: parsed.security.disableRateLimit === true,
+      ...(cfa
+        ? {
+            cloudflareAccess: {
+              teamDomain: requireString(cfa.teamDomain, "security.cloudflareAccess.teamDomain")
+                .replace(/^https?:\/\//, "")
+                .replace(/\/+$/, ""),
+              aud: requireString(cfa.aud, "security.cloudflareAccess.aud"),
+              ...(Array.isArray(cfa.allowedEmails) ? { allowedEmails: cfa.allowedEmails.map(String) } : {}),
+            },
+          }
+        : {}),
+    };
+  }
+
   const wakePolicy = parsed.wakePolicy === "on-connect" ? "on-connect" : "manual";
 
   const slots = Array.isArray(parsed.slots) ? parsed.slots : [];
@@ -316,6 +384,8 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
     klav,
     llmProxy,
     hub,
+    provider,
+    security,
     wakePolicy,
     slots,
     projects,

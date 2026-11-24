@@ -3,7 +3,12 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomToken } from "./auth.ts";
-import type { BoatClient } from "./boat.ts";
+import {
+  asSandboxProvider,
+  hasCapability,
+  type LegacyBoatClient,
+  type SandboxProvider,
+} from "./providers/types.ts";
 import type { ProjectConfig, SentinelConfig } from "./config.ts";
 import type { KlavClient } from "./klav.ts";
 import type { SlotRecord, StateStore } from "./state.ts";
@@ -49,12 +54,20 @@ export class LifecycleManager {
   private reaperTimer: ReturnType<typeof setInterval> | null = null;
   private bakeTimer: ReturnType<typeof setInterval> | null = null;
 
+  private readonly boat: SandboxProvider;
+
   constructor(
     private readonly config: SentinelConfig,
     private readonly state: StateStore,
-    private readonly boat: BoatClient,
+    provider: SandboxProvider | LegacyBoatClient,
     private readonly klav?: KlavClient,
-  ) {}
+  ) {
+    this.boat = asSandboxProvider(provider);
+  }
+
+  getProvider(): SandboxProvider {
+    return this.boat;
+  }
 
   startBackgroundLoops(): void {
     if (!this.reaperTimer) {
@@ -142,13 +155,23 @@ export class LifecycleManager {
     const slotName = this.reserveSlot(opts.slot, opts.replace === true);
 
     try {
-      // Fail fast if snapshot is missing (do NOT swallow listing errors!)
-      const snapshots = await this.boat.namedSnapshots();
-      if (!snapshots.includes(project.snapshot)) {
-        const bakeTarget = project.snapshot === this.config.boat.baseSnapshot ? "base" : projectName;
-        throw new Error(
-          `Golden snapshot "${project.snapshot}" does not exist yet. Run \`sentinel bake ${bakeTarget}\` (or POST /api/bake) first.`,
-        );
+      const supportsSnapshots = hasCapability(this.boat, "snapshots") && typeof this.boat.listSnapshots === "function";
+      let snapshotToUse: string | undefined = supportsSnapshots ? project.snapshot : undefined;
+      let effectiveProject: ProjectConfig = project;
+      if (supportsSnapshots) {
+        // Fail fast if snapshot is missing (do NOT swallow listing errors!)
+        const snapshots = await this.boat.listSnapshots!();
+        if (!snapshots.includes(project.snapshot)) {
+          const bakeTarget = project.snapshot === this.config.boat.baseSnapshot ? "base" : projectName;
+          throw new Error(
+            `Golden snapshot "${project.snapshot}" does not exist yet. Run \`sentinel bake ${bakeTarget}\` (or POST /api/bake) first.`,
+          );
+        }
+      } else if (project.bakeCmd) {
+        effectiveProject = {
+          ...project,
+          bootCmd: project.bootCmd ? `${project.bakeCmd}\n${project.bootCmd}` : project.bakeCmd,
+        };
       }
 
       return await this.withSlotLock(slotName, async () => {
@@ -168,7 +191,7 @@ export class LifecycleManager {
         this.state.updateSlot(slotName, (s) => {
           s.phase = "provisioning";
           s.project = projectName;
-          s.snapshot = project.snapshot;
+          s.snapshot = snapshotToUse ?? null;
           s.size = size;
           s.lastError = null;
         });
@@ -177,24 +200,28 @@ export class LifecycleManager {
         let klavAgentName: string | null = null;
 
         try {
-          console.log(`[lifecycle] spawning ${slotName} from immutable snapshot "${project.snapshot}" (${size})`);
-          sandboxId = await this.boat.create(sandboxName, size, project.snapshot);
+          console.log(
+            `[lifecycle] spawning ${slotName} via ${this.boat.name} (snapshot=${snapshotToUse ?? "base-image"}, size=${size})`,
+          );
+          sandboxId = await this.boat.create({ name: sandboxName, size, fromSnapshot: snapshotToUse });
 
-          if (project.klav && this.klav) {
-            const prov = await this.klav.provisionForSandbox(this.boat, sandboxId, project.klav);
+          if (effectiveProject.klav && this.klav) {
+            const prov = await this.klav.provisionForSandbox(this.boat, sandboxId, effectiveProject.klav);
             klavAgentName = prov.agentName;
           }
 
           await this.provisionRunningVm(
             slotName,
             sandboxId,
-            project,
+            effectiveProject,
             perSandboxWatchdogSecret,
             perSandboxLlmToken,
             true,
           );
 
-          const url = await this.boat.hostPublic(sandboxId, 3773);
+          const endpoint = await this.boat.exposePort(sandboxId, 3773, {
+            visibility: this.config.boat.hostVisibility,
+          });
           const now = new Date().toISOString();
 
           const live = this.state.updateSlot(slotName, (s) => {
@@ -202,7 +229,8 @@ export class LifecycleManager {
             s.watchdogSecret = perSandboxWatchdogSecret;
             s.llmToken = perSandboxLlmToken;
             s.klavAgentName = klavAgentName;
-            s.upstreamUrl = url;
+            s.upstreamUrl = endpoint.url;
+            s.upstreamHeaders = endpoint.headers ?? null;
             s.generation += 1;
             s.phase = "running";
             s.createdAt = now;
@@ -214,9 +242,15 @@ export class LifecycleManager {
 
           // Auto-register project via HTTP fallback if CLI `t3 project add` wasn't available
           let projectId: string | null = null;
-          if (project.registerProject !== false && live.upstreamToken) {
+          if (effectiveProject.registerProject !== false && live.upstreamToken) {
             try {
-              projectId = await ensureT3Project(url, live.upstreamToken, projectName, project.workdir);
+              projectId = await ensureT3Project(
+                endpoint.url,
+                live.upstreamToken,
+                projectName,
+                effectiveProject.workdir,
+                endpoint.headers,
+              );
               this.state.updateSlot(slotName, (s) => {
                 s.t3ProjectId = projectId;
               });
@@ -233,13 +267,19 @@ export class LifecycleManager {
               launchError = "Could not register T3 project before launching prompt";
             } else {
               try {
-                const launched = await launchT3Thread(url, live.upstreamToken, projectId, {
-                  prompt: opts.prompt,
-                  title: opts.title,
-                  provider: opts.provider ?? project.defaultProvider,
-                  model: opts.model ?? project.defaultModel,
-                  runtimeMode: opts.runtimeMode,
-                });
+                const launched = await launchT3Thread(
+                  endpoint.url,
+                  live.upstreamToken,
+                  projectId,
+                  {
+                    prompt: opts.prompt,
+                    title: opts.title,
+                    provider: opts.provider ?? effectiveProject.defaultProvider,
+                    model: opts.model ?? effectiveProject.defaultModel,
+                    runtimeMode: opts.runtimeMode,
+                  },
+                  endpoint.headers,
+                );
                 threadId = launched.threadId;
               } catch (err) {
                 launchError = err instanceof Error ? err.message : String(err);
@@ -303,6 +343,9 @@ export class LifecycleManager {
       });
 
       try {
+        if (!hasCapability(this.boat, "pause") || !this.boat.resume) {
+          throw new Error(`Provider "${this.boat.name}" does not support pause/resume`);
+        }
         console.log(`[lifecycle] waking ${slotName} (sandbox=${sandboxId})`);
         const res = await this.boat.resume(sandboxId, current.size);
         if (res === "data_expired") {
@@ -342,10 +385,13 @@ export class LifecycleManager {
           await this.provisionRunningVm(slotName, sandboxId, project, wdSecret, current.llmToken, !current.upstreamToken);
         }
 
-        const url = await this.boat.hostPublic(sandboxId, 3773);
+        const endpoint = await this.boat.exposePort(sandboxId, 3773, {
+          visibility: this.config.boat.hostVisibility,
+        });
         const now = new Date().toISOString();
         const updated = this.state.updateSlot(slotName, (s) => {
-          s.upstreamUrl = url;
+          s.upstreamUrl = endpoint.url;
+          s.upstreamHeaders = endpoint.headers ?? null;
           s.klavAgentName = nextKlavAgent;
           s.phase = "running";
           s.lastActiveAt = now;
@@ -375,8 +421,13 @@ export class LifecycleManager {
       if (!slot) throw new Error(`Unknown slot "${slotName}"`);
       if (!slot.sandboxId) return slot;
 
+      if (!hasCapability(this.boat, "pause") || !this.boat.pause) {
+        console.warn(`[lifecycle] provider "${this.boat.name}" does not support pause; leaving ${slotName} running`);
+        return slot;
+      }
+
       console.log(`[lifecycle] pausing ${slotName} (sandbox=${slot.sandboxId})`);
-      await this.boat.stop(slot.sandboxId);
+      await this.boat.pause(slot.sandboxId);
       return this.state.updateSlot(slotName, (s) => {
         s.phase = "sleeping";
         s.sleepingSince = new Date().toISOString();
@@ -440,6 +491,7 @@ export class LifecycleManager {
       s.project = null;
       s.snapshot = null;
       s.upstreamUrl = null;
+      s.upstreamHeaders = null;
       s.upstreamToken = null;
       s.phase = "empty";
       s.createdAt = null;
@@ -510,6 +562,9 @@ export class LifecycleManager {
    * - Runs a live T3 smoke check & captures real descriptor/session templates before wiping `~/.t3/userdata`.
    */
   async bake(target: string): Promise<{ snapshot: string; t3Version: string }> {
+    if (!hasCapability(this.boat, "snapshots") || !this.boat.saveSnapshot || !this.boat.listSnapshots) {
+      throw new Error(`Provider "${this.boat.name}" does not support named snapshots (bake is unavailable).`);
+    }
     const allProjects = this.state.getAllProjects(this.config);
     const isBase = target === "base" || target === this.config.boat.baseSnapshot;
     const project = isBase ? undefined : allProjects[target];
@@ -517,7 +572,7 @@ export class LifecycleManager {
       throw new Error(`Unknown bake target "${target}". Use "base" or one of: ${Object.keys(allProjects).join(", ")}`);
     }
 
-    const existingSnapshots = await this.boat.namedSnapshots();
+    const existingSnapshots = await this.boat.listSnapshots();
     const snapshotName = isBase ? this.config.boat.baseSnapshot : project!.snapshot;
     const size = project?.size ?? this.config.boat.defaultSize;
 
@@ -535,7 +590,7 @@ export class LifecycleManager {
 
     const tempName = `${this.config.boat.sandboxPrefix}bake-${target}-${Date.now().toString(36)}`;
     console.log(`[bake] creating temp VM ${tempName} (from=${fromSnapshot ?? "fresh-ubuntu"}) -> target snapshot "${snapshotName}"`);
-    const tempId = await this.boat.create(tempName, size, fromSnapshot);
+    const tempId = await this.boat.create({ name: tempName, size, fromSnapshot });
     this.inFlightBakes.add(tempId);
 
     try {
@@ -594,9 +649,11 @@ export class LifecycleManager {
         this.state.setTemplates(parsed.descriptor ?? null, parsed.authSession ?? null);
       }
 
-      await this.boat.stop(tempId);
-      // `boat stop` transitions through `archiving` before reaching `stopped`; wait until snapshotable.
-      await this.waitUntilStopped(tempId, 180_000);
+      if (hasCapability(this.boat, "pause") && this.boat.pause) {
+        await this.boat.pause(tempId);
+        // `boat stop` transitions through `archiving` before reaching `stopped`; wait until snapshotable.
+        await this.waitUntilStopped(tempId, 180_000);
+      }
       console.log(`[bake] saving immutable snapshot "${snapshotName}"...`);
       await this.boat.saveSnapshot(tempId, snapshotName);
 

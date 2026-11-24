@@ -12,6 +12,13 @@ import {
 } from "./auth.ts";
 import type { SentinelConfig } from "./config.ts";
 import type { LifecycleManager } from "./lifecycle.ts";
+import {
+  ROBOTS_TXT,
+  applySecurityHeaders,
+  clientIpFromRequest,
+  rateLimitedResponse,
+  type AuthRateLimiter,
+} from "./security.ts";
 import type { SlotRecord, StateStore } from "./state.ts";
 
 export interface WsData {
@@ -45,6 +52,7 @@ export class SlotProxy {
     private readonly config: SentinelConfig,
     private readonly state: StateStore,
     private readonly lifecycle: LifecycleManager,
+    private readonly rateLimiter?: AuthRateLimiter,
   ) {
     for (const s of config.slots) {
       this.authBySlot.set(s.name, new SlotAuth());
@@ -157,8 +165,12 @@ export class SlotProxy {
 
     const url = new URL(req.url);
     const path = url.pathname;
+    if (req.method === "GET" && path === "/robots.txt") {
+      return applySecurityHeaders(new Response(ROBOTS_TXT, { headers: { "content-type": "text/plain; charset=utf-8" } }));
+    }
     const slot = this.state.getSlot(slotName)!;
     const auth = this.getSlotAuth(slotName);
+    const ip = clientIpFromRequest(req);
 
     // 1. Schema-valid discovery descriptor (never wakes VM; removes DPoP trigger)
     if (req.method === "GET" && path === "/.well-known/t3/environment") {
@@ -167,12 +179,18 @@ export class SlotProxy {
 
     // 2. One-time pairing code exchange -> 10-year Bearer token (stored as SHA-256 hash)
     if (req.method === "POST" && path === "/oauth/token") {
+      if (this.rateLimiter) {
+        const limit = this.rateLimiter.check(`pair:${slotName}`, ip, 5, 15 * 60_000);
+        if (!limit.allowed) return withCors(rateLimitedResponse(limit.retryAfterSecs));
+      }
       const text = await req.text();
       const form = new URLSearchParams(text);
       const code = form.get("subject_token") ?? "";
       if (!auth.redeemPairingCode(code)) {
+        this.rateLimiter?.recordFailure(`pair:${slotName}`, ip, 15 * 60_000);
         return withCors(Response.json({ error: "invalid_grant" }, { status: 400 }));
       }
+      this.rateLimiter?.recordSuccess(`pair:${slotName}`, ip);
       const token = randomToken(32);
       const label = form.get("client_label")?.trim() || form.get("client_device_type")?.trim() || "T3 client";
       this.state.updateSlot(slotName, (s) => {
@@ -379,7 +397,7 @@ export class SlotProxy {
     const targetUrl = `${wsBase}${ws.data.targetPathAndQuery}`;
 
     const upstream = new WebSocket(targetUrl, {
-      headers: { authorization: `Bearer ${slot.upstreamToken}` },
+      headers: { ...(slot.upstreamHeaders ?? {}), authorization: `Bearer ${slot.upstreamToken}` },
     } as unknown as string[]);
     ws.data.upstream = upstream;
 
@@ -434,6 +452,11 @@ export class SlotProxy {
       if (HOP_BY_HOP.has(lower) || lower === "authorization") continue;
       headers.set(k, v);
     }
+    if (slot.upstreamHeaders) {
+      for (const [hk, hv] of Object.entries(slot.upstreamHeaders)) {
+        headers.set(hk, hv);
+      }
+    }
     if (!isUrlTokenRoute && slot.upstreamToken) {
       headers.set("authorization", `Bearer ${slot.upstreamToken}`);
     }
@@ -480,5 +503,5 @@ function withCors(res: Response): Response {
     "authorization, b3, traceparent, content-type, dpop, x-t3-orchestration-protocol",
   );
   headers.set("access-control-max-age", "600");
-  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+  return applySecurityHeaders(new Response(res.body, { status: res.status, statusText: res.statusText, headers }));
 }

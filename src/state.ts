@@ -25,6 +25,7 @@ export interface SlotRecord {
   snapshot: string | null;
   size: string;
   upstreamUrl: string | null;
+  upstreamHeaders?: Record<string, string> | null;
   upstreamToken: string | null;
   klavAgentName: string | null;
   t3ProjectId: string | null;
@@ -59,6 +60,7 @@ export interface HubSandboxRecord {
   snapshot: string;
   size: string;
   upstreamUrl: string;
+  upstreamHeaders?: Record<string, string> | null;
   upstreamToken: string;
   watchdogSecret: string;
   llmToken: string | null;

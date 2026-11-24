@@ -1,8 +1,10 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { BoatClient } from "./boat.ts";
+import type { SandboxProvider } from "./providers/types.ts";
 import type { KlavGlobalConfig, ProjectKlavConfig } from "./config.ts";
+
+export type KlavSandboxTransport = Pick<SandboxProvider, "upload" | "execOk">;
 
 export interface KlavProvisionResult {
   /** In proxy mode: Klav `sandbox_id`; in agent mode: ephemeral agent name (`boat-<sandboxId>`). */
@@ -12,7 +14,7 @@ export interface KlavProvisionResult {
 
 export interface KlavClient {
   provisionForSandbox(
-    boat: BoatClient,
+    boat: KlavSandboxTransport,
     sandboxId: string,
     projectKlav: ProjectKlavConfig,
     remoteHome?: string,
@@ -92,7 +94,7 @@ export class KlavCliProvider implements KlavClient {
   }
 
   async provisionForSandbox(
-    boat: BoatClient,
+    boat: KlavSandboxTransport,
     sandboxId: string,
     projectKlav: ProjectKlavConfig,
     remoteHome = "/home/user",
@@ -190,7 +192,7 @@ export class KlavCliProvider implements KlavClient {
   }
 
   private async provisionProxySandbox(
-    boat: BoatClient,
+    boat: KlavSandboxTransport,
     sandboxId: string,
     projectKlav: ProjectKlavConfig,
     remoteHome: string,
@@ -286,7 +288,7 @@ export class KlavCliProvider implements KlavClient {
   }
 
   private async provisionEphemeralAgent(
-    boat: BoatClient,
+    boat: KlavSandboxTransport,
     sandboxId: string,
     projectKlav: ProjectKlavConfig,
     remoteHome: string,

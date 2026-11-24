@@ -1,5 +1,12 @@
 import { extractBearer, safeEqual } from "./auth.ts";
 import type { LlmProxyConfig } from "./config.ts";
+import {
+  ROBOTS_TXT,
+  applySecurityHeaders,
+  clientIpFromRequest,
+  rateLimitedResponse,
+  type AuthRateLimiter,
+} from "./security.ts";
 import type { StateStore } from "./state.ts";
 
 const STRIP_REQ_HEADERS = new Set([
@@ -34,12 +41,27 @@ export class LlmProxy {
   constructor(
     private readonly cfg: LlmProxyConfig,
     private readonly state: StateStore,
+    private readonly rateLimiter?: AuthRateLimiter,
   ) {}
 
   async handle(req: Request): Promise<Response> {
+    const url = new URL(req.url);
+    if (req.method === "GET" && url.pathname === "/robots.txt") {
+      return applySecurityHeaders(new Response(ROBOTS_TXT, { headers: { "content-type": "text/plain; charset=utf-8" } }));
+    }
+
+    const ip = clientIpFromRequest(req);
+    if (this.rateLimiter) {
+      const limit = this.rateLimiter.check("llm-auth", ip, 30, 5 * 60_000);
+      if (!limit.allowed) return rateLimitedResponse(limit.retryAfterSecs);
+    }
+
     const presentedKey = req.headers.get("x-api-key")?.trim() || extractBearer(req.headers);
     if (!presentedKey) {
-      return Response.json({ error: { type: "authentication_error", message: "Missing sandbox LLM token" } }, { status: 401 });
+      this.rateLimiter?.recordFailure("llm-auth", ip, 5 * 60_000);
+      return applySecurityHeaders(
+        Response.json({ error: { type: "authentication_error", message: "Missing sandbox LLM token" } }, { status: 401 }),
+      );
     }
 
     const activeSlot = this.state
@@ -53,14 +75,17 @@ export class LlmProxy {
           .find((s) => s.phase === "running" && s.llmToken !== null && safeEqual(s.llmToken, presentedKey));
 
     if (!activeSlot && !activeHubSandbox) {
-      return Response.json(
-        { error: { type: "authentication_error", message: "Sandbox token inactive or revoked" } },
-        { status: 401 },
+      this.rateLimiter?.recordFailure("llm-auth", ip, 5 * 60_000);
+      return applySecurityHeaders(
+        Response.json(
+          { error: { type: "authentication_error", message: "Sandbox token inactive or revoked" } },
+          { status: 401 },
+        ),
       );
     }
+    this.rateLimiter?.recordSuccess("llm-auth", ip);
     const ownerLabel = activeSlot ? `slot ${activeSlot.name}` : `hub sandbox ${activeHubSandbox!.sandboxId}`;
 
-    const url = new URL(req.url);
     const target = `${this.cfg.upstreamUrl}${url.pathname}${url.search}`;
 
     const headers = new Headers();

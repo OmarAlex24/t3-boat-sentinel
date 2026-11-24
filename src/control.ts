@@ -4,6 +4,14 @@ import type { HubServer } from "./hub.ts";
 import type { JobManager } from "./jobs.ts";
 import type { LifecycleManager, WatchdogEventPayload } from "./lifecycle.ts";
 import type { SlotProxy } from "./proxy.ts";
+import {
+  CloudflareAccessVerifier,
+  ROBOTS_TXT,
+  applySecurityHeaders,
+  clientIpFromRequest,
+  rateLimitedResponse,
+  type AuthRateLimiter,
+} from "./security.ts";
 import { buildAutoProjectConfig, type StateStore } from "./state.ts";
 
 /**
@@ -14,6 +22,8 @@ import { buildAutoProjectConfig, type StateStore } from "./state.ts";
  * - `/`: mobile-first dashboard
  */
 export class ControlPlane {
+  private readonly cfAccess?: CloudflareAccessVerifier;
+
   constructor(
     private readonly config: SentinelConfig,
     private readonly state: StateStore,
@@ -21,60 +31,101 @@ export class ControlPlane {
     private readonly proxy: SlotProxy,
     private readonly jobs: JobManager,
     private readonly hub?: HubServer,
-  ) {}
+    private readonly rateLimiter?: AuthRateLimiter,
+  ) {
+    if (config.security?.cloudflareAccess) {
+      this.cfAccess = new CloudflareAccessVerifier(config.security.cloudflareAccess);
+    }
+  }
 
   async handle(req: Request): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
+    const ip = clientIpFromRequest(req);
+
+    if (req.method === "GET" && path === "/robots.txt") {
+      return applySecurityHeaders(new Response(ROBOTS_TXT, { headers: { "content-type": "text/plain; charset=utf-8" } }));
+    }
 
     if (req.method === "GET" && path === "/health") {
-      return Response.json({ ok: true, slots: this.state.listSlots().length });
+      return applySecurityHeaders(Response.json({ ok: true }));
     }
 
     // Per-sandbox watchdog callback (validates against THAT slot or hub sandbox's unique secret!)
     if (req.method === "POST" && path === "/internal/watchdog") {
+      if (this.rateLimiter) {
+        const limit = this.rateLimiter.check("watchdog", ip, 20, 5 * 60_000);
+        if (!limit.allowed) return rateLimitedResponse(limit.retryAfterSecs);
+      }
       const token = extractBearer(req.headers);
-      if (!token) return Response.json({ error: "unauthorized" }, { status: 401 });
+      if (!token) {
+        this.rateLimiter?.recordFailure("watchdog", ip, 5 * 60_000);
+        return applySecurityHeaders(Response.json({ error: "unauthorized" }, { status: 401 }));
+      }
 
       const payload = (await req.json()) as WatchdogEventPayload;
       if (this.hub && payload.slot?.startsWith("hub:")) {
         const sb = this.state.getHubSandbox(payload.sandboxId);
         if (!sb || !sb.watchdogSecret || !safeEqual(token, sb.watchdogSecret)) {
-          return Response.json({ error: "unauthorized" }, { status: 401 });
+          this.rateLimiter?.recordFailure("watchdog", ip, 5 * 60_000);
+          return applySecurityHeaders(Response.json({ error: "unauthorized" }, { status: 401 }));
         }
+        this.rateLimiter?.recordSuccess("watchdog", ip);
         void this.hub.handleWatchdogEvent(payload).catch((err) => {
           console.error("[control] hub watchdog event failed:", err);
         });
-        return Response.json({ accepted: true });
+        return applySecurityHeaders(Response.json({ accepted: true }));
       }
 
       const slot = this.state.getSlot(payload.slot);
       if (!slot || !slot.watchdogSecret || slot.sandboxId !== payload.sandboxId || !safeEqual(token, slot.watchdogSecret)) {
-        return Response.json({ error: "unauthorized" }, { status: 401 });
+        this.rateLimiter?.recordFailure("watchdog", ip, 5 * 60_000);
+        return applySecurityHeaders(Response.json({ error: "unauthorized" }, { status: 401 }));
       }
 
+      this.rateLimiter?.recordSuccess("watchdog", ip);
       void this.lifecycle.handleWatchdogEvent(payload).catch((err) => {
         console.error("[control] watchdog event failed:", err);
       });
-      return Response.json({ accepted: true });
+      return applySecurityHeaders(Response.json({ accepted: true }));
+    }
+
+    // Optional origin-side Cloudflare Access JWT verification for Dashboard & Control API
+    // (loopback CLI calls from 127.0.0.1 / ::1 stay exempt so local `sentinel status/bake/pair` always work!)
+    if (this.cfAccess && !isLoopbackHost(req.headers.get("host"))) {
+      const verified = await this.cfAccess.verifyRequest(req);
+      if (!verified.ok) {
+        return applySecurityHeaders(
+          Response.json({ error: "cloudflare_access_required", detail: verified.reason }, { status: 403 }),
+        );
+      }
     }
 
     if (req.method === "GET" && path === "/") {
-      return new Response(renderDashboardHtml(this.config), {
-        headers: { "content-type": "text/html; charset=utf-8" },
-      });
+      return applySecurityHeaders(
+        new Response(renderDashboardHtml(this.config), {
+          headers: { "content-type": "text/html; charset=utf-8" },
+        }),
+        { isHtml: true },
+      );
     }
 
     // Control API: strictly Bearer header auth (never `?token=` in query strings/logs!)
     if (path.startsWith("/api/")) {
+      if (this.rateLimiter) {
+        const limit = this.rateLimiter.check("ctrl-api", ip, 10, 5 * 60_000);
+        if (!limit.allowed) return rateLimitedResponse(limit.retryAfterSecs);
+      }
       const token = extractBearer(req.headers);
       if (!token || !safeEqual(token, this.config.controlSecret)) {
-        return Response.json({ error: "unauthorized" }, { status: 401 });
+        this.rateLimiter?.recordFailure("ctrl-api", ip, 5 * 60_000);
+        return applySecurityHeaders(Response.json({ error: "unauthorized" }, { status: 401 }));
       }
-      return this.handleApi(req, url, path);
+      this.rateLimiter?.recordSuccess("ctrl-api", ip);
+      return applySecurityHeaders(await this.handleApi(req, url, path));
     }
 
-    return new Response("Not found", { status: 404 });
+    return applySecurityHeaders(new Response("Not found", { status: 404 }));
   }
 
   private async handleApi(req: Request, url: URL, path: string): Promise<Response> {
@@ -133,7 +184,12 @@ export class ControlPlane {
                 })),
               }
             : null;
+        const provider = this.lifecycle.getProvider();
         return Response.json({
+          provider: {
+            name: provider.name,
+            capabilities: Array.from(provider.capabilities),
+          },
           t3: this.config.t3,
           wakePolicy: this.config.wakePolicy,
           baseSnapshot: {
@@ -326,6 +382,12 @@ export class ControlPlane {
       return Response.json({ ok: false, error: msg }, { status: 400 });
     }
   }
+}
+
+function isLoopbackHost(hostHeader: string | null): boolean {
+  if (!hostHeader) return false;
+  const host = hostHeader.split(":")[0].toLowerCase();
+  return host === "127.0.0.1" || host === "localhost" || host === "::1";
 }
 
 function renderDashboardHtml(config: SentinelConfig): string {

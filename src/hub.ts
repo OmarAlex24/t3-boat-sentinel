@@ -10,7 +10,19 @@ import {
   randomToken,
   type TicketUse,
 } from "./auth.ts";
-import type { BoatClient } from "./boat.ts";
+import {
+  asSandboxProvider,
+  hasCapability,
+  type LegacyBoatClient,
+  type SandboxProvider,
+} from "./providers/types.ts";
+import {
+  ROBOTS_TXT,
+  applySecurityHeaders,
+  clientIpFromRequest,
+  rateLimitedResponse,
+  type AuthRateLimiter,
+} from "./security.ts";
 import type { ProjectConfig, SentinelConfig } from "./config.ts";
 import type { KlavClient } from "./klav.ts";
 import type { LifecycleManager, WatchdogEventPayload } from "./lifecycle.ts";
@@ -235,7 +247,7 @@ class HubVmBridge {
     const targetUrl = `${wsBase}/ws?orchestrationProtocol=2`;
 
     const ws = new WebSocket(targetUrl, {
-      headers: { authorization: `Bearer ${this.sandbox.upstreamToken}` },
+      headers: { ...(this.sandbox.upstreamHeaders ?? {}), authorization: `Bearer ${this.sandbox.upstreamToken}` },
     } as unknown as string[]);
     this.ws = ws;
 
@@ -516,13 +528,17 @@ export class HubServer {
   >();
   private readonly activeProjectClones = new Map<string, ProjectCloneSnapshotState>();
 
+  private readonly boat: SandboxProvider;
+
   constructor(
     private readonly config: SentinelConfig,
     private readonly state: StateStore,
-    private readonly boat: BoatClient,
+    provider: SandboxProvider | LegacyBoatClient,
     private readonly lifecycle: LifecycleManager,
     private readonly klav?: KlavClient,
+    private readonly rateLimiter?: AuthRateLimiter,
   ) {
+    this.boat = asSandboxProvider(provider);
     if (config.hub) {
       this.state.ensureHub(config.hub.label, Object.keys(this.state.getAllProjects(config)));
       this.restoreLiveSandboxes();
@@ -761,6 +777,10 @@ export class HubServer {
 
     const url = new URL(req.url);
     const path = url.pathname;
+    if (req.method === "GET" && path === "/robots.txt") {
+      return applySecurityHeaders(new Response(ROBOTS_TXT, { headers: { "content-type": "text/plain; charset=utf-8" } }));
+    }
+    const ip = clientIpFromRequest(req);
     const hub = this.state.ensureHub(this.config.hub?.label ?? "Boat", Object.keys(this.state.getAllProjects(this.config)));
 
     // 1. Discovery descriptor
@@ -768,13 +788,19 @@ export class HubServer {
       return withCors(Response.json(this.buildDescriptor()));
     }
 
-    // 2. Pairing token exchange
+    // 2. Pairing token exchange (rate-limited against brute-force guessing)
     if (req.method === "POST" && path === "/oauth/token") {
+      if (this.rateLimiter) {
+        const limit = this.rateLimiter.check("hub-pair", ip, 5, 15 * 60_000);
+        if (!limit.allowed) return withCors(rateLimitedResponse(limit.retryAfterSecs));
+      }
       const form = new URLSearchParams(await req.text());
       const code = form.get("subject_token") ?? "";
       if (!this.auth.redeemPairingCode(code)) {
+        this.rateLimiter?.recordFailure("hub-pair", ip, 15 * 60_000);
         return withCors(Response.json({ error: "invalid_grant" }, { status: 400 }));
       }
+      this.rateLimiter?.recordSuccess("hub-pair", ip);
       const token = randomToken(32);
       const label = form.get("client_label")?.trim() || form.get("client_device_type")?.trim() || "T3 client";
       this.state.updateHub((h) => {
@@ -1456,6 +1482,7 @@ export class HubServer {
           await fetch(`${sb.upstreamUrl}${res.relativeUrl}`, {
             method: "POST",
             headers: {
+              ...(sb.upstreamHeaders ?? {}),
               "content-type": staged.mimeType,
               "content-length": String(staged.bytes.byteLength),
             },
@@ -1506,21 +1533,30 @@ export class HubServer {
       throw new Error(`Hub sandbox limit reached (${activeCount}/${maxSandboxes}). Settle or archive an existing chat first.`);
     }
 
-    const snapshots = await this.boat.namedSnapshots();
-    let snapshotToUse = project.snapshot;
+    const supportsSnapshots = hasCapability(this.boat, "snapshots") && typeof this.boat.listSnapshots === "function";
+    let snapshotToUse: string | undefined = supportsSnapshots ? project.snapshot : undefined;
     let effectiveProject: ProjectConfig = project;
     let fallbackCloning = false;
-    if (!snapshots.includes(project.snapshot)) {
-      if (snapshots.includes(this.config.boat.baseSnapshot) && project.bakeCmd) {
-        snapshotToUse = this.config.boat.baseSnapshot;
-        fallbackCloning = true;
-        effectiveProject = {
-          ...project,
-          bootCmd: project.bootCmd ? `${project.bakeCmd}\n${project.bootCmd}` : project.bakeCmd,
-        };
-      } else {
-        throw new Error(`Golden snapshot "${project.snapshot}" does not exist yet. Run \`sentinel bake ${projectKey}\` first.`);
+    if (supportsSnapshots) {
+      const snapshots = await this.boat.listSnapshots!();
+      if (!snapshots.includes(project.snapshot)) {
+        if (snapshots.includes(this.config.boat.baseSnapshot) && project.bakeCmd) {
+          snapshotToUse = this.config.boat.baseSnapshot;
+          fallbackCloning = true;
+          effectiveProject = {
+            ...project,
+            bootCmd: project.bootCmd ? `${project.bakeCmd}\n${project.bootCmd}` : project.bakeCmd,
+          };
+        } else {
+          throw new Error(`Golden snapshot "${project.snapshot}" does not exist yet. Run \`sentinel bake ${projectKey}\` first.`);
+        }
       }
+    } else if (project.bakeCmd) {
+      fallbackCloning = true;
+      effectiveProject = {
+        ...project,
+        bootCmd: project.bootCmd ? `${project.bakeCmd}\n${project.bootCmd}` : project.bakeCmd,
+      };
     }
 
     const hub = this.state.ensureHub(this.config.hub?.label ?? "Boat", Object.keys(allProjects));
@@ -1616,7 +1652,7 @@ export class HubServer {
         startedAt: setupStartedAt,
         endedAt: activeStage === "done" || activeStage === "failed" ? now : null,
         branch: null,
-        baseRef: snapshotToUse,
+        baseRef: snapshotToUse ?? null,
         worktreePath: effectiveProject.workdir,
         setupScript: null,
         stages,
@@ -1626,9 +1662,11 @@ export class HubServer {
     };
 
     try {
-      emitStage("fetch", `Creating Boat VM (${size}) from ${snapshotToUse}...`, 15);
-      console.log(`[hub] spawning fresh VM ${sandboxName} for project="${projectKey}" thread=${threadId} (snapshot=${snapshotToUse})`);
-      sandboxId = await this.boat.create(sandboxName, size, snapshotToUse);
+      emitStage("fetch", `Creating ${this.boat.name} VM (${size}) from ${snapshotToUse ?? "base image"}...`, 15);
+      console.log(
+        `[hub] spawning fresh VM ${sandboxName} via ${this.boat.name} for project="${projectKey}" thread=${threadId} (snapshot=${snapshotToUse ?? "base-image"})`,
+      );
+      sandboxId = await this.boat.create({ name: sandboxName, size, fromSnapshot: snapshotToUse });
 
       if (effectiveProject.klav && this.klav) {
         emitStage("checkout", `VM ${sandboxId} created — attaching zero-trust Klav proxy...`, 40);
@@ -1661,9 +1699,17 @@ export class HubServer {
         throw new Error(`T3 server inside ${sandboxId} returned no upstreamToken`);
       }
 
-      emitStage("agent", `Connecting live stream to Boat VM ${sandboxId}...`, 90);
-      const upstreamUrl = await this.boat.hostPublic(sandboxId, 3773);
-      const vmProjectId = await ensureT3Project(upstreamUrl, provisioned.upstreamToken, projectKey, effectiveProject.workdir);
+      emitStage("agent", `Connecting live stream to VM ${sandboxId}...`, 90);
+      const endpoint = await this.boat.exposePort(sandboxId, 3773, {
+        visibility: this.config.boat.hostVisibility,
+      });
+      const vmProjectId = await ensureT3Project(
+        endpoint.url,
+        provisioned.upstreamToken,
+        projectKey,
+        effectiveProject.workdir,
+        endpoint.headers,
+      );
       const now = new Date().toISOString();
 
       const record: HubSandboxRecord = {
@@ -1671,9 +1717,10 @@ export class HubServer {
         project: projectKey,
         hubProjectId,
         vmProjectId,
-        snapshot: snapshotToUse,
+        snapshot: snapshotToUse ?? "base-image",
         size,
-        upstreamUrl,
+        upstreamUrl: endpoint.url,
+        upstreamHeaders: endpoint.headers ?? null,
         upstreamToken: provisioned.upstreamToken,
         watchdogSecret,
         llmToken,
@@ -1740,6 +1787,9 @@ export class HubServer {
       if (!sb) throw new Error(`Unknown hub sandbox "${sandboxId}"`);
       if (sb.phase === "running") return sb;
 
+      if (!hasCapability(this.boat, "pause") || !this.boat.resume) {
+        throw new Error(`Provider "${this.boat.name}" does not support pause/resume`);
+      }
       console.log(`[hub] waking sleeping sandbox ${sandboxId} (${sb.project})`);
       const res = await this.boat.resume(sandboxId, sb.size);
       if (res === "data_expired") {
@@ -1771,10 +1821,13 @@ export class HubServer {
         });
       }
 
-      const upstreamUrl = await this.boat.hostPublic(sandboxId, 3773);
+      const endpoint = await this.boat.exposePort(sandboxId, 3773, {
+        visibility: this.config.boat.hostVisibility,
+      });
       const now = new Date().toISOString();
       const updated = this.state.updateHubSandbox(sandboxId, (s) => {
-        s.upstreamUrl = upstreamUrl;
+        s.upstreamUrl = endpoint.url;
+        s.upstreamHeaders = endpoint.headers ?? null;
         s.llmToken = llmToken;
         s.klavAgentName = nextKlavAgent;
         s.phase = "running";
@@ -1797,10 +1850,14 @@ export class HubServer {
   async sleepHubSandbox(sandboxId: string): Promise<void> {
     const sb = this.state.getHubSandbox(sandboxId);
     if (!sb || sb.phase !== "running") return;
+    if (!hasCapability(this.boat, "pause") || !this.boat.pause) {
+      console.warn(`[hub] provider "${this.boat.name}" does not support pause; skipping idle sleep for ${sandboxId}`);
+      return;
+    }
     console.log(`[hub] pausing idle sandbox ${sandboxId} (${sb.project})`);
     this.bridges.get(sandboxId)?.stop();
     this.bridges.delete(sandboxId);
-    await this.boat.stop(sandboxId);
+    await this.boat.pause(sandboxId);
     this.state.updateHubSandbox(sandboxId, (s) => {
       s.phase = "sleeping";
       s.llmToken = null; // immediately revoke LLM token while sleeping
@@ -2241,6 +2298,11 @@ export class HubServer {
       if (HOP_BY_HOP.has(lower) || lower === "authorization") continue;
       headers.set(k, v);
     }
+    if (sb.upstreamHeaders) {
+      for (const [hk, hv] of Object.entries(sb.upstreamHeaders)) {
+        headers.set(hk, hv);
+      }
+    }
     if (!isUrlTokenRoute) {
       headers.set("authorization", `Bearer ${sb.upstreamToken}`);
     }
@@ -2329,5 +2391,5 @@ function withCors(res: Response): Response {
     "authorization, b3, traceparent, content-type, dpop, x-t3-orchestration-protocol",
   );
   headers.set("access-control-max-age", "600");
-  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+  return applySecurityHeaders(new Response(res.body, { status: res.status, statusText: res.statusText, headers }));
 }

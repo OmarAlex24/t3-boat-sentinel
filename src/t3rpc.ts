@@ -18,8 +18,10 @@ export async function ensureT3Project(
   upstreamToken: string,
   title: string,
   workspaceRoot: string,
+  extraHeaders?: Record<string, string> | null,
 ): Promise<string> {
-  const headers = {
+  const headers: Record<string, string> = {
+    ...(extraHeaders ?? {}),
     authorization: `Bearer ${upstreamToken}`,
     "x-t3-orchestration-protocol": "2",
   };
@@ -68,6 +70,7 @@ export async function launchT3Thread(
   upstreamToken: string,
   projectId: string,
   opts: LaunchThreadOptions,
+  extraHeaders?: Record<string, string> | null,
 ): Promise<{ threadId: string }> {
   const wsBase = upstreamUrl.replace(/^https:\/\//, "wss://").replace(/^http:\/\//, "ws://");
   const threadId = randomUUID();
@@ -89,7 +92,7 @@ export async function launchT3Thread(
 
   await new Promise<void>((resolve, reject) => {
     const ws = new WebSocket(`${wsBase}/ws?orchestrationProtocol=2`, {
-      headers: { authorization: `Bearer ${upstreamToken}` },
+      headers: { ...(extraHeaders ?? {}), authorization: `Bearer ${upstreamToken}` },
     } as unknown as string[]);
 
     const timer = setTimeout(() => {
