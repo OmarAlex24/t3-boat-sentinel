@@ -263,16 +263,27 @@ if [ "$BAKE_CLEAN" = "1" ]; then
   systemctl --user stop t3-sentinel-watchdog.service 2>/dev/null || true
   # Agent/probe helpers (e.g. Devin's background ACP checks) run in app-t3code.slice, outside t3code.service's cgroup
   systemctl --user stop app-t3code.slice 2>/dev/null || true
-  # Unlinking a still-open DB fails with EBUSY on the sandbox filesystem; wait for holders to exit, name them if not
-  for _ in $(seq 1 30); do grep -q "$userdata_dir/statev2" < <(ls -l /proc/[0-9]*/fd 2>/dev/null) || break; sleep 1; done
-  for p in /proc/[0-9]*; do grep -q "$userdata_dir/statev2" < <(ls -l "$p/fd" 2>/dev/null) && echo "[bake] still holding statev2: $(tr "\0" " " < "$p/cmdline")" >&2; done
-  rm -rf \
-    "$userdata_dir/statev2.sqlite" "$userdata_dir/statev2.sqlite-wal" "$userdata_dir/statev2.sqlite-shm" \
-    "$userdata_dir/server-owner.sqlite" "$userdata_dir/server-owner.sqlite-journal" \
-    "$userdata_dir/environment-id" "$userdata_dir/settings.json" "$userdata_dir/keybindings.json" \
-    "$userdata_dir/logs" "$userdata_dir/worktrees" "$userdata_dir/attachments" "$userdata_dir/auth" \
-    "$sentinel_dir/watchdog.json" "$sentinel_dir/boot-secrets.json" "$sentinel_dir/t3-settings.json" "$sentinel_dir/saw-thread" \
-    "$HOME/.klav-forward" "$units/t3code.service.d/klav-env.conf"
+  wipe_userdata() {
+    rm -rf \
+      "$userdata_dir/statev2.sqlite" "$userdata_dir/statev2.sqlite-wal" "$userdata_dir/statev2.sqlite-shm" \
+      "$userdata_dir/server-owner.sqlite" "$userdata_dir/server-owner.sqlite-journal" \
+      "$userdata_dir/environment-id" "$userdata_dir/settings.json" "$userdata_dir/keybindings.json" \
+      "$userdata_dir/logs" "$userdata_dir/worktrees" "$userdata_dir/attachments" "$userdata_dir/auth" \
+      "$sentinel_dir/watchdog.json" "$sentinel_dir/boot-secrets.json" "$sentinel_dir/t3-settings.json" "$sentinel_dir/saw-thread" \
+      "$HOME/.klav-forward" "$units/t3code.service.d/klav-env.conf"
+  }
+  # The sandbox home is FUSE (ascii-lazyfs), which can briefly return EBUSY on files t3 just closed; retry
+  for attempt in $(seq 1 30); do
+    if wipe_userdata 2>/dev/null; then
+      [ "$attempt" = 1 ] || echo "[bake] userdata wipe succeeded on attempt $attempt" >&2
+      break
+    fi
+    if [ "$attempt" = 30 ]; then
+      sudo -n bash -c 'for p in /proc/[0-9]*; do ls -l "$p/fd" 2>/dev/null | grep -q "/.t3/userdata/statev2" && echo "[bake] holding statev2: $p $(tr "\0" " " < "$p/cmdline")"; done' >&2 || true
+      wipe_userdata
+    fi
+    sleep 2
+  done
   # Keep logs/ so t3code.service can open its stdout log when VMs boot from this snapshot
   mkdir -p "$userdata_dir/logs"
 
