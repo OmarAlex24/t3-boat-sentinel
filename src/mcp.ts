@@ -21,9 +21,30 @@ const TOOLS = [
   {
     name: "sentinel_status",
     description:
-      "List all Boat slots, their live phases (empty/running/sleeping), configured projects, and golden snapshot freshness.",
+      "List the Hub environment (live per-chat Boat sandboxes), any legacy slots, configured & dynamically added projects, and golden snapshot freshness.",
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
     inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "sentinel_add_project",
+    description:
+      "Register a GitHub repo (e.g. `owner/repo` or full git URL) dynamically without editing sentinel.yaml, push it live to T3 Code Desktop/Mobile, and optionally start an async job to bake its immutable `env-<name>` golden snapshot.",
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    inputSchema: {
+      type: "object",
+      properties: {
+        repo: { type: "string", description: "GitHub shorthand `owner/repo` or full git clone URL." },
+        name: { type: "string", description: "Optional short project slug (defaults to repo name)." },
+        size: { type: "string", description: "Optional Boat VM size override (e.g. default, medium, large)." },
+        klavProfiles: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional Klav proxy profiles to grant sandboxes for this repo.",
+        },
+        bake: { type: "boolean", description: "Whether to bake the immutable golden snapshot now (default true)." },
+      },
+      required: ["repo"],
+    },
   },
   {
     name: "sentinel_job",
@@ -85,7 +106,7 @@ const TOOLS = [
   {
     name: "sentinel_reset",
     description:
-      "DESTRUCTIVE: Permanently delete the disposable Boat VM in a slot, revoke its ephemeral Klav agent, and return the slot to empty (keeps T3 pairing intact). Unpushed git work in the VM will be lost.",
+      "DESTRUCTIVE: Permanently delete a disposable Boat VM, revoke its ephemeral Klav agent, and free the slot. Pass `slot: \"hub:<sandboxId>\"` for a Hub VM, `slot: \"hub\"` for all Hub VMs, or a legacy slot name (`boat-1`). Unpushed git work in the VM will be lost.",
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
     inputSchema: {
       type: "object",
@@ -174,6 +195,14 @@ async function dispatchTool(
   switch (name) {
     case "sentinel_status":
       return api.call("/api/status");
+    case "sentinel_add_project":
+      return api.call("/api/projects", {
+        repo: String(args.repo),
+        ...(args.name ? { name: String(args.name) } : {}),
+        ...(args.size ? { size: String(args.size) } : {}),
+        ...(Array.isArray(args.klavProfiles) ? { klavProfiles: args.klavProfiles.map(String) } : {}),
+        ...(args.bake !== undefined ? { bake: Boolean(args.bake) } : {}),
+      });
     case "sentinel_job":
       return api.call(`/api/jobs/${encodeURIComponent(String(args.jobId))}`);
     case "sentinel_spawn":

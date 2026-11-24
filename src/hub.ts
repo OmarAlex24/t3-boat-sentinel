@@ -14,7 +14,7 @@ import type { BoatClient } from "./boat.ts";
 import type { ProjectConfig, SentinelConfig } from "./config.ts";
 import type { KlavClient } from "./klav.ts";
 import type { LifecycleManager, WatchdogEventPayload } from "./lifecycle.ts";
-import type { HubSandboxRecord, StateStore } from "./state.ts";
+import { buildAutoProjectConfig, type HubSandboxRecord, type StateStore } from "./state.ts";
 import { ensureT3Project } from "./t3rpc.ts";
 
 export interface HubWsData {
@@ -96,15 +96,51 @@ const WORKSPACE_ROUTED_PREFIXES = ["vcs.", "git.", "projects.", "review."];
 
 const KEEP_OPEN_SUBSCRIPTIONS = new Set([
   "subscribePreviewEvents",
-  "subscribeProjectClones",
-  "subscribeWorktreeSetup",
   "scheduledTasks.subscribe",
-  "subscribeVcsStatus",
   "subscribeDeviceState",
   "subscribeDiscoveredLocalServers",
   "subscribeResourceTelemetry",
   "pullRequests.subscribeRefreshes",
 ]);
+
+interface WorktreeSetupStageState {
+  id: "fetch" | "checkout" | "submodules" | "setup-script" | "agent";
+  status: "pending" | "running" | "done" | "skipped" | "warning" | "failed";
+  startedAt: string | null;
+  endedAt: string | null;
+  percent: number | null;
+  detail: string | null;
+  tail: string[];
+}
+
+interface WorktreeSetupSnapshotState {
+  threadId: string;
+  phase: "running" | "done" | "failed" | "cancelled";
+  startedAt: string;
+  endedAt: string | null;
+  branch: string | null;
+  baseRef: string | null;
+  worktreePath: string | null;
+  setupScript: null;
+  stages: WorktreeSetupStageState[];
+  error: string | null;
+  sequence: number;
+}
+
+interface ProjectCloneSnapshotState {
+  projectId: string;
+  remoteUrl: string;
+  destinationPath: string;
+  repository: null;
+  phase: "running" | "done" | "failed" | "cancelled";
+  stage: "connecting" | "counting" | "receiving" | "resolving" | "checkout";
+  percent: number | null;
+  detail: string | null;
+  error: string | null;
+  startedAt: string;
+  endedAt: string | null;
+  sequence: number;
+}
 
 /**
  * Persistent WebSocket bridge from the Hub to a single live Boat VM's `t3 serve`.
@@ -473,6 +509,12 @@ export class HubServer {
   private readonly urlTokenToSandbox = new Map<string, string>();
   private readonly stagedAttachments = new Map<string, StagedAttachment>();
   private readonly stagedUploadTokens = new Map<string, string>(); // uploadToken -> attachmentId
+  private readonly worktreeSetupSnapshots = new Map<string, WorktreeSetupSnapshotState>();
+  private readonly worktreeSetupSubs = new Map<
+    string,
+    Set<{ ws: ServerWebSocket<HubWsData>; reqKey: string; reqId: string | number }>
+  >();
+  private readonly activeProjectClones = new Map<string, ProjectCloneSnapshotState>();
 
   constructor(
     private readonly config: SentinelConfig,
@@ -482,7 +524,7 @@ export class HubServer {
     private readonly klav?: KlavClient,
   ) {
     if (config.hub) {
-      this.state.ensureHub(config.hub.label, Object.keys(config.projects));
+      this.state.ensureHub(config.hub.label, Object.keys(this.state.getAllProjects(config)));
       this.restoreLiveSandboxes();
     }
   }
@@ -516,7 +558,7 @@ export class HubServer {
   }
 
   private buildDescriptor(): Record<string, unknown> {
-    const hub = this.state.ensureHub(this.config.hub?.label ?? "Boat", Object.keys(this.config.projects));
+    const hub = this.state.ensureHub(this.config.hub?.label ?? "Boat", Object.keys(this.state.getAllProjects(this.config)));
     const base = this.state.getTemplates().descriptor ?? {
       environmentId: hub.environmentId,
       label: hub.label,
@@ -527,9 +569,13 @@ export class HubServer {
         repositoryIdentity: true,
         connectionProbe: true,
         attachmentUploads: true,
+        projectCloneTracking: true,
       },
     };
-    const caps = { ...((base.capabilities as Record<string, unknown> | undefined) ?? {}) };
+    const caps: Record<string, unknown> = {
+      ...((base.capabilities as Record<string, unknown> | undefined) ?? {}),
+      projectCloneTracking: true,
+    };
     delete caps.accessTokenRenewal;
     return {
       ...base,
@@ -577,7 +623,7 @@ export class HubServer {
   }
 
   private buildHubServerConfig(): Record<string, unknown> {
-    const hub = this.state.ensureHub(this.config.hub?.label ?? "Boat", Object.keys(this.config.projects));
+    const hub = this.state.ensureHub(this.config.hub?.label ?? "Boat", Object.keys(this.state.getAllProjects(this.config)));
     const desc = this.buildDescriptor();
     const cached = hub.serverConfig;
     if (cached && typeof cached === "object") {
@@ -636,44 +682,69 @@ export class HubServer {
     };
   }
 
-  private buildHubProjects(): Record<string, unknown>[] {
-    const hub = this.state.ensureHub(this.config.hub?.label ?? "Boat", Object.keys(this.config.projects));
+  private buildProjectShell(key: string, proj: ProjectConfig): Record<string, unknown> {
+    const hub = this.state.ensureHub(this.config.hub?.label ?? "Boat", Object.keys(this.state.getAllProjects(this.config)));
     const now = new Date().toISOString();
+    const projectId = hub.projectIds[key] ?? randomUUID();
+    if (!hub.projectIds[key]) {
+      this.state.updateHub((h) => {
+        h.projectIds[key] = projectId;
+      });
+    }
+    const cached = hub.projectTemplates[key]?.shell;
+    if (cached && typeof cached === "object") {
+      return {
+        ...cached,
+        id: projectId,
+        title: key,
+        workspaceRoot: proj.workdir,
+      };
+    }
+    return {
+      id: projectId,
+      title: key,
+      workspaceRoot: proj.workdir,
+      defaultModelSelection: null,
+      scripts: [],
+      createdAt: now,
+      updatedAt: now,
+      deletedAt: null,
+    };
+  }
+
+  private buildHubProjects(): Record<string, unknown>[] {
+    const allProjects = this.state.getAllProjects(this.config);
     const out: Record<string, unknown>[] = [];
-    for (const [key, proj] of Object.entries(this.config.projects)) {
+    for (const [key, proj] of Object.entries(allProjects)) {
       if (proj.registerProject === false) continue;
-      const projectId = hub.projectIds[key] ?? randomUUID();
-      if (!hub.projectIds[key]) {
-        this.state.updateHub((h) => {
-          h.projectIds[key] = projectId;
-        });
-      }
-      const cached = hub.projectTemplates[key]?.shell;
-      if (cached && typeof cached === "object") {
-        out.push({
-          ...cached,
-          id: projectId,
-          title: key,
-          workspaceRoot: proj.workdir,
-        });
-      } else {
-        out.push({
-          id: projectId,
-          title: key,
-          workspaceRoot: proj.workdir,
-          defaultModelSelection: null,
-          scripts: [],
-          createdAt: now,
-          updatedAt: now,
-          deletedAt: null,
-        });
-      }
+      out.push(this.buildProjectShell(key, proj));
     }
     return out;
   }
 
+  /** Push a newly registered project live into all connected T3 Desktop & Mobile clients. */
+  notifyProjectAdded(projectKey: string): void {
+    const proj = this.state.getAllProjects(this.config)[projectKey];
+    if (!proj || proj.registerProject === false) return;
+    const shell = this.buildProjectShell(projectKey, proj);
+    this.broadcastShellItem({
+      kind: "project.updated",
+      sequence: this.state.nextHubSequence(),
+      project: shell,
+    });
+  }
+
+  /** Notify all connected T3 Desktop & Mobile clients that a dynamic project was removed. */
+  notifyProjectRemoved(projectId: string): void {
+    this.broadcastShellItem({
+      kind: "project.removed",
+      sequence: this.state.nextHubSequence(),
+      projectId,
+    });
+  }
+
   private buildMergedShellSnapshot(): Record<string, unknown> {
-    const hub = this.state.ensureHub(this.config.hub?.label ?? "Boat", Object.keys(this.config.projects));
+    const hub = this.state.ensureHub(this.config.hub?.label ?? "Boat", Object.keys(this.state.getAllProjects(this.config)));
     return {
       schemaVersion: 2,
       snapshotSequence: hub.sequence,
@@ -690,7 +761,7 @@ export class HubServer {
 
     const url = new URL(req.url);
     const path = url.pathname;
-    const hub = this.state.ensureHub(this.config.hub?.label ?? "Boat", Object.keys(this.config.projects));
+    const hub = this.state.ensureHub(this.config.hub?.label ?? "Boat", Object.keys(this.state.getAllProjects(this.config)));
 
     // 1. Discovery descriptor
     if (req.method === "GET" && path === "/.well-known/t3/environment") {
@@ -835,6 +906,7 @@ export class HubServer {
     for (const [, ref] of ws.data.upstreamRequests) {
       this.bridges.get(ref.sandboxId)?.sendInterrupt(ref.upReqId);
     }
+    this.removeWorktreeSetupSubsForWs(ws);
     ws.data.upstreamRequests.clear();
     ws.data.localStreams.clear();
   }
@@ -876,6 +948,7 @@ export class HubServer {
       const rawReqId = frame.requestId ?? "";
       const reqKey = String(rawReqId);
       ws.data.localStreams.delete(reqKey);
+      this.removeWorktreeSetupSub(ws, reqKey);
       const ref = ws.data.upstreamRequests.get(reqKey);
       if (ref) {
         ws.data.upstreamRequests.delete(reqKey);
@@ -985,6 +1058,69 @@ export class HubServer {
     if (tag === "subscribeTerminalMetadata") {
       ws.data.localStreams.set(reqKey, { rawId: reqId, tag });
       sendRpcFrame(ws, { _tag: "Chunk", requestId: reqId, values: [{ kind: "snapshot", threads: [] }] });
+      return;
+    }
+    if (tag === "subscribeWorktreeSetup") {
+      const tid = extractThreadId(payload);
+      ws.data.localStreams.set(reqKey, { rawId: reqId, tag });
+      if (tid) {
+        let subs = this.worktreeSetupSubs.get(tid);
+        if (!subs) {
+          subs = new Set();
+          this.worktreeSetupSubs.set(tid, subs);
+        }
+        subs.add({ ws, reqKey, reqId });
+        sendRpcFrame(ws, {
+          _tag: "Chunk",
+          requestId: reqId,
+          values: [this.worktreeSetupSnapshots.get(tid) ?? null],
+        });
+      }
+      return;
+    }
+    if (tag === "worktreeSetup.cancel") {
+      sendRpcExitSuccess(ws, reqId, { cancelled: false });
+      return;
+    }
+    if (tag === "subscribeProjectClones") {
+      ws.data.localStreams.set(reqKey, { rawId: reqId, tag });
+      sendRpcFrame(ws, {
+        _tag: "Chunk",
+        requestId: reqId,
+        values: [Array.from(this.activeProjectClones.values())],
+      });
+      return;
+    }
+    if (tag === "projectClone.start") {
+      await this.handleProjectCloneStart(ws, reqId, (payload ?? {}) as Record<string, unknown>);
+      return;
+    }
+    if (tag === "projectClone.cancel") {
+      const pid = String((payload as Record<string, unknown> | undefined)?.projectId ?? "");
+      const existing = this.activeProjectClones.get(pid);
+      if (existing) {
+        this.activeProjectClones.delete(pid);
+        this.broadcastProjectClones();
+        sendRpcExitSuccess(ws, reqId, { applied: true });
+      } else {
+        sendRpcExitSuccess(ws, reqId, { applied: false });
+      }
+      return;
+    }
+    if (tag === "projectClone.retry") {
+      const pid = String((payload as Record<string, unknown> | undefined)?.projectId ?? "");
+      const projKey = this.projectKeyFromHubId(pid);
+      const existing = this.activeProjectClones.get(pid);
+      if (projKey && existing) {
+        this.startBackgroundProjectBake(pid, projKey, existing.remoteUrl, existing.destinationPath);
+        sendRpcExitSuccess(ws, reqId, { applied: true });
+      } else {
+        sendRpcExitSuccess(ws, reqId, { applied: false });
+      }
+      return;
+    }
+    if (tag === "subscribeVcsStatus" || tag === "subscribeVcsBranch") {
+      await this.handleWorkspaceRpc(ws, reqId, tag, payload, headers);
       return;
     }
     if (KEEP_OPEN_SUBSCRIPTIONS.has(tag)) {
@@ -1275,6 +1411,11 @@ export class HubServer {
       sendRpcExitSuccess(ws, reqId, { paths: [] });
       return;
     }
+    if (tag === "subscribeVcsStatus" || tag === "subscribeVcsBranch") {
+      // Keep VCS status/branch subscriptions open quietly when zero VMs are running for this project
+      ws.data.localStreams.set(String(reqId), { rawId: reqId, tag });
+      return;
+    }
 
     sendRpcExitFailure(ws, reqId, `No running sandbox for ${tag}`);
   }
@@ -1356,7 +1497,8 @@ export class HubServer {
   }
 
   private async doSpawnSandboxForThread(projectKey: string, threadId: string): Promise<HubSandboxRecord> {
-    const project = this.config.projects[projectKey];
+    const allProjects = this.state.getAllProjects(this.config);
+    const project = allProjects[projectKey];
     if (!project) throw new Error(`Unknown project "${projectKey}"`);
     const maxSandboxes = this.config.hub?.maxSandboxes ?? 10;
     const activeCount = this.state.listHubSandboxes().filter((s) => s.phase !== "destroying").length;
@@ -1365,11 +1507,23 @@ export class HubServer {
     }
 
     const snapshots = await this.boat.namedSnapshots();
+    let snapshotToUse = project.snapshot;
+    let effectiveProject: ProjectConfig = project;
+    let fallbackCloning = false;
     if (!snapshots.includes(project.snapshot)) {
-      throw new Error(`Golden snapshot "${project.snapshot}" does not exist yet. Run \`sentinel bake ${projectKey}\` first.`);
+      if (snapshots.includes(this.config.boat.baseSnapshot) && project.bakeCmd) {
+        snapshotToUse = this.config.boat.baseSnapshot;
+        fallbackCloning = true;
+        effectiveProject = {
+          ...project,
+          bootCmd: project.bootCmd ? `${project.bakeCmd}\n${project.bootCmd}` : project.bakeCmd,
+        };
+      } else {
+        throw new Error(`Golden snapshot "${project.snapshot}" does not exist yet. Run \`sentinel bake ${projectKey}\` first.`);
+      }
     }
 
-    const hub = this.state.ensureHub(this.config.hub?.label ?? "Boat", Object.keys(this.config.projects));
+    const hub = this.state.ensureHub(this.config.hub?.label ?? "Boat", Object.keys(allProjects));
     const hubProjectId = hub.projectIds[projectKey] ?? randomUUID();
     const size = project.size ?? this.config.boat.defaultSize;
     const shortThread = threadId.replace(/[^a-z0-9]/gi, "").slice(0, 6).toLowerCase() || "chat";
@@ -1379,23 +1533,125 @@ export class HubServer {
 
     let sandboxId: string | null = null;
     let klavAgentName: string | null = null;
+    const setupStartedAt = new Date().toISOString();
+    let setupSeq = 0;
+    const emitStage = (
+      activeStage: "fetch" | "checkout" | "setup-script" | "agent" | "done" | "failed",
+      detail: string,
+      percent: number,
+      errorMsg: string | null = null,
+    ) => {
+      const now = new Date().toISOString();
+      const order: Array<"fetch" | "checkout" | "submodules" | "setup-script" | "agent"> = [
+        "fetch",
+        "checkout",
+        "submodules",
+        "setup-script",
+        "agent",
+      ];
+      const activeIdx =
+        activeStage === "done"
+          ? order.length
+          : activeStage === "failed"
+            ? Math.max(0, order.indexOf("setup-script"))
+            : order.indexOf(activeStage);
+      const stages: WorktreeSetupStageState[] = order.map((id, idx) => {
+        if (id === "submodules") {
+          return {
+            id,
+            status: activeIdx > idx ? "skipped" : "pending",
+            startedAt: null,
+            endedAt: activeIdx > idx ? now : null,
+            percent: null,
+            detail: null,
+            tail: [],
+          };
+        }
+        if (activeStage === "done" || idx < activeIdx) {
+          return {
+            id,
+            status: "done",
+            startedAt: setupStartedAt,
+            endedAt: now,
+            percent: 100,
+            detail: idx === activeIdx - 1 ? detail.slice(0, 200) : null,
+            tail: [],
+          };
+        }
+        if (activeStage === "failed" && idx === activeIdx) {
+          return {
+            id,
+            status: "failed",
+            startedAt: setupStartedAt,
+            endedAt: now,
+            percent,
+            detail: detail.slice(0, 200),
+            tail: errorMsg ? [errorMsg.slice(0, 400)] : [],
+          };
+        }
+        if (idx === activeIdx) {
+          return {
+            id,
+            status: "running",
+            startedAt: now,
+            endedAt: null,
+            percent,
+            detail: detail.slice(0, 200),
+            tail: [detail.slice(0, 400)],
+          };
+        }
+        return {
+          id,
+          status: "pending",
+          startedAt: null,
+          endedAt: null,
+          percent: null,
+          detail: null,
+          tail: [],
+        };
+      });
+      this.publishWorktreeSetup(threadId, {
+        threadId,
+        phase: activeStage === "done" ? "done" : activeStage === "failed" ? "failed" : "running",
+        startedAt: setupStartedAt,
+        endedAt: activeStage === "done" || activeStage === "failed" ? now : null,
+        branch: null,
+        baseRef: snapshotToUse,
+        worktreePath: effectiveProject.workdir,
+        setupScript: null,
+        stages,
+        error: errorMsg ? errorMsg.slice(0, 1000) : null,
+        sequence: ++setupSeq,
+      });
+    };
 
     try {
-      console.log(`[hub] spawning fresh VM ${sandboxName} for project="${projectKey}" thread=${threadId}`);
-      sandboxId = await this.boat.create(sandboxName, size, project.snapshot);
+      emitStage("fetch", `Creating Boat VM (${size}) from ${snapshotToUse}...`, 15);
+      console.log(`[hub] spawning fresh VM ${sandboxName} for project="${projectKey}" thread=${threadId} (snapshot=${snapshotToUse})`);
+      sandboxId = await this.boat.create(sandboxName, size, snapshotToUse);
 
-      if (project.klav && this.klav) {
-        const prov = await this.klav.provisionForSandbox(this.boat, sandboxId, project.klav);
+      if (effectiveProject.klav && this.klav) {
+        emitStage("checkout", `VM ${sandboxId} created — attaching zero-trust Klav proxy...`, 40);
+        const prov = await this.klav.provisionForSandbox(this.boat, sandboxId, effectiveProject.klav);
         klavAgentName = prov.agentName;
+      } else {
+        emitStage("checkout", `VM ${sandboxId} created — preparing workspace...`, 40);
       }
 
+      emitStage(
+        "setup-script",
+        fallbackCloning
+          ? `Cloning ${projectKey} & starting T3 Code inside ${sandboxId}...`
+          : `Starting T3 Code server & watchdog inside ${sandboxId}...`,
+        68,
+      );
       const provisioned = await this.lifecycle.provisionStandaloneVm({
         sandboxId,
         watchdogSlotKey: `hub:${sandboxId}`,
         environmentId: hub.environmentId,
         label: hub.label,
         projectName: projectKey,
-        project,
+        project: effectiveProject,
         watchdogSecret,
         llmToken,
         mintToken: true,
@@ -1405,8 +1661,9 @@ export class HubServer {
         throw new Error(`T3 server inside ${sandboxId} returned no upstreamToken`);
       }
 
+      emitStage("agent", `Connecting live stream to Boat VM ${sandboxId}...`, 90);
       const upstreamUrl = await this.boat.hostPublic(sandboxId, 3773);
-      const vmProjectId = await ensureT3Project(upstreamUrl, provisioned.upstreamToken, projectKey, project.workdir);
+      const vmProjectId = await ensureT3Project(upstreamUrl, provisioned.upstreamToken, projectKey, effectiveProject.workdir);
       const now = new Date().toISOString();
 
       const record: HubSandboxRecord = {
@@ -1414,7 +1671,7 @@ export class HubServer {
         project: projectKey,
         hubProjectId,
         vmProjectId,
-        snapshot: project.snapshot,
+        snapshot: snapshotToUse,
         size,
         upstreamUrl,
         upstreamToken: provisioned.upstreamToken,
@@ -1435,9 +1692,12 @@ export class HubServer {
       this.attachBridge(record);
       await this.bridges.get(sandboxId)!.waitUntilOpen(20_000);
 
+      emitStage("done", `Boat VM ${sandboxId} (${size}) ready`, 100);
       console.log(`[hub] sandbox ${sandboxId} ready for thread=${threadId} (project=${projectKey})`);
       return record;
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      emitStage("failed", `Boat VM boot failed`, 100, msg);
       if (sandboxId) {
         this.state.removeHubSandbox(sandboxId);
         this.state.queueDelete(sandboxId, "hub-failed-spawn", klavAgentName);
@@ -1487,7 +1747,7 @@ export class HubServer {
         throw new Error("Sandbox disk expired after 14 days stopped");
       }
 
-      const project = this.config.projects[sb.project];
+      const project = this.state.getAllProjects(this.config)[sb.project];
       let nextKlavAgent = sb.klavAgentName;
       if (this.config.klav?.mode === "proxy" && project?.klav && this.klav) {
         if (sb.klavAgentName) await this.klav.revokeForSandbox(sb.klavAgentName).catch(() => {});
@@ -1734,7 +1994,7 @@ export class HubServer {
       }
     }
     // Also harvest vcsRefs for this project if missing
-    const project = this.config.projects[sandbox.project];
+    const project = this.state.getAllProjects(this.config)[sandbox.project];
     const bridge = this.bridges.get(sandbox.sandboxId);
     if (project && bridge?.isOpen() && !this.state.getHub()?.projectTemplates[sandbox.project]?.vcsRefs) {
       void bridge.callUnary("vcs.listRefs", { cwd: project.workdir }).then((res) => {
@@ -1784,10 +2044,167 @@ export class HubServer {
   }
 
   private projectKeyFromWorkdir(cwd: string): string | null {
-    for (const [k, p] of Object.entries(this.config.projects)) {
+    for (const [k, p] of Object.entries(this.state.getAllProjects(this.config))) {
       if (cwd === p.workdir || cwd.startsWith(`${p.workdir}/`)) return k;
     }
     return null;
+  }
+
+  private publishWorktreeSetup(threadId: string, snapshot: WorktreeSetupSnapshotState): void {
+    this.worktreeSetupSnapshots.set(threadId, snapshot);
+    const subs = this.worktreeSetupSubs.get(threadId);
+    if (subs) {
+      for (const sub of subs) {
+        sendRpcFrame(sub.ws, { _tag: "Chunk", requestId: sub.reqId, values: [snapshot] });
+      }
+    }
+    if (snapshot.phase === "done" || snapshot.phase === "failed") {
+      setTimeout(() => {
+        if (this.worktreeSetupSnapshots.get(threadId)?.sequence === snapshot.sequence) {
+          this.worktreeSetupSnapshots.delete(threadId);
+        }
+      }, 30_000);
+    }
+  }
+
+  private removeWorktreeSetupSub(ws: ServerWebSocket<HubWsData>, reqKey: string): void {
+    for (const [tid, subs] of this.worktreeSetupSubs) {
+      for (const sub of subs) {
+        if (sub.ws === ws && sub.reqKey === reqKey) {
+          subs.delete(sub);
+        }
+      }
+      if (subs.size === 0) this.worktreeSetupSubs.delete(tid);
+    }
+  }
+
+  private removeWorktreeSetupSubsForWs(ws: ServerWebSocket<HubWsData>): void {
+    for (const [tid, subs] of this.worktreeSetupSubs) {
+      for (const sub of subs) {
+        if (sub.ws === ws) subs.delete(sub);
+      }
+      if (subs.size === 0) this.worktreeSetupSubs.delete(tid);
+    }
+  }
+
+  private broadcastProjectClones(): void {
+    const list = Array.from(this.activeProjectClones.values());
+    for (const client of this.clients) {
+      for (const [, sub] of client.data.localStreams) {
+        if (sub.tag === "subscribeProjectClones") {
+          sendRpcFrame(client, { _tag: "Chunk", requestId: sub.rawId, values: [list] });
+        }
+      }
+    }
+  }
+
+  private async handleProjectCloneStart(
+    ws: ServerWebSocket<HubWsData>,
+    reqId: string | number,
+    payload: Record<string, unknown>,
+  ): Promise<void> {
+    try {
+      const projectId = typeof payload.projectId === "string" && payload.projectId ? payload.projectId : randomUUID();
+      const title = typeof payload.title === "string" ? payload.title.trim() : "";
+      const remoteUrlInput = typeof payload.remoteUrl === "string" ? payload.remoteUrl.trim() : "";
+      const repositoryInput = typeof payload.repository === "string" ? payload.repository.trim() : "";
+      const destinationPath = typeof payload.destinationPath === "string" ? payload.destinationPath.trim() : "";
+      const repoInput = remoteUrlInput || repositoryInput;
+      if (!repoInput) {
+        sendRpcExitFailure(ws, reqId, "projectClone.start requires remoteUrl or repository");
+        return;
+      }
+
+      const { name, project } = buildAutoProjectConfig({
+        repo: repoInput,
+        name: title || undefined,
+        workdir: destinationPath || undefined,
+      });
+
+      this.state.addDynamicProject(name, project, projectId);
+      this.notifyProjectAdded(name);
+      this.startBackgroundProjectBake(projectId, name, project.repo ?? repoInput, project.workdir);
+
+      console.log(`[hub] auto-registered repo "${name}" (${project.repo}) via T3 projectClone.start -> baking ${project.snapshot}`);
+      sendRpcExitSuccess(ws, reqId, {
+        projectId,
+        cwd: project.workdir,
+        remoteUrl: project.repo ?? repoInput,
+        repository: null,
+      });
+    } catch (err) {
+      sendRpcExitFailure(ws, reqId, err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  private startBackgroundProjectBake(
+    projectId: string,
+    projectKey: string,
+    remoteUrl: string,
+    destinationPath: string,
+  ): void {
+    const startedAt = new Date().toISOString();
+    let seq = 1;
+    this.activeProjectClones.set(projectId, {
+      projectId,
+      remoteUrl,
+      destinationPath,
+      repository: null,
+      phase: "running",
+      stage: "receiving",
+      percent: 25,
+      detail: `Baking immutable Boat snapshot env-${projectKey}...`,
+      error: null,
+      startedAt,
+      endedAt: null,
+      sequence: seq,
+    });
+    this.broadcastProjectClones();
+
+    void this.lifecycle
+      .bake(projectKey)
+      .then((res) => {
+        this.activeProjectClones.set(projectId, {
+          projectId,
+          remoteUrl,
+          destinationPath,
+          repository: null,
+          phase: "done",
+          stage: "checkout",
+          percent: 100,
+          detail: `Snapshot ${res.snapshot} ready`,
+          error: null,
+          startedAt,
+          endedAt: new Date().toISOString(),
+          sequence: ++seq,
+        });
+        this.broadcastProjectClones();
+        setTimeout(() => {
+          if (this.activeProjectClones.get(projectId)?.phase === "done") {
+            this.activeProjectClones.delete(projectId);
+            this.broadcastProjectClones();
+          }
+        }, 5_000);
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[hub] background bake failed for "${projectKey}":`, msg);
+        this.activeProjectClones.set(projectId, {
+          projectId,
+          remoteUrl,
+          destinationPath,
+          repository: null,
+          phase: "failed",
+          stage: "receiving",
+          percent: null,
+          detail: null,
+          error: msg.slice(0, 1000),
+          startedAt,
+          endedAt: new Date().toISOString(),
+          sequence: ++seq,
+        });
+        this.broadcastProjectClones();
+      });
   }
 
   private findSandboxByCwd(cwd: string): HubSandboxRecord | undefined {

@@ -4,43 +4,56 @@
 #
 # Tip: Any `${ENV_VAR}` placeholder is expanded from process.env so secrets stay in `.env`.
 
-domain: boat.example.com          # Wildcard Cloudflare Tunnel: *.boat.example.com -> http://127.0.0.1:8080
-controlHost: ctrl.boat.example.com
+domain: example.com                  # Wildcard Cloudflare Tunnel: *.example.com -> http://127.0.0.1:8080
+controlHost: boat-ctrl.example.com   # Protect with Cloudflare Access (Bypass on /internal/watchdog)
 listenHost: 127.0.0.1
 listenPort: 8080
-stateDir: ./data                  # Persistent state (hashed client tokens, descriptor templates, reaper queue)
+stateDir: ./data                     # Persistent state (hashed client tokens, dynamic projects, reaper queue)
 
-# Bearer secret for control API / mobile UI / MCP / iOS Shortcuts (generate: `openssl rand -hex 32`)
+# Bearer secret for control API / Dashboard / MCP / iOS Shortcuts (generate: `openssl rand -hex 32`)
 controlSecret: ${CONTROL_SECRET}
 
 # Optional push notification webhook (e.g., https://ntfy.sh/your-private-topic)
 # notifyUrl: https://ntfy.sh/t3-boat-alerts
 
+# Recommended: Single-Environment Hub Multiplexer (1 Environment -> up to N parallel disposable Boat VMs)
+# Pair `https://boat.example.com` ONCE on T3 Desktop & ONCE on T3 Mobile.
+# Every new chat automatically spawns 1 fresh isolated Boat VM and destroys ONLY that VM when settled/archived!
+hub:
+  host: boat.example.com
+  label: Boat
+  maxSandboxes: 20
+
 t3:
-  # Recommended: pin an exact T3 version matching your Desktop/Mobile clients (e.g. "0.0.48"), or "latest"
+  # Recommended: pin an exact T3 version matching your Desktop/Mobile clients, or "latest"
   version: latest
   # Channel: "stable" or "nightly" (must match your T3 Desktop / T3 Mobile channel)
   channel: stable
   # Default false: update cleanly during `bake`, never mutate a live chat VM mid-session
   autoUpdateOnWake: false
-  # Optional JSON file merged into `~/.t3/userdata/settings.json` on every VM boot (inherits providers & defaults!)
+  # Optional JSON file merged into `~/.t3/userdata/settings.json` on every VM boot (providers, defaults, etc.)
   # settingsFile: /opt/t3-boat-sentinel/t3-settings.json
 
 boat:
   # Optional explicit path to boat binary (auto-detects ~/.ascii/bin/boat or PATH)
   # bin: /root/.ascii/bin/boat
-  defaultSize: default
-  # Immutable golden base snapshot (Ubuntu + t3 + watchdog + optional klav binary)
+  # Default VM size for new chats ("default" = 2vCPU/4GB, "medium", "large" = 4vCPU/8GB)
+  defaultSize: large
+  # Immutable golden base snapshot (Ubuntu + t3 + watchdog + optional klav-forward)
   baseSnapshot: base-t3
   # Optional daily UTC hour (0-23) to refresh base-t3 automatically
   # baseBakeHourUtc: 3
+  # Optional shell command run during `bake base` to install extra base tooling (e.g. tailscale, CLIs)
+  # baseBakeCmd: |
+  #   set -e
+  #   npm install -g pnpm
   # Pause an active sandbox after this many seconds of inactivity (no agents, no CPU build, no traffic)
   sleepAfterSecs: 600
-  # Grace period after all chats in a sandbox are archived/deleted before acting
+  # Grace period after a chat is settled/archived before acting
   archiveGraceSecs: 20
   # Trigger cleanup when all top-level chats are: "archived" | "archived-or-settled"
-  deleteWhen: archived
-  # Action on archive: "delete" (permanently delete VM -> $0) | "stop" (pause VM; Boat keeps disk 14d)
+  deleteWhen: archived-or-settled
+  # Action on settle/archive: "delete" (permanently delete VM -> $0) | "stop" (pause VM; Boat keeps disk 14d)
   archiveAction: delete
   # How often sentinel reconciles `boat list --all` to kill orphan sandboxes
   reaperIntervalSecs: 300
@@ -50,59 +63,53 @@ boat:
   sandboxPrefix: t3s-
   # Optional files on sentinel uploaded at VM spawn time (never baked into golden snapshots!)
   # injectFiles:
-  #   - from: /opt/t3-boat-sentinel/claude-settings.json
-  #     to: ~/.claude/settings.json
+  #   - from: /opt/t3-boat-sentinel/extra-config.json
+  #     to: ~/.config/my-tool/config.json
   #     mode: "600"
 
-# Optional: Klav (https://klav.dev) zero-knowledge secrets provider.
-# Recommended: `mode: proxy` (ADR 0036 §4) — runs on the same host as `klav-proxy serve` (no master password
-# on sentinel! API keys stay in klav-proxy; sentinel only hands each Boat VM a one-time `ksb1_` package).
-# klav:
-#   mode: proxy
-#   bin: /usr/local/bin/klav
-#   issuerHome: /var/lib/t3-sentinel-klav-issuer
-#   proxyPort: 8790
-#   defaultTtl: 8h
-
 # Optional: Zero-trust per-sandbox LLM API proxy (e.g. forwarding to a private LAN/Tailscale CLIProxy).
-# Boat VMs NEVER join your Tailnet/LAN and NEVER see `upstreamApiKey` — each running VM receives
-# a unique ephemeral `t3llm_...` token that immediately returns 401 when the VM sleeps or is deleted!
+# Boat VMs NEVER join your LAN/Tailnet for LLM calls and NEVER see `upstreamApiKey` — each running VM
+# receives a unique ephemeral `t3llm_...` token that immediately returns 401 when the VM sleeps or is deleted!
 # llmProxy:
 #   host: boat-llm.example.com
 #   upstreamUrl: http://192.168.1.248:8317
 #   upstreamApiKey: ${LLM_UPSTREAM_API_KEY}
 
-# Wake behavior when T3 Mobile/Desktop connects to a sleeping slot:
-# - "manual" (default): returns 503 while asleep (0 phantom wakes, 0 dropped frames); wake from ctrl/MCP/CLI
-# - "on-connect": transparently wakes the sleeping VM when a client connects
+# Optional: Klav (https://klav.dev) zero-knowledge secrets provider (ADR 0036 + ADR 0042).
+# Real API keys stay on `klav-proxy`; each Boat VM gets a scoped ephemeral sandbox over `tag:klav-sandbox` Tailnet
+# that is automatically revoked when the chat is settled or archived.
+# klav:
+#   mode: proxy
+#   bin: /usr/local/bin/klav
+#   issuerHome: /var/lib/klav-issuer
+#   issuerAgent: sandbox-issuer
+#   forwardBinaryPath: /opt/t3-boat-sentinel/klav-assets/klav-forward
+#   tailnetUpScriptPath: /opt/t3-boat-sentinel/klav-assets/klav-tailnet-up
+#   skillPath: /opt/t3-boat-sentinel/klav-assets/SKILL.md
+#   proxyPort: 8790
+#   defaultTtl: 8h
+
+# Wake behavior when T3 connects to a sleeping legacy slot ("manual" | "on-connect")
 wakePolicy: manual
 
-# Fixed slots paired ONCE in T3 Mobile & Desktop (0 T3 Connect tunnels consumed!)
-slots:
-  - name: boat-1
-    label: "Boat 1"
-  - name: boat-2
-    label: "Boat 2"
-  - name: boat-3
-    label: "Boat 3"
-  - name: boat-4
-    label: "Boat 4"
+# Optional legacy fixed slots (leave empty `[]` when using Hub Mode above!)
+slots: []
 
 # Immutable golden snapshots per project (always baked from base-t3).
-# Chats NEVER modify these snapshots — only `sentinel bake <project>` (manual or daily cron) updates them.
+# Tip: You can also add/remove repos dynamically WITHOUT editing this file via:
+#   - T3 Code UI (Clone repo)
+#   - Dashboard (`https://boat-ctrl.example.com` -> "+ Add GitHub Repo")
+#   - API (`POST /api/projects`) or MCP (`sentinel_add_project`)
 projects:
   my-app:
     snapshot: env-my-app
-    size: default
-    repo: git@github.com:your-org/my-app.git
+    # size: large   # optional per-project override (defaults to boat.defaultSize)
+    repo: https://github.com/your-org/my-app.git
     workdir: /home/user/my-app
-    # Optional defaults when spawning with `prompt` alone via MCP (e.g. from a personal assistant)
-    # defaultProvider: claudeAgent
-    # defaultModel: claude-sonnet-5-5
     bakeCmd: |
       set -e
       if [ ! -d /home/user/my-app/.git ]; then
-        git clone git@github.com:your-org/my-app.git /home/user/my-app
+        git clone https://github.com/your-org/my-app.git /home/user/my-app
       fi
       cd /home/user/my-app
       git fetch --all --prune
@@ -112,16 +119,12 @@ projects:
       elif [ -f package-lock.json ]; then npm ci; fi
     bootCmd: |
       cd /home/user/my-app && git fetch origin --prune || true
-    # Preferred (with klav.mode: proxy): zero-knowledge proxy profiles granted to this repo's VMs
+    # Optional Klav proxy profiles granted to this repo's VMs:
     # klav:
-    #   profiles: [northflank, github]
+    #   profiles: [northflank]
     #   ttl: 8h
-    # Alternative fallback: inject a local .env file from sentinel host at boot
-    # envFile: /etc/t3-boat-sentinel/envs/my-app.env
-    # envTarget: /home/user/my-app/.env
     bakeHourUtc: 4
 
   scratch:
     snapshot: base-t3
-    size: default
     workdir: /home/user

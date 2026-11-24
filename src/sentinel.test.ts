@@ -939,4 +939,169 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     });
     expect(stillAliveLlm.status).toBe(200);
   });
+
+  test("streams live subscribeWorktreeSetup boot progress, handles dynamic repos via POST /api/projects & T3 projectClone.start, and keeps subscribeVcsStatus open cleanly", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-hub-dyn-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+
+    const vm1 = startFakeVmT3Server("vm1");
+    cleanups.push(() => vm1.server.stop(true));
+
+    const boat = new MockBoat();
+    boat.snapshots.add("base-t3");
+    boat.snapshots.add("env-my-app");
+    boat.upstreamBaseUrl = vm1.url;
+
+    const cfg: SentinelConfig = {
+      ...makeTestConfig(0),
+      stateDir: dir,
+      hub: { host: "boat.boat.example.com", label: "Boat", maxSandboxes: 5 },
+    };
+
+    const handle = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+    cleanups.push(() => handle.stop());
+    const base = `http://127.0.0.1:${handle.server.port}`;
+
+    // Pair & connect WS
+    const pairRes = await fetch(`${base}/api/pair`, {
+      method: "POST",
+      headers: { host: cfg.controlHost, authorization: `Bearer ${cfg.controlSecret}`, "content-type": "application/json" },
+      body: JSON.stringify({ slot: "hub" }),
+    });
+    const { code } = (await pairRes.json()) as { code: string };
+    const tokRes = await fetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: { host: "boat.boat.example.com", "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ subject_token: code, client_label: "Mac" }),
+    });
+    const { access_token: bearer } = (await tokRes.json()) as { access_token: string };
+    const tickRes = await fetch(`${base}/api/auth/websocket-ticket/rpc`, {
+      method: "POST",
+      headers: { host: "boat.boat.example.com", authorization: `Bearer ${bearer}` },
+    });
+    const { ticket } = (await tickRes.json()) as { ticket: string };
+
+    const ws = new WebSocket(`ws://127.0.0.1:${handle.server.port}/ws?wsTicket=${ticket}&orchestrationProtocol=2`, {
+      headers: { host: "boat.boat.example.com" },
+    } as unknown as string[]);
+    cleanups.push(() => ws.close());
+
+    const inbox: Array<Record<string, unknown>> = [];
+    const waiters: Array<() => void> = [];
+    await new Promise<void>((resolve, reject) => {
+      ws.addEventListener("open", () => resolve());
+      ws.addEventListener("error", () => reject(new Error("ws error")));
+      ws.addEventListener("message", (ev) => {
+        inbox.push(JSON.parse(String(ev.data)) as Record<string, unknown>);
+        for (const w of waiters.splice(0)) w();
+      });
+    });
+
+    const waitForFrame = async (pred: (f: Record<string, unknown>) => boolean, timeoutMs = 5_000) => {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        const idx = inbox.findIndex(pred);
+        if (idx >= 0) return inbox.splice(idx, 1)[0];
+        await new Promise<void>((r) => {
+          waiters.push(r);
+          setTimeout(r, 40);
+        });
+      }
+      throw new Error(`Timed out waiting for frame; inbox=${JSON.stringify(inbox)}`);
+    };
+
+    // Subscribe to shell, project clones, and VCS status with 0 VMs running
+    ws.send(JSON.stringify({ _tag: "Request", id: 1, tag: "orchestration.subscribeShell", payload: {}, headers: [] }));
+    const shellSnap = await waitForFrame((f) => f._tag === "Chunk" && f.requestId === 1);
+    const hubProjectId = String((((shellSnap.values as Array<Record<string, unknown>>)[0].snapshot as Record<string, unknown>).projects as Array<Record<string, unknown>>)[0].id);
+
+    ws.send(JSON.stringify({ _tag: "Request", id: 2, tag: "subscribeProjectClones", payload: {}, headers: [] }));
+    const initClones = await waitForFrame((f) => f._tag === "Chunk" && f.requestId === 2);
+    expect((initClones.values as unknown[])[0]).toEqual([]);
+
+    // subscribeVcsStatus with 0 running VMs should NOT fail!
+    ws.send(JSON.stringify({ _tag: "Request", id: 3, tag: "subscribeVcsStatus", payload: { cwd: "/home/user/my-app" }, headers: [] }));
+
+    // Subscribe to worktree setup progress for thread-progress BEFORE launching
+    ws.send(JSON.stringify({ _tag: "Request", id: 4, tag: "subscribeWorktreeSetup", payload: { threadId: "thread-progress" }, headers: [] }));
+    const initSetup = await waitForFrame((f) => f._tag === "Chunk" && f.requestId === 4);
+    expect((initSetup.values as unknown[])[0]).toBeNull();
+
+    // Launch thread -> should emit running stages AND final `done` WorktreeSetupSnapshot
+    ws.send(JSON.stringify({
+      _tag: "Request",
+      id: 5,
+      tag: "orchestration.launchThread",
+      payload: { threadId: "thread-progress", projectId: hubProjectId, title: "Progress Test", workspaceStrategy: { type: "root" } },
+      headers: [],
+    }));
+    const launchExit = await waitForFrame((f) => f._tag === "Exit" && f.requestId === 5);
+    expect((launchExit.exit as Record<string, unknown>)._tag).toBe("Success");
+    const setupDone = await waitForFrame(
+      (f) => f._tag === "Chunk" && f.requestId === 4 && (f.values as Array<{ phase?: string }>)?.[0]?.phase === "done",
+    );
+    expect(setupDone).toBeTruthy();
+
+    // Verify subscribeVcsStatus never errored with an Exit Failure
+    expect(inbox.some((f) => f._tag === "Exit" && f.requestId === 3)).toBe(false);
+
+    // Add a repo dynamically via Dashboard/API (`POST /api/projects`) -> broadcasts `project.updated` live!
+    const addRes = await fetch(`${base}/api/projects`, {
+      method: "POST",
+      headers: { host: cfg.controlHost, authorization: `Bearer ${cfg.controlSecret}`, "content-type": "application/json" },
+      body: JSON.stringify({ repo: "OmarAlex24/awesome-repo", size: "large", bake: false }),
+    });
+    expect(addRes.status).toBe(200);
+    const addedBody = (await addRes.json()) as { ok: boolean; name: string; project: { snapshot: string; workdir: string } };
+    expect(addedBody.name).toBe("awesome-repo");
+    expect(addedBody.project.snapshot).toBe("env-awesome-repo");
+
+    const projUpdated = await waitForFrame(
+      (f) =>
+        f._tag === "Chunk" &&
+        f.requestId === 1 &&
+        (f.values as Array<{ kind?: string; project?: { title?: string } }>)?.[0]?.kind === "project.updated" &&
+        (f.values as Array<{ project?: { title?: string } }>)[0].project?.title === "awesome-repo",
+    );
+    expect(projUpdated).toBeTruthy();
+
+    // Delete dynamic project -> broadcasts `project.removed` live!
+    const delRes = await fetch(`${base}/api/projects/awesome-repo`, {
+      method: "DELETE",
+      headers: { host: cfg.controlHost, authorization: `Bearer ${cfg.controlSecret}` },
+    });
+    expect(delRes.status).toBe(200);
+    const projRemoved = await waitForFrame(
+      (f) => f._tag === "Chunk" && f.requestId === 1 && (f.values as Array<{ kind?: string }>)?.[0]?.kind === "project.removed",
+    );
+    expect(projRemoved).toBeTruthy();
+
+    // Add a repo natively via T3 Code UI (`projectClone.start`) -> auto-registers & bakes snapshot!
+    ws.send(JSON.stringify({
+      _tag: "Request",
+      id: 6,
+      tag: "projectClone.start",
+      payload: {
+        projectId: "proj-cloned-1",
+        title: "cloned-app",
+        createdAt: new Date().toISOString(),
+        remoteUrl: "https://github.com/OmarAlex24/cloned-app.git",
+        destinationPath: "/home/user/cloned-app",
+      },
+      headers: [],
+    }));
+    const cloneExit = await waitForFrame((f) => f._tag === "Exit" && f.requestId === 6);
+    expect((cloneExit.exit as Record<string, unknown>)._tag).toBe("Success");
+    const cloneDone = await waitForFrame(
+      (f) =>
+        f._tag === "Chunk" &&
+        f.requestId === 2 &&
+        Array.isArray((f.values as unknown[])?.[0]) &&
+        ((f.values as Array<Array<{ projectId?: string; phase?: string }>>)[0]).some(
+          (c) => c.projectId === "proj-cloned-1" && c.phase === "done",
+        ),
+    );
+    expect(cloneDone).toBeTruthy();
+    expect(boat.snapshots.has("env-cloned-app")).toBe(true);
+  });
 });

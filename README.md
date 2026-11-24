@@ -1,6 +1,6 @@
 # t3-boat-sentinel
 
-**1 chat = 1 disposable [Boat](https://boat.dev) cloud sandbox for official [T3 Code](https://t3.codes) (Desktop & Mobile) — zero forks, zero T3 Connect tunnels consumed, immutable golden snapshots.**
+**1 chat = 1 disposable [Boat](https://boat.dev) cloud sandbox behind a single [T3 Code](https://t3.codes) Environment (Desktop & Mobile) — zero T3 forks, zero T3 Connect tunnels consumed, immutable golden snapshots, and zero-trust proxies.**
 
 `t3-boat-sentinel` runs as a tiny always-on sentinel daemon (Proxmox LXC, Raspberry Pi, or any $4 VPS — **none of your project code runs on the sentinel**) behind a single wildcard Cloudflare Tunnel.
 
@@ -8,49 +8,64 @@
 
 ## Why this exists
 
-| | `t3boat` | `t3-boat-sentinel` |
+| | Traditional single-VM setups | `t3-boat-sentinel` |
 |---|---|---|
-| **Sandbox model** | 1 persistent VPS-like VM shared across chats | **1 chat = 1 fresh disposable VM** from an immutable golden snapshot |
-| **Golden snapshots** | Overwritten on every sleep (accumulates worktrees & artifacts) | **Strictly immutable** — chats never mutate snapshots; only clean `bake` updates them |
-| **Archiving a chat** | Keeps VM & disk around | **Auto-stops & permanently deletes the Boat VM ($0)** after a 20s Undo grace period |
-| **T3 Mobile wake** | Cannot wake sleeping VMs when laptop is closed | **24/7 wake from T3 Mobile** via always-on sentinel + Cloudflare Tunnel |
-| **T3 Connect tunnels** | Consumes 1 T3 Connect tunnel per machine | **0 T3 Connect tunnels** (unlimited slots via your own wildcard Cloudflare Tunnel) |
-| **T3 Code maintenance** | Inspects & caches internal T3 RPCs | **Transparent HTTP/WS proxy** + 4 stable T3 auth routes (resilient across T3 updates) |
+| **Environment UX** | Pair 1 environment per VM/slot | **1 single `Boat` Environment** — spawns up to `N` (e.g. 20) parallel Boat VMs on demand |
+| **Sandbox isolation** | 1 persistent VM shared across chats | **1 chat = 1 fresh disposable VM** from an immutable golden snapshot (`env-<project>`) |
+| **Golden snapshots** | Overwritten on sleep (accumulates worktrees & bloat) | **Strictly immutable** — chats never mutate snapshots; only clean `bake` updates them |
+| **Settle / Archive a chat** | Keeps VM & disk around | **Auto-destroys only that chat's Boat VM ($0)** + revokes its ephemeral tokens & Klav sandbox |
+| **Adding new repos** | Hand-edit YAML & restart | **Automatic** via T3 Code's native Clone UI, the web Dashboard (`+ Add GitHub Repo`), API, or MCP |
+| **Live boot feedback** | Blind spinner or extra Mac CLI | **Native progress inside T3 Code UI** via `subscribeWorktreeSetup` (zero extra client install) |
+| **Secrets & LLM keys** | Plaintext API keys inside VMs | **Zero-trust**: per-sandbox ephemeral `LlmProxy` tokens + optional [Klav](https://klav.dev) (`klav-proxy` + ephemeral Tailnet) |
+| **T3 Connect tunnels** | Consumes 1 tunnel per VM | **0 T3 Connect tunnels** (all traffic rides your own wildcard Cloudflare Tunnel) |
 
 ---
 
-## Architecture
+## Architecture (Hub Mode — Recommended)
 
 ```text
-T3 Mobile / T3 Desktop
-   │  wss://boat-1.boat.example.com   (paired ONCE forever)
-   │  https://ctrl.boat.example.com   (mobile dashboard / iOS Shortcut)
+T3 Code Desktop (Mac/Linux/Win) + T3 Mobile
+   │  wss://boat.example.com       (paired ONCE forever — 1 Environment for all repos & chats!)
+   │  https://boat-ctrl.example.com (web dashboard / MCP / API — optional Cloudflare Access)
    ▼
 Sentinel host (Proxmox LXC / Docker — ~40MB RAM, zero project code runs here)
-   ├── cloudflared (1 wildcard tunnel: *.boat.example.com -> 127.0.0.1:8080)
-   ├── Slot Auth & Transparent HTTP/WS Proxy (permanent environmentId + pairing tokens)
-   ├── Wake-on-command (passive sidebar probes never wake sleeping VMs)
+   ├── cloudflared (1 wildcard tunnel: *.example.com -> http://127.0.0.1:8080)
+   ├── Hub RPC Multiplexer (`boat.example.com`)
+   │     ├── Presents all configured & dynamically-added repos in ONE T3 Environment
+   │     ├── Streams live VM boot progress directly into T3 UI (`subscribeWorktreeSetup`)
+   │     ├── Spawns 1 fresh isolated Boat VM per new chat (`orchestration.launchThread`)
+   │     ├── Rewrites projectIds & routes every thread/terminal/VCS/attachment RPC to its owning VM
+   │     └── Auto-reaps each VM independently when its chat is settled or archived
+   ├── Zero-Trust LLM Proxy (`boat-llm.example.com`)
+   │     └── Per-VM ephemeral `t3llm_...` token valid ONLY while `phase === "running"` (401 on sleep/delete)
    └── Reaper (reconciles `boat list --all` every 5m so zero orphan VMs bill)
    ▼
-Disposable Boat VMs (spawned via `boat new --from env-<project>`)
-   ├── t3code.service (auto-synced to your target T3 version/channel)
+Disposable Boat VMs (`boat new --type large --from env-<project>`)
+   ├── t3code.service (official `t3 serve`, auto-pinned to your Desktop/Mobile version)
+   ├── Optional Klav ephemeral sandbox (`klav-forward` over `tag:klav-sandbox` Tailnet — real API keys never enter VM)
    └── watchdog.mjs (0 npm deps)
-         ├── All chats archived/deleted -> notifies sentinel -> `boat delete --yes`
-         └── Idle (no agents, no CPU builds) -> `boat stop self` (never touches snapshots)
+         ├── Chat settled / archived -> notifies sentinel -> destroys ONLY that VM ($0) + revokes tokens
+         └── Idle (no agents, no CPU builds) -> pauses VM (never mutates golden snapshots)
 ```
+
+*(Classic fixed-slot mode `boat-1..N` is also still supported if you want dedicated named environments per slot.)*
 
 ---
 
 ## Features
 
-- **Immutable 2-tier golden snapshots:** `base-t3` (Ubuntu + `t3` + watchdog + optional `klav` binary) → `env-<project>` (always built cleanly from `base-t3`, smoke-tested, and wiped of `~/.t3/userdata` before snapshotting). Supports daily UTC auto-bake (`baseBakeHourUtc` / `bakeHourUtc`).
-- **Zero-knowledge secrets with [Klav](https://klav.dev):** Optionally provisions a scoped ephemeral Klav agent (`boat-<sandboxId>`) per disposable VM (`klav agent register` + non-interactive `approve --project ... --expires ...`), registers `klav mcp` inside the VM, and immediately revokes it (`klav agent revoke`) when the chat is archived or deleted. Plaintext `.env` injection from the sentinel host is also supported as a fallback.
-- **Auto-register project & launch initial thread:** Automatically registers `project.workdir` on fresh VMs (`t3 project add` / `POST /api/projects/mutate`) so the repo appears immediately in T3 Mobile, and supports passing `prompt` to `sentinel_spawn` / `POST /api/spawn` to start a thread right away (`orchestration.launchThread`).
-- **Zero re-pairing & clean cursor reset:** Sentinel writes each slot's permanent UUID into `~/.t3/userdata/environment-id` before `t3` starts, stores SHA-256 hashed per-device bearer tokens, and strips stale `resumeFrom` / `afterSequence` cursors when a fresh VM replaces an old one.
-- **Auto-delete on archive:** Archive or delete all top-level chats from Mac or T3 Mobile → after `archiveGraceSecs` (default 20s), sentinel checks for dirty/unpushed git state, warns via `notifyUrl`, and deletes (or pauses, if `archiveAction: stop`) the VM automatically.
-- **Async Job API & Single-Writer Daemon:** Long operations (`spawn`, `wake`, `bake`) run as async jobs (`202` + `GET /api/jobs/:id`) with `idempotencyKey` support and `idleTimeout: 255` so HTTP/MCP clients never time out. All CLI commands talk to the running daemon.
-- **Built-in stdio MCP server + Agent Skill:** Run `bun run sentinel mcp` and install [`skills/t3-boat-sentinel/SKILL.md`](skills/t3-boat-sentinel/SKILL.md) so personal assistants and coding agents can spawn chats, poll jobs, bake snapshots, and manage slots directly.
-- **Optional push notifications:** Sends alerts to any webhook (such as [ntfy.sh](https://ntfy.sh)) when an agent finishes, needs input, or a sandbox is deleted after archive.
+- **1-Environment Hub Multiplexer (`hub:`):** Pair `https://boat.example.com` **once** on T3 Desktop and **once** on T3 Mobile. Every new chat automatically spawns its own isolated Boat VM (`defaultSize: large` / `default` / `medium`, configurable globally or per-project), runs completely in parallel (up to `hub.maxSandboxes`), and is destroyed independently when you **Settle** or **Archive** the thread.
+- **Zero-YAML Repo Onboarding:** Add new repositories without touching `sentinel.yaml`:
+  1. Directly in **T3 Code UI** (Clone repository → Hub intercepts `projectClone.start`, registers the repo, and bakes `env-<repo>` in the background with live clone progress!).
+  2. From the **Dashboard** (`https://boat-ctrl.example.com` → `+ Add GitHub Repo` → enter `owner/repo`).
+  3. Via **REST API** (`POST /api/projects`) or **MCP** (`sentinel_add_project`).
+  If you start a chat before `env-<repo>` finishes baking, Sentinel automatically boots from `base-t3` and clones on first boot.
+- **Native Live Boot Progress in T3 Code:** Streams real-time VM creation, Klav setup, T3 server startup, and connection stages straight into T3 Code's native setup progress panel (`subscribeWorktreeSetup`) — no separate Mac CLI required.
+- **Immutable 2-Tier Golden Snapshots:** `base-t3` (Ubuntu + `t3` + watchdog + cached provider/ACP tool binaries + optional `klav-forward`) → `env-<project>` (always built cleanly from `base-t3`, smoke-tested, and wiped of per-VM DB/tokens while preserving pre-cached provider binaries). Supports daily UTC auto-bake (`baseBakeHourUtc` / `bakeHourUtc`).
+- **Zero-Trust LLM Proxy (`llmProxy:`):** Forward Claude/OpenAI requests to a private LAN/Tailscale gateway (e.g., `cliproxy`) without ever letting Boat VMs join your LAN or see your real API key. Each running VM receives a unique `t3llm_...` token that immediately returns `401` the moment the VM sleeps or is destroyed.
+- **Zero-Knowledge Secrets with [Klav](https://klav.dev) (`klav:`):** Supports Klav ADR 0036/0042 (`mode: proxy` with `klav-proxy` + ephemeral `tag:klav-sandbox` Tailscale + `klav-forward`) so agents can call external APIs (e.g. Northflank, GitHub, Cloudflare) without plaintext secrets ever entering the sandbox, revoking access automatically when the chat ends.
+- **Auto-Delete on Settle or Archive:** Configure `deleteWhen: archived-or-settled` (or `archived`) and `archiveAction: delete` (or `stop`). After `archiveGraceSecs` (default 20s), the VM is permanently deleted ($0/hr idle, no standby pool required).
+- **Built-in stdio MCP Server + Agent Skill:** Run `bun run sentinel mcp` and install [`skills/t3-boat-sentinel/SKILL.md`](skills/t3-boat-sentinel/SKILL.md) so personal assistants and coding agents can check status, add repos, bake snapshots, and manage sandboxes.
 
 ---
 
@@ -59,24 +74,26 @@ Disposable Boat VMs (spawned via `boat new --from env-<project>`)
 ### Option A: Proxmox LXC / Linux host (recommended, ~512MB RAM)
 
 ```bash
-git clone https://github.com/<your-user>/t3-boat-sentinel /opt/t3-boat-sentinel
+git clone https://github.com/OmarAlex24/t3-boat-sentinel /opt/t3-boat-sentinel
 cd /opt/t3-boat-sentinel
 bash scripts/install-lxc.sh
 
 # 1. Authenticate Boat CLI once
 boat onboard
 
-# 2. Generate sentinel.yaml with cryptographic secrets
+# 2. Generate sentinel.yaml with a cryptographic controlSecret
 bun run sentinel init
 $EDITOR sentinel.yaml
 
 # 3. Point a single Cloudflare Tunnel wildcard to http://127.0.0.1:8080:
-#      *.boat.example.com -> http://127.0.0.1:8080
+#      *.example.com -> http://127.0.0.1:8080
 #
-#    IMPORTANT: Do NOT put Cloudflare Access on `boat-1..N` (T3 Mobile authenticates
-#    with T3's cryptographic bearer token). You CAN protect `ctrl.boat.example.com`
-#    with Cloudflare Access — just add a Bypass rule for `/internal/watchdog`
-#    (already authenticated with `watchdogSecret`).
+#    Security note:
+#    - Do NOT put Cloudflare Access on `boat.example.com` or `boat-llm.example.com`
+#      (they use T3's OAuth/Bearer auth and per-VM ephemeral tokens).
+#    - DO protect `boat-ctrl.example.com` with Cloudflare Access (Email OTP / GitHub),
+#      and add ONE Bypass application for `boat-ctrl.example.com/internal/watchdog`
+#      so Boat VMs can deliver per-sandbox signed watchdog events.
 
 # 4. Start the daemon
 sudo systemctl start t3-boat-sentinel
@@ -86,7 +103,7 @@ sudo systemctl start t3-boat-sentinel
 
 ```bash
 cp sentinel.example.yaml sentinel.yaml
-# Set CONTROL_SECRET, WATCHDOG_SECRET (and optional CLOUDFLARE_TUNNEL_TOKEN) in .env
+# Set CONTROL_SECRET (and optional LLM_UPSTREAM_API_KEY / CLOUDFLARE_TUNNEL_TOKEN) in .env
 docker compose run --rm sentinel boat onboard
 docker compose up -d
 # Or with bundled cloudflared sidecar:
@@ -95,51 +112,50 @@ docker compose --profile tunnel up -d
 
 ---
 
-## First-time setup
+## First-Time Setup
 
 1. **Bake your immutable base snapshot (`base-t3`):**
    ```bash
    bun run sentinel bake base
    ```
-   *(To pre-authenticate `claude` / `codex` inside `base-t3`: spin up a temp VM with `boat new --from base-t3`, run `boat ssh <id>` → `claude auth login` / `codex login`, exit, then `boat stop <id> && boat snapshot <id> base-t3 && boat delete <id> --yes`.)*
 
-2. **Bake each project's immutable snapshot (e.g. `my-app`):**
+2. **Add & bake your first project (either in `sentinel.yaml` or directly from the Dashboard / API):**
    ```bash
    bun run sentinel bake my-app
    ```
-
-3. **Pair your slots ONCE in T3 Desktop and T3 Mobile:**
+   Or dynamically without touching YAML:
    ```bash
-   bun run sentinel pair boat-1
-   bun run sentinel pair boat-2
+   curl -X POST https://boat-ctrl.example.com/api/projects \
+     -H "Authorization: Bearer $CONTROL_SECRET" \
+     -H "Content-Type: application/json" \
+     -d '{"repo": "owner/my-app", "bake": true}'
    ```
-   Paste each URL in **T3 Code → Settings → Environments → Add environment**.
+
+3. **Pair your Hub ONCE in T3 Desktop and ONCE in T3 Mobile:**
+   ```bash
+   bun run sentinel pair hub
+   ```
+   Paste the link in **T3 Code → Settings → Environments → Add environment**.
+   *(Generate a fresh pairing link for each device — each code is single-use and multiple concurrent pairing codes are supported.)*
+
+4. **Code away:** Open your `Boat` environment in T3 Desktop or T3 Mobile, pick any repo, and send a message. Sentinel spawns a fresh Boat VM for that thread, streams live boot progress right inside T3, and destroys the VM automatically when you **Settle** or **Archive** the chat.
 
 ---
 
-## Daily workflow
+## CLI & MCP Usage
 
-### From T3 Mobile (1-tap iOS Shortcut)
-Create an iOS Shortcut with **Get Contents of URL**:
-- **URL:** `https://ctrl.boat.example.com/api/spawn`
-- **Method:** `POST`
-- **Headers:** `Authorization: Bearer <your-controlSecret>`
-- **Body (JSON):** `{"project": "my-app"}`
-
-Tap the shortcut → Sentinel spawns a fresh VM from `env-my-app` into a free slot (e.g. `boat-2`) in ~10s → open `Boat 2` in T3 Mobile → code away. When done, **archive the chat** on Mac or Mobile → Sentinel deletes the VM automatically 20 seconds later.
-
-### From CLI
+### CLI (talks to the running daemon)
 ```bash
 bun run sentinel status
-bun run sentinel spawn my-app          # picks a free slot
-bun run sentinel wake boat-1
-bun run sentinel sleep boat-1
-bun run sentinel reset boat-1          # delete VM immediately
-bun run sentinel revoke boat-1         # revoke paired tokens for lost devices
-bun run sentinel bake my-app           # refresh immutable golden snapshot
+bun run sentinel pair hub               # pairing link for T3 Desktop / Mobile
+bun run sentinel bake base              # refresh base-t3 golden snapshot
+bun run sentinel bake my-app            # refresh env-my-app from base-t3
+bun run sentinel reset hub:<sandboxId>  # destroy one Hub VM immediately
+bun run sentinel reset hub              # destroy all live Hub VMs
+bun run sentinel revoke hub             # revoke paired device tokens
 ```
 
-### As an MCP server (Claude Code / Codex / T3 Code)
+### As an MCP server (Claude Code / Codex / T3 Code / Personal Assistants)
 ```json
 {
   "mcpServers": {
@@ -147,7 +163,7 @@ bun run sentinel bake my-app           # refresh immutable golden snapshot
       "command": "bun",
       "args": ["run", "/path/to/t3-boat-sentinel/src/index.ts", "mcp"],
       "env": {
-        "SENTINEL_URL": "https://ctrl.boat.example.com",
+        "SENTINEL_URL": "https://boat-ctrl.example.com",
         "CONTROL_SECRET": "<your-controlSecret>"
       }
     }

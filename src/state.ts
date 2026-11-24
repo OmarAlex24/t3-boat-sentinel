@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { ClientCredentialRecord } from "./auth.ts";
-import type { SentinelConfig } from "./config.ts";
+import type { ProjectConfig, SentinelConfig } from "./config.ts";
 
 export type SlotPhase = "empty" | "provisioning" | "running" | "waking" | "sleeping" | "destroying";
 
@@ -99,6 +99,8 @@ export interface PersistedState {
   templateAuthSession: Record<string, unknown> | null;
   slots: Record<string, SlotRecord>;
   hub?: HubStateRecord;
+  /** Projects added dynamically via Dashboard / API / T3 Code `projectClone.start` (merged with sentinel.yaml). */
+  dynamicProjects?: Record<string, ProjectConfig>;
   pendingDeletes: PendingDelete[];
   bakes: Record<string, BakeRecord>;
 }
@@ -164,7 +166,10 @@ export class StateStore {
     if (config.hub || hub) {
       const prevHub = existing.hub;
       const projectIds: Record<string, string> = { ...(prevHub?.projectIds ?? {}) };
-      for (const key of Object.keys(config.projects)) {
+      for (const key of [
+        ...Object.keys(existing.dynamicProjects ?? {}),
+        ...Object.keys(config.projects),
+      ]) {
         if (!projectIds[key]) projectIds[key] = randomUUID();
       }
       const sandboxes: Record<string, HubSandboxRecord> = {};
@@ -196,6 +201,7 @@ export class StateStore {
       templateAuthSession: existing.templateAuthSession ?? null,
       slots,
       ...(hub ? { hub } : {}),
+      dynamicProjects: existing.dynamicProjects ?? {},
       pendingDeletes: Array.isArray(existing.pendingDeletes) ? existing.pendingDeletes : [],
       bakes: existing.bakes ?? {},
     };
@@ -332,4 +338,98 @@ export class StateStore {
       this.save();
     }
   }
+
+  getAllProjects(config: SentinelConfig): Record<string, ProjectConfig> {
+    return { ...(this.data.dynamicProjects ?? {}), ...config.projects };
+  }
+
+  addDynamicProject(name: string, project: ProjectConfig, hubProjectId?: string): void {
+    this.data.dynamicProjects ??= {};
+    this.data.dynamicProjects[name] = project;
+    if (this.data.hub) {
+      this.data.hub.projectIds[name] = hubProjectId ?? this.data.hub.projectIds[name] ?? randomUUID();
+    }
+    this.save();
+  }
+
+  removeDynamicProject(name: string): string | null {
+    if (!this.data.dynamicProjects?.[name]) return null;
+    delete this.data.dynamicProjects[name];
+    const removedHubId = this.data.hub?.projectIds[name] ?? null;
+    if (this.data.hub?.projectIds[name]) {
+      delete this.data.hub.projectIds[name];
+    }
+    this.save();
+    return removedHubId;
+  }
+}
+
+export interface AutoProjectInput {
+  repo: string;
+  name?: string;
+  workdir?: string;
+  size?: string;
+  klavProfiles?: string[];
+  klavTtl?: string;
+  defaultProvider?: string;
+  defaultModel?: string;
+}
+
+export function normalizeGitRepo(input: string): { remoteUrl: string; derivedName: string } {
+  const raw = input.trim();
+  if (!raw) throw new Error("Repository URL or owner/repo is required");
+  let remoteUrl = raw;
+  if (/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(raw)) {
+    remoteUrl = `https://github.com/${raw}.git`;
+  }
+  const lastSeg = remoteUrl.replace(/\/+$/, "").split(/[/:]/).pop() ?? "repo";
+  const derivedName =
+    lastSeg
+      .replace(/\.git$/i, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9-]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "repo";
+  return { remoteUrl, derivedName };
+}
+
+export function buildAutoProjectConfig(input: AutoProjectInput): { name: string; project: ProjectConfig } {
+  const { remoteUrl, derivedName } = normalizeGitRepo(input.repo);
+  const name = (input.name?.trim() || derivedName)
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  if (!name || name === "base") {
+    throw new Error(`Invalid project name "${name || input.name}"`);
+  }
+  const workdir = input.workdir?.trim() || `/home/user/${name}`;
+  const qUrl = `'${remoteUrl.replace(/'/g, `'\\''`)}'`;
+  const qDir = `'${workdir.replace(/'/g, `'\\''`)}'`;
+  const bakeCmd = [
+    "set -e",
+    `if [ ! -d ${qDir}/.git ]; then git clone ${qUrl} ${qDir}; fi`,
+    `cd ${qDir}`,
+    "git fetch --all --prune",
+    'DEFAULT_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo main)',
+    'git reset --hard "origin/$DEFAULT_BRANCH" || true',
+    "if [ -f pnpm-lock.yaml ] && command -v pnpm >/dev/null 2>&1; then pnpm install --frozen-lockfile || pnpm install;",
+    "elif ( [ -f bun.lock ] || [ -f bun.lockb ] ) && command -v bun >/dev/null 2>&1; then bun install --frozen-lockfile || bun install;",
+    "elif [ -f package-lock.json ] && command -v npm >/dev/null 2>&1; then npm ci || npm install;",
+    "elif [ -f Cargo.toml ] && command -v cargo >/dev/null 2>&1; then cargo fetch || true;",
+    "fi",
+  ].join("\n");
+  const bootCmd = `if [ -d ${qDir}/.git ]; then cd ${qDir} && git fetch origin --prune || true; fi`;
+  const project: ProjectConfig = {
+    snapshot: `env-${name}`,
+    repo: remoteUrl,
+    workdir,
+    bakeCmd,
+    bootCmd,
+    ...(input.size ? { size: input.size } : {}),
+    ...(input.defaultProvider ? { defaultProvider: input.defaultProvider } : {}),
+    ...(input.defaultModel ? { defaultModel: input.defaultModel } : {}),
+    ...(input.klavProfiles && input.klavProfiles.length > 0
+      ? { klav: { profiles: input.klavProfiles, ...(input.klavTtl ? { ttl: input.klavTtl } : {}) } }
+      : {}),
+  };
+  return { name, project };
 }

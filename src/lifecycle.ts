@@ -132,9 +132,10 @@ export class LifecycleManager {
   async spawn(projectName: string, requestedSlotOrOpts?: string | SpawnOptions): Promise<SpawnResult> {
     const opts: SpawnOptions =
       typeof requestedSlotOrOpts === "string" ? { slot: requestedSlotOrOpts } : (requestedSlotOrOpts ?? {});
-    const project = this.config.projects[projectName];
+    const allProjects = this.state.getAllProjects(this.config);
+    const project = allProjects[projectName];
     if (!project) {
-      throw new Error(`Unknown project "${projectName}". Available: ${Object.keys(this.config.projects).join(", ")}`);
+      throw new Error(`Unknown project "${projectName}". Available: ${Object.keys(allProjects).join(", ")}`);
     }
 
     // Reserve slot synchronously BEFORE any async call so concurrent spawns cannot pick the same slot
@@ -326,7 +327,7 @@ export class LifecycleManager {
           throw new Error("Sandbox disk expired; slot reset to empty");
         }
 
-        const project = current.project ? this.config.projects[current.project] : undefined;
+        const project = current.project ? this.state.getAllProjects(this.config)[current.project] : undefined;
         let nextKlavAgent = current.klavAgentName;
         if (this.config.klav?.mode === "proxy" && project?.klav && this.klav) {
           if (current.klavAgentName) {
@@ -509,10 +510,11 @@ export class LifecycleManager {
    * - Runs a live T3 smoke check & captures real descriptor/session templates before wiping `~/.t3/userdata`.
    */
   async bake(target: string): Promise<{ snapshot: string; t3Version: string }> {
+    const allProjects = this.state.getAllProjects(this.config);
     const isBase = target === "base" || target === this.config.boat.baseSnapshot;
-    const project = isBase ? undefined : this.config.projects[target];
+    const project = isBase ? undefined : allProjects[target];
     if (!isBase && !project) {
-      throw new Error(`Unknown bake target "${target}". Use "base" or one of: ${Object.keys(this.config.projects).join(", ")}`);
+      throw new Error(`Unknown bake target "${target}". Use "base" or one of: ${Object.keys(allProjects).join(", ")}`);
     }
 
     const existingSnapshots = await this.boat.namedSnapshots();
@@ -731,7 +733,7 @@ export class LifecycleManager {
       }
     }
 
-    for (const [name, proj] of Object.entries(this.config.projects)) {
+    for (const [name, proj] of Object.entries(this.state.getAllProjects(this.config))) {
       if (proj.bakeHourUtc === undefined || proj.bakeHourUtc !== hourUtc) continue;
       const last = this.state.getBake(name)?.bakedAt;
       if (last && last.startsWith(todayKey)) continue;

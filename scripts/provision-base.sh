@@ -66,10 +66,17 @@ if [ "$BAKE_CLEAN" = "1" ]; then
   auth_session="$(curl -sf --max-time 5 -H "Authorization: Bearer $smoke_token" http://127.0.0.1:3773/api/auth/session || echo '{}')"
   ver="$("$t3" --version 2>/dev/null || echo unknown)"
 
-  # Stop services and wipe ALL of ~/.t3/userdata so no environment-id, sqlite DB, or tokens leak into snapshot
+  # Stop services and wipe per-VM userdata (DB, environment-id, tokens, logs, worktrees, settings)
+  # while preserving cached provider/ACP tool binaries (`providers/`, `cache/`, `tools/`, `acp-registry/`)
   systemctl --user stop t3code.service 2>/dev/null || true
   systemctl --user stop t3-sentinel-watchdog.service 2>/dev/null || true
-  rm -rf "$userdata_dir" "$sentinel_dir/watchdog.json" "$sentinel_dir/boot-secrets.json" "$sentinel_dir/saw-thread" "$HOME/.klav-forward" "$units/t3code.service.d/klav-env.conf"
+  rm -rf \
+    "$userdata_dir/statev2.sqlite" "$userdata_dir/statev2.sqlite-wal" "$userdata_dir/statev2.sqlite-shm" \
+    "$userdata_dir/server-owner.sqlite" "$userdata_dir/server-owner.sqlite-journal" \
+    "$userdata_dir/environment-id" "$userdata_dir/settings.json" "$userdata_dir/keybindings.json" \
+    "$userdata_dir/logs" "$userdata_dir/worktrees" "$userdata_dir/attachments" "$userdata_dir/auth" \
+    "$sentinel_dir/watchdog.json" "$sentinel_dir/boot-secrets.json" "$sentinel_dir/saw-thread" \
+    "$HOME/.klav-forward" "$units/t3code.service.d/klav-env.conf"
   mkdir -p "$userdata_dir"
 
   DESC="$descriptor" SESS="$auth_session" VER="$ver" node -e '
