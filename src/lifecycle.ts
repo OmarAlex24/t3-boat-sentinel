@@ -556,6 +556,8 @@ export class LifecycleManager {
       }
 
       await this.boat.stop(tempId);
+      // `boat stop` transitions through `archiving` before reaching `stopped`; wait until snapshotable.
+      await this.waitUntilStopped(tempId, 180_000);
       console.log(`[bake] saving immutable snapshot "${snapshotName}"...`);
       await this.boat.saveSnapshot(tempId, snapshotName);
 
@@ -769,6 +771,16 @@ export class LifecycleManager {
     if (parsed.descriptor || parsed.authSession) {
       this.state.setTemplates(parsed.descriptor ?? null, parsed.authSession ?? null);
     }
+  }
+
+  private async waitUntilStopped(sandboxId: string, timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const info = await this.boat.info(sandboxId);
+      if (info.state === "stopped" || info.state === "archived") return;
+      await Bun.sleep(2_000);
+    }
+    throw new Error(`Timed out waiting for sandbox ${sandboxId} to finish stopping before snapshot`);
   }
 
   private async sendNotify(title: string, message: string): Promise<void> {
