@@ -23,7 +23,8 @@ t3="$HOME/.local/bin/t3"
 sentinel_dir="$HOME/.t3-sentinel"
 userdata_dir="$HOME/.t3/userdata"
 units="$HOME/.config/systemd/user"
-mkdir -p "$sentinel_dir" "$units" "$userdata_dir"
+# t3code.service appends stdout to userdata/logs/boot-service.log; systemd fails (209/STDOUT) if the dir is missing
+mkdir -p "$sentinel_dir" "$units" "$userdata_dir/logs"
 chmod 700 "$sentinel_dir"
 
 restart_t3=0
@@ -67,6 +68,8 @@ if [ "$BAKE_CLEAN" = "1" ]; then
   # Smoke-test t3 serve & capture real descriptor + auth session templates before wiping per-VM userdata
   "$t3" service install --allow-downgrade >/dev/null
   systemctl --user daemon-reload
+  # Clear start-limit-hit (StartLimitBurst=5) left by boot attempts that ran before logs/ existed
+  systemctl --user reset-failed t3code.service 2>/dev/null || true
   systemctl --user restart t3code.service
   wait_for_t3
 
@@ -265,7 +268,8 @@ if [ "$BAKE_CLEAN" = "1" ]; then
     "$userdata_dir/logs" "$userdata_dir/worktrees" "$userdata_dir/attachments" "$userdata_dir/auth" \
     "$sentinel_dir/watchdog.json" "$sentinel_dir/boot-secrets.json" "$sentinel_dir/t3-settings.json" "$sentinel_dir/saw-thread" \
     "$HOME/.klav-forward" "$units/t3code.service.d/klav-env.conf"
-  mkdir -p "$userdata_dir"
+  # Keep logs/ so t3code.service can open its stdout log when VMs boot from this snapshot
+  mkdir -p "$userdata_dir/logs"
 
   DESC="$descriptor" SESS="$auth_session" VER="$ver" node -e '
     console.log(JSON.stringify({
@@ -322,7 +326,10 @@ if [ -f "$HOME/.klav-forward/env.systemd" ]; then
 fi
 systemctl --user daemon-reload
 systemctl --user is-active --quiet t3code.service || restart_t3=1
-[ "$restart_t3" = "0" ] || systemctl --user restart t3code.service
+if [ "$restart_t3" != "0" ]; then
+  systemctl --user reset-failed t3code.service 2>/dev/null || true
+  systemctl --user restart t3code.service
+fi
 wait_for_t3
 
 # Optionally register project via official `t3 project add` CLI (fallback handled by sentinel if unavailable)
