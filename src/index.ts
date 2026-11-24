@@ -85,7 +85,7 @@ export function createSentinelServer(
       },
       close(ws, code, reason) {
         if (hub && "kind" in ws.data && ws.data.kind === "hub") {
-          hub.onWsClose(ws as Bun.ServerWebSocket<HubWsData>);
+          hub.onWsClose(ws as Bun.ServerWebSocket<HubWsData>, code, reason);
         } else {
           slotWs.close?.(ws as Bun.ServerWebSocket<WsData>, code, reason);
         }

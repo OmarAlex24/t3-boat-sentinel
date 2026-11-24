@@ -581,9 +581,23 @@ export class HubServer {
     const desc = this.buildDescriptor();
     const cached = hub.serverConfig;
     if (cached && typeof cached === "object") {
+      const cachedAuth =
+        cached.auth && typeof cached.auth === "object"
+          ? {
+              ...(cached.auth as Record<string, unknown>),
+              policy: "remote-reachable",
+              sessionMethods: ["bearer-access-token"],
+            }
+          : {
+              policy: "remote-reachable",
+              bootstrapMethods: ["one-time-token"],
+              sessionMethods: ["bearer-access-token"],
+              sessionCookieName: "t3_session",
+            };
       return {
         ...cached,
         environment: desc,
+        auth: cachedAuth,
       };
     }
     // Fallback before first VM/bake harvests the real ServerConfig
@@ -812,10 +826,12 @@ export class HubServer {
 
   onWsOpen(ws: ServerWebSocket<HubWsData>): void {
     this.clients.add(ws);
+    console.log(`[hub-ws] client connected (clientId=${ws.data.clientId}, total=${this.clients.size})`);
   }
 
-  onWsClose(ws: ServerWebSocket<HubWsData>): void {
+  onWsClose(ws: ServerWebSocket<HubWsData>, code?: number, reason?: string): void {
     this.clients.delete(ws);
+    console.log(`[hub-ws] client disconnected (clientId=${ws.data.clientId}, code=${code ?? 0}, reason=${reason ?? ""})`);
     for (const [, ref] of ws.data.upstreamRequests) {
       this.bridges.get(ref.sandboxId)?.sendInterrupt(ref.upReqId);
     }
@@ -825,7 +841,15 @@ export class HubServer {
 
   onWsMessage(ws: ServerWebSocket<HubWsData>, msg: string | Buffer): void {
     const raw = typeof msg === "string" ? msg : new TextDecoder().decode(msg);
-    for (const frame of decodeRpcFrames<RpcClientFrame>(raw)) {
+    const frames = decodeRpcFrames<RpcClientFrame>(raw);
+    if (frames.length === 0) {
+      console.warn(`[hub-ws] unparsed frame (${raw.length}B): ${raw.slice(0, 120)}`);
+      return;
+    }
+    for (const frame of frames) {
+      if (frame._tag === "Request") {
+        console.log(`[hub-ws] req id=${frame.id} tag=${frame.tag}`);
+      }
       void this.handleClientFrame(ws, frame).catch((err) => {
         console.error("[hub] client frame error:", err);
       });
@@ -887,15 +911,25 @@ export class HubServer {
     if (tag === "subscribeServerLifecycle") {
       ws.data.localStreams.set(reqId, tag);
       const hub = this.state.getHub();
+      const desc = this.buildDescriptor();
       const events =
         hub?.lifecycleEvents && hub.lifecycleEvents.length > 0
-          ? hub.lifecycleEvents
+          ? hub.lifecycleEvents.map((ev) => {
+              if (ev && typeof ev === "object") {
+                const obj = ev as Record<string, unknown>;
+                const p = obj.payload && typeof obj.payload === "object" ? (obj.payload as Record<string, unknown>) : null;
+                if (p && "environment" in p) {
+                  return { ...obj, payload: { ...p, environment: desc } };
+                }
+              }
+              return ev;
+            })
           : [
               {
                 version: 1,
                 sequence: 1,
                 type: "ready",
-                payload: { environment: this.buildDescriptor() },
+                payload: { at: new Date().toISOString(), environment: desc },
               },
             ];
       sendRpcFrame(ws, { _tag: "Chunk", requestId: reqId, values: events });
