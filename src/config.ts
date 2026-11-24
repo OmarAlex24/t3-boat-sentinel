@@ -225,7 +225,7 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
 
   const boat = {
     bin: parsed.boat?.bin,
-    hostVisibility: (parsed.boat?.hostVisibility === "private" ? "private" : "public") as "public" | "private",
+    hostVisibility: (parsed.boat?.hostVisibility === "public" ? "public" : "private") as "public" | "private",
     defaultSize: parsed.boat?.defaultSize ?? "default",
     baseSnapshot: parsed.boat?.baseSnapshot ?? "base-t3",
     baseFrom: parsed.boat?.baseFrom ? String(parsed.boat.baseFrom).trim() : undefined,

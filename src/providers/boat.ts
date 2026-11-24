@@ -36,10 +36,10 @@ export class BoatProvider implements SandboxProvider, LegacyBoatClient {
   constructor(explicitBinOrOpts?: string | BoatProviderOptions) {
     if (typeof explicitBinOrOpts === "string") {
       this.bin = explicitBinOrOpts;
-      this.hostVisibility = "public";
+      this.hostVisibility = "private";
     } else {
       this.bin = explicitBinOrOpts?.bin ?? BoatProvider.locate();
-      this.hostVisibility = explicitBinOrOpts?.hostVisibility ?? "public";
+      this.hostVisibility = explicitBinOrOpts?.hostVisibility ?? "private";
     }
   }
 
@@ -191,19 +191,20 @@ export class BoatProvider implements SandboxProvider, LegacyBoatClient {
       headers.cookie = v.cookie;
     }
 
-    // If Boat returned a token-gated redirect URL (`https://...?token=...`), exchange it once to capture the gate Cookie
+    // If Boat returned a token-gated redirect URL (`https://...?_token=...`), exchange it once to capture the gate Cookie (`_port_auth=...`)
     const parsedUrl = new URL(v.url);
     if (Object.keys(headers).length === 0 && parsedUrl.search) {
       try {
         const probe = await fetch(v.url, { method: "GET", redirect: "manual", signal: AbortSignal.timeout(15_000) });
-        const setCookie = probe.headers.get("set-cookie");
-        if (setCookie) {
-          const cookiePair = setCookie
-            .split(/,(?=[^;]+=[^;]+)/)
-            .map((part) => part.split(";")[0]?.trim())
-            .filter(Boolean)
-            .join("; ");
-          if (cookiePair) headers.cookie = cookiePair;
+        const rawSetCookies: string[] =
+          typeof (probe.headers as Headers & { getSetCookie?: () => string[] }).getSetCookie === "function"
+            ? (probe.headers as Headers & { getSetCookie: () => string[] }).getSetCookie()
+            : [probe.headers.get("set-cookie") ?? ""].filter(Boolean);
+        const cookiePairs = rawSetCookies
+          .map((c) => c.split(";")[0]?.trim())
+          .filter((c): c is string => Boolean(c && c.includes("=")));
+        if (cookiePairs.length > 0) {
+          headers.cookie = cookiePairs.join("; ");
         }
       } catch (err) {
         console.warn(`[boat] private preview cookie exchange failed for ${id}, falling back to raw URL:`, err);
@@ -211,7 +212,10 @@ export class BoatProvider implements SandboxProvider, LegacyBoatClient {
     }
 
     const baseUrl = `${parsedUrl.origin}${parsedUrl.pathname}`.replace(/\/+$/, "");
-    return Object.keys(headers).length > 0 ? { url: baseUrl, headers } : { url: v.url.replace(/\/+$/, "") };
+    if (Object.keys(headers).length === 0) {
+      throw new Error(`boat host --private returned no gate cookie/headers for ${id} (refusing insecure fallback)`);
+    }
+    return { url: baseUrl, headers };
   }
 
   async exec(id: string, script: string, timeoutSecs = 120): Promise<ExecResult> {

@@ -1255,4 +1255,44 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     expect(locked.status).toBe(429);
     expect(locked.headers.get("retry-after")).toBeTruthy();
   });
+
+  test("BoatProvider private preview exchanges ?_token=... into clean base URL + _port_auth Cookie header", async () => {
+    const gateServer = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        const url = new URL(req.url);
+        if (url.searchParams.get("_token") === "secret-gate-token") {
+          return new Response(null, {
+            status: 302,
+            headers: {
+              location: "/",
+              "set-cookie": "_port_auth=signed-cookie-val; Path=/; HttpOnly; Secure; Expires=Wed, 25 Nov 2026 00:00:00 GMT",
+            },
+          });
+        }
+        return new Response("Forbidden", { status: 403 });
+      },
+    });
+    cleanups.push(() => gateServer.stop(true));
+
+    const { BoatProvider } = await import("./providers/boat.ts");
+    const bp = new BoatProvider({ hostVisibility: "private" });
+    // Stub private CLI runner to return Boat's exact `--private --localhost --json` shape
+    (bp as unknown as { run: (args: string[]) => Promise<string> }).run = async (args: string[]) => {
+      expect(args).toContain("--private");
+      expect(args).toContain("--localhost");
+      return JSON.stringify({
+        access: "private",
+        isProtected: true,
+        localhost: true,
+        port: 3773,
+        url: `http://127.0.0.1:${gateServer.port}?_token=secret-gate-token`,
+      });
+    };
+
+    const ep = await bp.exposePort("bx_test", 3773);
+    expect(ep.url).toBe(`http://127.0.0.1:${gateServer.port}`);
+    expect(ep.headers).toEqual({ cookie: "_port_auth=signed-cookie-val" });
+  });
 });
