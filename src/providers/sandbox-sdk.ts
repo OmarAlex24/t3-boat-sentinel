@@ -243,7 +243,7 @@ export class SandboxSdkProvider implements SandboxProvider {
   async execOk(id: string, script: string, timeoutSecs = 120): Promise<string> {
     const r = await this.exec(id, script, timeoutSecs);
     if (r.exitCode !== 0) {
-      throw new Error(`remote command failed (exit ${r.exitCode}): ${(r.stderr.trim() || r.stdout.trim()).slice(0, 600)}`);
+      throw new Error(`remote command failed (exit ${r.exitCode}): ${(r.stderr.trim() || r.stdout.trim()).slice(-600)}`);
     }
     return r.stdout;
   }

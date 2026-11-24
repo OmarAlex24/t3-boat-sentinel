@@ -5,6 +5,9 @@
 #
 # Modes:
 #   BAKE_CLEAN=1   Install/update t3, verify it starts & capture descriptor/session templates,
+#                  optionally install provider runtimes (T3_PREPARE_ACP_AGENTS / T3_INSTALL_PROVIDERS),
+#                  then re-probe providers and wait until their on-disk status caches report
+#                  `installed: true` (also for T3_VERIFY_ACP_AGENTS / T3_VERIFY_PROVIDERS, verify-only),
 #                  then stop t3 and wipe ALL of `~/.t3/userdata` so the golden snapshot is spotless.
 #   (default)      Write slot's permanent `environment-id` BEFORE t3 starts, start `t3code.service`
 #                  and `t3-sentinel-watchdog.service`, optionally register `PROJECT_WORKDIR` via
@@ -72,18 +75,30 @@ if [ "$BAKE_CLEAN" = "1" ]; then
   auth_session="$(curl -sf --max-time 5 -H "Authorization: Bearer $smoke_token" http://127.0.0.1:3773/api/auth/session || echo '{}')"
   ver="$("$t3" --version 2>/dev/null || echo unknown)"
 
-  # Optionally pre-prepare ACP Registry agents (e.g. devin) and managed provider runtimes (e.g. antigravity)
-  if [ -n "${T3_PREPARE_ACP_AGENTS:-}" ] || [ -n "${T3_INSTALL_PROVIDERS:-}" ]; then
+  # Optionally pre-prepare ACP Registry agents (e.g. devin) and managed provider runtimes (e.g. antigravity),
+  # then make sure their provider status caches (`~/.t3/caches/<instanceId>.json`) say installed before the
+  # snapshot is taken. T3 probes providers at boot, before the installs above, and writes `installed:false`;
+  # new VMs hydrate from those files, so a stale cache in the snapshot shows "Not found" until a re-check.
+  if [ -n "${T3_PREPARE_ACP_AGENTS:-}" ] || [ -n "${T3_INSTALL_PROVIDERS:-}" ] \
+    || [ -n "${T3_VERIFY_ACP_AGENTS:-}" ] || [ -n "${T3_VERIFY_PROVIDERS:-}" ]; then
     js_runner="node"
     if command -v bun >/dev/null 2>&1; then js_runner="bun"; elif [ -x "$HOME/.bun/bin/bun" ]; then js_runner="$HOME/.bun/bin/bun"; fi
-    SMOKE_TOK="$smoke_token" ACP_LIST="${T3_PREPARE_ACP_AGENTS:-}" PROV_LIST="${T3_INSTALL_PROVIDERS:-}" "$js_runner" -e '
+    SMOKE_TOK="$smoke_token" ACP_LIST="${T3_PREPARE_ACP_AGENTS:-}" PROV_LIST="${T3_INSTALL_PROVIDERS:-}" \
+      VERIFY_ACP_LIST="${T3_VERIFY_ACP_AGENTS:-}" VERIFY_PROV_LIST="${T3_VERIFY_PROVIDERS:-}" \
+      VERIFY_TIMEOUT_SECS="${T3_PROVIDER_VERIFY_TIMEOUT_SECS:-180}" \
+      CACHE_DIR="$HOME/.t3/caches" SETTINGS_PATH="$userdata_dir/settings.json" "$js_runner" -e '
       (async () => {
+      const fs = require("fs");
+      const pathMod = require("path");
       const tok = process.env.SMOKE_TOK;
-      const acpAgents = (process.env.ACP_LIST || "").split(",").map(s => s.trim()).filter(Boolean);
-      const installProvs = (process.env.PROV_LIST || "").split(",").map(s => s.trim()).filter(Boolean);
+      const csv = (v) => (v || "").split(",").map(s => s.trim()).filter(Boolean);
+      const acpAgents = csv(process.env.ACP_LIST);
+      const installProvs = csv(process.env.PROV_LIST);
+      const verifyAgents = [...new Set([...acpAgents, ...csv(process.env.VERIFY_ACP_LIST)])];
+      const verifyProvs = [...new Set([...installProvs, ...csv(process.env.VERIFY_PROV_LIST)])];
       if (typeof WebSocket === "undefined") {
-        console.error("[bake] WebSocket global unavailable in JS runtime; skipping provider pre-install");
-        process.exit(0);
+        console.error("[bake] WebSocket global unavailable in JS runtime; cannot install or verify providers");
+        process.exit(1);
       }
       const tickRes = await fetch("http://127.0.0.1:3773/api/auth/websocket-ticket/rpc", {
         method: "POST",
@@ -156,7 +171,85 @@ if [ "$BAKE_CLEAN" = "1" ]; then
         streamHandlers.delete(String(subId));
         console.error("[bake] provider runtime ready: " + instanceId);
       }
+
+      // Instances whose status cache must say installed. ACP Registry agents map to the
+      // providerInstances entry (driver acpRegistry, config.agentId) that references them.
+      const expected = new Set(verifyProvs);
+      let settings = {};
+      try { settings = JSON.parse(fs.readFileSync(process.env.SETTINGS_PATH, "utf8")); } catch {}
+      const instances = (settings && settings.providerInstances) || {};
+      let configProviders = null;
+      for (const agentId of verifyAgents) {
+        const ids = Object.entries(instances)
+          .filter(([, inst]) => inst && inst.driver === "acpRegistry" && inst.config && inst.config.source !== "local"
+            && typeof inst.config.agentId === "string" && inst.config.agentId.trim() === agentId)
+          .map(([id]) => id);
+        if (ids.length === 0) {
+          if (configProviders === null) {
+            configProviders = await callUnary("server.getConfig", {}, 30000).then((c) => c.providers || []).catch(() => []);
+          }
+          const fallback = "acpRegistry_" + agentId;
+          const known = configProviders.some((p) => p.instanceId === fallback && p.driver === "acpRegistry")
+            || fs.existsSync(pathMod.join(process.env.CACHE_DIR, fallback + ".json"));
+          if (known) ids.push(fallback);
+        }
+        if (ids.length === 0) {
+          console.error("[bake] WARNING: no provider instance references ACP agent " + agentId + "; nothing to verify for it");
+        }
+        for (const id of ids) expected.add(id);
+      }
+      if (expected.size === 0) { ws.close(); process.exit(0); }
+
+      const ids = [...expected];
+      const deadline = Date.now() + Number(process.env.VERIFY_TIMEOUT_SECS) * 1000;
+      const readCache = (id) => {
+        try { return JSON.parse(fs.readFileSync(pathMod.join(process.env.CACHE_DIR, id + ".json"), "utf8")); }
+        catch { return null; }
+      };
+      const pending = () => ids.filter((id) => { const c = readCache(id); return !(c && c.installed === true); });
+      const remainingMs = () => Math.max(1000, deadline - Date.now());
+      const note = (what) => (err) => console.error("[bake] " + what + " did not complete: " + (err && err.message ? err.message : err));
+
+      // A full pass re-probes every live instance and rewrites the caches. It joins a pass already in
+      // flight (possibly the boot probe from before the installs), so also refresh each instance directly.
+      console.error("[bake] re-probing providers; waiting for caches of " + ids.join(", ") + " to report installed...");
+      // Judge only after these first refreshes settle (or the deadline hits): files that already say
+      // installed may be rewritten by a probe still running, and t3 must not be stopped mid-probe.
+      const firstRefreshes = [callUnary("server.refreshProviders", {}, remainingMs()).catch(note("server.refreshProviders"))];
+      const inFlight = new Set();
+      const refreshOne = (id) => {
+        if (inFlight.has(id)) return null;
+        inFlight.add(id);
+        return callUnary("server.refreshProviders", { instanceId: id }, remainingMs())
+          .catch(note("server.refreshProviders(" + id + ")"))
+          .finally(() => inFlight.delete(id));
+      };
+      for (const id of ids) firstRefreshes.push(refreshOne(id));
+      let refreshed = false;
+      Promise.allSettled(firstRefreshes).then(() => { refreshed = true; });
+
+      let lastNudge = Date.now();
+      while ((!refreshed || pending().length > 0) && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 2000));
+        if (Date.now() - lastNudge >= 30000) {
+          lastNudge = Date.now();
+          pending().forEach(refreshOne);
+        }
+      }
+      const stale = pending();
+      for (const id of ids) {
+        const c = readCache(id);
+        console.error("[bake] provider cache " + id + ": " + (c
+          ? "installed=" + c.installed + " enabled=" + c.enabled + " status=" + c.status + " checkedAt=" + c.checkedAt + (c.message ? " message=" + JSON.stringify(c.message) : "")
+          : "missing"));
+      }
+      if (stale.length > 0) {
+        console.error("[bake] provider status caches still not installed after " + process.env.VERIFY_TIMEOUT_SECS + "s: " + stale.join(", ") + "; refusing to snapshot");
+        process.exit(1);
+      }
+      console.error("[bake] provider status caches verified: " + ids.join(", "));
       ws.close();
+      process.exit(0);
       })().catch((err) => { console.error("[bake] provider pre-install error:", err); process.exit(1); });
     '
   fi
