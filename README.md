@@ -1,5 +1,7 @@
 # t3-boat-sentinel
 
+![t3-boat-sentinel — 1 T3 Code chat = 1 disposable Boat VM](docs/banner-boat.png)
+
 **1 chat = 1 disposable [Boat](https://boat.dev) cloud sandbox behind a single [T3 Code](https://t3.codes) Environment (Desktop & Mobile) — zero T3 forks, zero T3 Connect tunnels consumed, immutable golden snapshots, and zero-trust proxies.**
 
 `t3-boat-sentinel` runs as a tiny always-on sentinel daemon (Proxmox LXC, Raspberry Pi, or any $4 VPS — **none of your project code runs on the sentinel**) behind a single wildcard Cloudflare Tunnel.
