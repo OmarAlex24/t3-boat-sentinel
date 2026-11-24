@@ -1,0 +1,28 @@
+services:
+  sentinel:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      SENTINEL_CONFIG: /config/sentinel.yaml
+      CONTROL_SECRET: ${CONTROL_SECRET}
+    volumes:
+      - ./sentinel.yaml:/config/sentinel.yaml:ro
+      - ./data:/app/data
+      - ./envs:/etc/t3-boat-sentinel/envs:ro
+      # Mount your Boat CLI auth directory after running `docker compose run --rm sentinel boat onboard`
+      - boat-auth:/root/.ascii
+
+  # Optional: sidecar Cloudflare Tunnel (set CLOUDFLARE_TUNNEL_TOKEN in .env)
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+    network_mode: service:sentinel
+    profiles: ["tunnel"]
+
+volumes:
+  boat-auth:

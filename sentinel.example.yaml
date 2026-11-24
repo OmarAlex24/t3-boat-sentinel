@@ -1,0 +1,112 @@
+# t3-boat-sentinel configuration
+# Runs on an always-on sentinel host (Proxmox LXC / Docker / VPS).
+# Zero project code runs on the sentinel host — all agent execution runs inside disposable Boat VMs.
+#
+# Tip: Any `${ENV_VAR}` placeholder is expanded from process.env so secrets stay in `.env`.
+
+domain: boat.example.com          # Wildcard Cloudflare Tunnel: *.boat.example.com -> http://127.0.0.1:8080
+controlHost: ctrl.boat.example.com
+listenHost: 127.0.0.1
+listenPort: 8080
+stateDir: ./data                  # Persistent state (hashed client tokens, descriptor templates, reaper queue)
+
+# Bearer secret for control API / mobile UI / MCP / iOS Shortcuts (generate: `openssl rand -hex 32`)
+controlSecret: ${CONTROL_SECRET}
+
+# Optional push notification webhook (e.g., https://ntfy.sh/your-private-topic)
+# notifyUrl: https://ntfy.sh/t3-boat-alerts
+
+t3:
+  # Recommended: pin an exact T3 version matching your Desktop/Mobile clients (e.g. "0.0.48"), or "latest"
+  version: latest
+  # Channel: "stable" or "nightly" (must match your T3 Desktop / T3 Mobile channel)
+  channel: stable
+  # Default false: update cleanly during `bake`, never mutate a live chat VM mid-session
+  autoUpdateOnWake: false
+
+boat:
+  # Optional explicit path to boat binary (auto-detects ~/.ascii/bin/boat or PATH)
+  # bin: /root/.ascii/bin/boat
+  defaultSize: default
+  # Immutable golden base snapshot (Ubuntu + t3 + watchdog + optional klav binary)
+  baseSnapshot: base-t3
+  # Optional daily UTC hour (0-23) to refresh base-t3 automatically
+  # baseBakeHourUtc: 3
+  # Pause an active sandbox after this many seconds of inactivity (no agents, no CPU build, no traffic)
+  sleepAfterSecs: 600
+  # Grace period after all chats in a sandbox are archived/deleted before acting
+  archiveGraceSecs: 20
+  # Trigger cleanup when all top-level chats are: "archived" | "archived-or-settled"
+  deleteWhen: archived
+  # Action on archive: "delete" (permanently delete VM -> $0) | "stop" (pause VM; Boat keeps disk 14d)
+  archiveAction: delete
+  # How often sentinel reconciles `boat list --all` to kill orphan sandboxes
+  reaperIntervalSecs: 300
+  # Optional safety cap in hours for sleeping sandboxes (0 = disabled)
+  maxSleepingHours: 0
+  # Prefix for sandboxes managed by sentinel (reaper only touches sandboxes with this prefix)
+  sandboxPrefix: t3s-
+
+# Optional: Klav (https://klav.dev) zero-knowledge secrets provider.
+# Recommended: `mode: proxy` (ADR 0036 §4) — runs on the same host as `klav-proxy serve` (no master password
+# on sentinel! API keys stay in klav-proxy; sentinel only hands each Boat VM a one-time `ksb1_` package).
+# klav:
+#   mode: proxy
+#   bin: /usr/local/bin/klav
+#   issuerHome: /var/lib/t3-sentinel-klav-issuer
+#   proxyPort: 8790
+#   defaultTtl: 8h
+
+# Wake behavior when T3 Mobile/Desktop connects to a sleeping slot:
+# - "manual" (default): returns 503 while asleep (0 phantom wakes, 0 dropped frames); wake from ctrl/MCP/CLI
+# - "on-connect": transparently wakes the sleeping VM when a client connects
+wakePolicy: manual
+
+# Fixed slots paired ONCE in T3 Mobile & Desktop (0 T3 Connect tunnels consumed!)
+slots:
+  - name: boat-1
+    label: "Boat 1"
+  - name: boat-2
+    label: "Boat 2"
+  - name: boat-3
+    label: "Boat 3"
+  - name: boat-4
+    label: "Boat 4"
+
+# Immutable golden snapshots per project (always baked from base-t3).
+# Chats NEVER modify these snapshots — only `sentinel bake <project>` (manual or daily cron) updates them.
+projects:
+  my-app:
+    snapshot: env-my-app
+    size: default
+    repo: git@github.com:your-org/my-app.git
+    workdir: /home/user/my-app
+    # Optional defaults when spawning with `prompt` alone via MCP (e.g. from a personal assistant)
+    # defaultProvider: claudeAgent
+    # defaultModel: claude-sonnet-5-5
+    bakeCmd: |
+      set -e
+      if [ ! -d /home/user/my-app/.git ]; then
+        git clone git@github.com:your-org/my-app.git /home/user/my-app
+      fi
+      cd /home/user/my-app
+      git fetch --all --prune
+      git reset --hard origin/$(git symbolic-ref --short HEAD 2>/dev/null || echo main)
+      if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile;
+      elif [ -f bun.lock ] || [ -f bun.lockb ]; then bun install --frozen-lockfile;
+      elif [ -f package-lock.json ]; then npm ci; fi
+    bootCmd: |
+      cd /home/user/my-app && git fetch origin --prune || true
+    # Preferred (with klav.mode: proxy): zero-knowledge proxy profiles granted to this repo's VMs
+    # klav:
+    #   profiles: [northflank, github]
+    #   ttl: 8h
+    # Alternative fallback: inject a local .env file from sentinel host at boot
+    # envFile: /etc/t3-boat-sentinel/envs/my-app.env
+    # envTarget: /home/user/my-app/.env
+    bakeHourUtc: 4
+
+  scratch:
+    snapshot: base-t3
+    size: default
+    workdir: /home/user

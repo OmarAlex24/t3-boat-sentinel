@@ -1,0 +1,9 @@
+node_modules/
+data/
+dist/
+sentinel.yaml
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
