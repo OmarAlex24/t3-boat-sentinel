@@ -5,7 +5,7 @@ RUN apt-get update -y && \
     rm -rf /var/lib/apt/lists/*
 
 # Install official Boat CLI into /root/.ascii/bin/boat
-RUN curl -fsSL https://boat.dev/install.sh | sh
+RUN curl -fsSL https://boat.dev/install | sh
 ENV PATH="/root/.ascii/bin:${PATH}"
 
 WORKDIR /app

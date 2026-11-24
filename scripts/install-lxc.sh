@@ -17,7 +17,7 @@ fi
 
 if ! command -v boat >/dev/null 2>&1 && [ ! -x "$HOME/.ascii/bin/boat" ]; then
   echo "==> Installing Boat CLI"
-  curl -fsSL https://boat.dev/install.sh | sh
+  curl -fsSL https://boat.dev/install | sh
 fi
 
 if ! command -v cloudflared >/dev/null 2>&1; then
