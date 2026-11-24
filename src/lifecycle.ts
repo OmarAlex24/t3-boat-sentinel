@@ -730,6 +730,15 @@ export class LifecycleManager {
       await this.boat.upload(sandboxId, this.config.t3.settingsFile, "~/.t3-sentinel/t3-settings.json");
     }
 
+    // Optional per-boot injected config files (e.g. ~/.claude/settings.json) — never baked into golden snapshots
+    for (const file of this.config.boat.injectFiles) {
+      if (!existsSync(file.from)) continue;
+      const remoteDir = file.to.includes("/") ? file.to.slice(0, file.to.lastIndexOf("/")) : ".";
+      await this.boat.execOk(sandboxId, `mkdir -p ${remoteDir}`, 30);
+      await this.boat.upload(sandboxId, file.from, file.to);
+      await this.boat.execOk(sandboxId, `chmod ${file.mode ?? "600"} ${file.to}`, 30);
+    }
+
     // Plaintext .env injection (fallback when not using Klav)
     if (project?.envFile && existsSync(project.envFile)) {
       const target = project.envTarget ?? `${project.workdir}/.env`;

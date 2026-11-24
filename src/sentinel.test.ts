@@ -176,6 +176,7 @@ function makeTestConfig(port = 0): SentinelConfig {
       reaperIntervalSecs: 300,
       maxSleepingHours: 0,
       sandboxPrefix: "t3s-",
+      injectFiles: [],
     },
     wakePolicy: "manual",
     slots: [

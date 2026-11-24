@@ -66,6 +66,15 @@ export interface ProjectConfig {
   bakeHourUtc?: number;
 }
 
+export interface InjectFileConfig {
+  /** Local file on sentinel host (never baked into snapshots). */
+  from: string;
+  /** Remote path inside each spawned Boat VM (e.g. "~/.claude/settings.json"). */
+  to: string;
+  /** Optional chmod octal mode (default "600"). */
+  mode?: string;
+}
+
 export interface SentinelConfig {
   domain: string;
   controlHost: string;
@@ -98,6 +107,8 @@ export interface SentinelConfig {
     /** Safety cap in hours for sleeping sandboxes (0 = disabled, default 0 to prevent surprise data loss). */
     maxSleepingHours: number;
     sandboxPrefix: string;
+    /** Optional files on sentinel uploaded into every spawned VM (never frozen into golden snapshots). */
+    injectFiles: InjectFileConfig[];
   };
   klav?: KlavGlobalConfig;
   /**
@@ -156,6 +167,13 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
     reaperIntervalSecs: Number(parsed.boat?.reaperIntervalSecs ?? 300),
     maxSleepingHours: Number(parsed.boat?.maxSleepingHours ?? 0),
     sandboxPrefix: parsed.boat?.sandboxPrefix ?? "t3s-",
+    injectFiles: Array.isArray(parsed.boat?.injectFiles)
+      ? parsed.boat.injectFiles.map((f) => ({
+          from: resolve(requireString(f.from, "boat.injectFiles[].from")),
+          to: requireString(f.to, "boat.injectFiles[].to"),
+          mode: f.mode ?? "600",
+        }))
+      : [],
   };
 
   let klav: KlavGlobalConfig | undefined;

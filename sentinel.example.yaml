@@ -48,6 +48,11 @@ boat:
   maxSleepingHours: 0
   # Prefix for sandboxes managed by sentinel (reaper only touches sandboxes with this prefix)
   sandboxPrefix: t3s-
+  # Optional files on sentinel uploaded at VM spawn time (never baked into golden snapshots!)
+  # injectFiles:
+  #   - from: /opt/t3-boat-sentinel/claude-settings.json
+  #     to: ~/.claude/settings.json
+  #     mode: "600"
 
 # Optional: Klav (https://klav.dev) zero-knowledge secrets provider.
 # Recommended: `mode: proxy` (ADR 0036 §4) — runs on the same host as `klav-proxy serve` (no master password
