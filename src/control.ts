@@ -318,6 +318,24 @@ export class ControlPlane {
         return Response.json({ ok: true, slot: body.slot, ...pair });
       }
 
+      if (req.method === "POST" && path === "/api/token") {
+        const body = (await req.json()) as { slot?: string; label?: string };
+        const slot = body.slot ?? "hub";
+        if (slot !== "hub") {
+          return Response.json({ ok: false, error: "Machine tokens are currently supported for slot \"hub\" only." }, { status: 400 });
+        }
+        if (!this.hub || !this.config.hub) {
+          return Response.json({ ok: false, error: "Hub is not enabled in sentinel.yaml" }, { status: 400 });
+        }
+        const minted = this.hub.mintClientToken(body.label ?? "machine");
+        return Response.json({
+          ok: true,
+          slot: "hub",
+          mcpUrl: `https://${this.config.hub.host}/mcp`,
+          ...minted,
+        });
+      }
+
       if (req.method === "POST" && path === "/api/projects") {
         const body = (await req.json()) as {
           repo: string;

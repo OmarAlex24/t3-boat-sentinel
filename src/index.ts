@@ -232,6 +232,17 @@ async function main(): Promise<void> {
       break;
     }
 
+    case "token": {
+      const [slotName = "hub", ...labelParts] = rest;
+      const label = labelParts.join(" ").trim() || "machine";
+      const res = await callControlApi(localBase, config.controlSecret, "/api/token", {
+        slot: slotName,
+        label,
+      });
+      console.log(JSON.stringify(res, null, 2));
+      break;
+    }
+
     case "revoke": {
       const [slotName, clientId] = rest;
       if (!slotName) throw new Error("Usage: sentinel revoke <slot-name> [client-id]");
@@ -289,7 +300,7 @@ async function main(): Promise<void> {
 
     default:
       console.error(
-        `Unknown command "${cmd}". Commands: init | serve | mcp | bake <target> | pair <slot> | revoke <slot> [clientId] | spawn <project> [slot] | wake <slot> | sleep <slot> | reset <slot> | status`,
+        `Unknown command "${cmd}". Commands: init | serve | mcp | bake <target> | pair <slot> | token <hub> [label] | revoke <slot> [clientId] | spawn <project> [slot] | wake <slot> | sleep <slot> | reset <slot> | status`,
       );
       process.exit(1);
   }

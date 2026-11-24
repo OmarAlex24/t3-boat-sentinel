@@ -1405,4 +1405,424 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     };
     expect(desc.serverVersion).toBe("0.1.12-nightly.20261124.5204");
   });
+
+  test("Streamable HTTP /mcp: machine token, 0-VM idle reads, async <2s launch, queued sends, pending requests, and settle -> $0/hr destroy", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-hub-mcp-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+
+    // Rich mock VM T3 server supporting launchThread, getThreadProjection, dispatchCommand, vcs.listRefs
+    const dispatchedCommands: Array<Record<string, unknown>> = [];
+    const launchedPayloads: Array<Record<string, unknown>> = [];
+    const vmMessages: Array<Record<string, unknown>> = [];
+    let vmThreadId = "";
+    let pendingRequestStatus = "pending";
+    const vmProjectId = "vm-proj-mcp";
+
+    const vmServer = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req, srv) {
+        const url = new URL(req.url);
+        if (url.pathname === "/api/orchestration/shell") {
+          return Response.json({
+            projects: [{ id: vmProjectId, title: "my-app", workspaceRoot: "/home/user/my-app" }],
+            threads: [],
+          });
+        }
+        if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
+          srv.upgrade(req);
+          return undefined;
+        }
+        return Response.json({ ok: true });
+      },
+      websocket: {
+        message(ws, raw) {
+          const frame = JSON.parse(String(raw)) as { _tag?: string; id?: string; tag?: string; payload?: Record<string, unknown> };
+          if (frame._tag === "Ping") {
+            ws.sendText(JSON.stringify({ _tag: "Pong" }));
+            return;
+          }
+          if (frame._tag !== "Request" || !frame.id) return;
+          if (frame.tag === "orchestration.subscribeShell") {
+            ws.sendText(
+              JSON.stringify({
+                _tag: "Chunk",
+                requestId: frame.id,
+                values: [
+                  {
+                    kind: "snapshot",
+                    snapshot: {
+                      schemaVersion: 2,
+                      snapshotSequence: 1,
+                      projects: [{ id: vmProjectId, title: "my-app", workspaceRoot: "/home/user/my-app" }],
+                      threads: [],
+                      archivedThreads: [],
+                    },
+                  },
+                ],
+              }),
+            );
+            return;
+          }
+          if (frame.tag === "orchestration.launchThread") {
+            const p = frame.payload ?? {};
+            launchedPayloads.push(p);
+            vmThreadId = String(p.threadId);
+            const initMsg = p.initialMessage as { text?: string } | undefined;
+            if (initMsg?.text) {
+              vmMessages.push({ id: "m-init", role: "user", runId: "run-1", text: initMsg.text });
+              vmMessages.push({ id: "m-reply", role: "assistant", runId: "run-1", text: "Working on it!" });
+            }
+            const threadShell = {
+              id: vmThreadId,
+              projectId: vmProjectId,
+              title: String(p.title ?? "MCP Task"),
+              status: "running",
+              updatedAt: "2026-11-24T12:00:00.000Z",
+              pullRequests: [
+                {
+                  host: "github.com",
+                  repository: "OmarAlex24/my-app",
+                  number: 42,
+                  url: "https://github.com/OmarAlex24/my-app/pull/42",
+                  state: "open",
+                  title: "Fix bug",
+                },
+              ],
+            };
+            ws.sendText(
+              JSON.stringify({
+                _tag: "Exit",
+                requestId: frame.id,
+                exit: { _tag: "Success", value: { threadId: vmThreadId, projection: { thread: threadShell }, sequence: 2 } },
+              }),
+            );
+            ws.sendText(
+              JSON.stringify({
+                _tag: "Chunk",
+                requestId: "hub-shell",
+                values: [{ kind: "thread.updated", sequence: 2, location: "active", thread: threadShell }],
+              }),
+            );
+            return;
+          }
+          if (frame.tag === "orchestration.dispatchCommand") {
+            const p = frame.payload ?? {};
+            dispatchedCommands.push(p);
+            if (p.type === "message.dispatch" && typeof p.text === "string") {
+              vmMessages.push({ id: String(p.messageId ?? "m-extra"), role: "user", runId: "run-2", text: p.text });
+            }
+            if (p.type === "runtime-request.respond") {
+              pendingRequestStatus = "resolved";
+            }
+            ws.sendText(
+              JSON.stringify({
+                _tag: "Exit",
+                requestId: frame.id,
+                exit: { _tag: "Success", value: { sequence: 3 } },
+              }),
+            );
+            return;
+          }
+          if (frame.tag === "orchestration.getThreadProjection") {
+            ws.sendText(
+              JSON.stringify({
+                _tag: "Exit",
+                requestId: frame.id,
+                exit: {
+                  _tag: "Success",
+                  value: {
+                    thread: {
+                      id: vmThreadId,
+                      projectId: vmProjectId,
+                      title: "Autonomous PR",
+                      status: "running",
+                      updatedAt: "2026-11-24T12:01:00.000Z",
+                      pullRequests: [
+                        {
+                          host: "github.com",
+                          repository: "OmarAlex24/my-app",
+                          number: 42,
+                          url: "https://github.com/OmarAlex24/my-app/pull/42",
+                          state: "open",
+                          title: "Fix bug",
+                        },
+                      ],
+                    },
+                    messages: vmMessages,
+                    turnItems: [
+                      ...vmMessages.map((m) => ({
+                        type: m.role === "user" ? "user_message" : "assistant_message",
+                        messageId: m.id,
+                        runId: m.runId,
+                      })),
+                      {
+                        type: "user_input_request",
+                        requestId: "req-q1",
+                        questions: [{ id: "q1", question: "Ship it?", options: [{ label: "Yes" }, { label: "No" }] }],
+                      },
+                    ],
+                    runs: [{ id: "run-1", ordinal: 1, status: "running", startedAt: "2026-11-24T12:00:00.000Z" }],
+                    runtimeRequests: [{ id: "req-q1", kind: "user_input", status: pendingRequestStatus }],
+                  },
+                },
+              }),
+            );
+            return;
+          }
+          if (frame.tag === "vcs.listRefs") {
+            ws.sendText(
+              JSON.stringify({
+                _tag: "Exit",
+                requestId: frame.id,
+                exit: { _tag: "Success", value: { branches: [{ name: "main", current: true }], nextCursor: null } },
+              }),
+            );
+            return;
+          }
+          ws.sendText(JSON.stringify({ _tag: "Exit", requestId: frame.id, exit: { _tag: "Success", value: {} } }));
+        },
+      },
+    });
+    cleanups.push(() => vmServer.stop(true));
+
+    const boat = new MockBoat();
+    boat.snapshots.add("base-t3");
+    boat.snapshots.add("env-my-app");
+    boat.upstreamBaseUrl = `http://127.0.0.1:${vmServer.port}`;
+
+    // Gate VM creation so we can verify async < 2s launch & mid-boot reads/queued sends!
+    let releaseBoot!: () => void;
+    const bootGate = new Promise<void>((r) => {
+      releaseBoot = r;
+    });
+    const origCreate = boat.create.bind(boat);
+    boat.create = async (name: string, size: string, fromSnapshot?: string) => {
+      await bootGate;
+      return origCreate(name, size, fromSnapshot);
+    };
+
+    const cfg: SentinelConfig = {
+      ...makeTestConfig(0),
+      stateDir: dir,
+      hub: { host: "boat.boat.example.com", label: "Boat", maxSandboxes: 2 },
+      projects: {
+        "my-app": {
+          repo: "https://github.com/OmarAlex24/my-app.git",
+          snapshot: "env-my-app",
+          workdir: "/home/user/my-app",
+          defaultProvider: "claudeAgent",
+          defaultModel: "claude-sonnet-5-5",
+          bakeCmd: "git pull",
+          bootCmd: "git fetch origin",
+        },
+      },
+    };
+    const handle = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+    cleanups.push(() => handle.stop());
+    const base = `http://127.0.0.1:${handle.server.port}`;
+    const hubEnvId = handle.state.ensureHub().environmentId;
+
+    // 1. GET /health on Hub works without auth
+    const healthRes = await fetch(`${base}/health`, { headers: { host: "boat.boat.example.com" } });
+    expect(healthRes.status).toBe(200);
+    expect(await healthRes.json()).toEqual({ ok: true, provider: "boat-legacy", activeSandboxes: 0, maxSandboxes: 2 });
+
+    // 2. Unauthenticated POST /mcp -> 401
+    const unauth = await fetch(`${base}/mcp`, {
+      method: "POST",
+      headers: { host: "boat.boat.example.com", "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+    });
+    expect(unauth.status).toBe(401);
+
+    // 3. Mint machine Bearer token via Control Plane POST /api/token (stored hashed only)
+    const tokRes = await fetch(`${base}/api/token`, {
+      method: "POST",
+      headers: { host: cfg.controlHost, authorization: `Bearer ${cfg.controlSecret}`, "content-type": "application/json" },
+      body: JSON.stringify({ slot: "hub", label: "zumith-worker" }),
+    });
+    expect(tokRes.status).toBe(200);
+    const tokBody = (await tokRes.json()) as { ok: boolean; token: string; clientId: string; mcpUrl: string };
+    expect(tokBody.ok).toBe(true);
+    expect(tokBody.mcpUrl).toBe("https://boat.boat.example.com/mcp");
+    expect(handle.state.getHub()!.clients.some((c) => c.id === tokBody.clientId && c.tokenHash === hashToken(tokBody.token))).toBe(true);
+
+    let sessionId: string | null = null;
+    const mcpRpc = async (method: string, params: Record<string, unknown> = {}, id: number | null = 1) => {
+      const res = await fetch(`${base}/mcp`, {
+        method: "POST",
+        headers: {
+          host: "boat.boat.example.com",
+          authorization: `Bearer ${tokBody.token}`,
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          "mcp-protocol-version": "2025-06-18",
+          ...(sessionId ? { "mcp-session-id": sessionId } : {}),
+        },
+        body: JSON.stringify(id === null ? { jsonrpc: "2.0", method, params } : { jsonrpc: "2.0", id, method, params }),
+      });
+      const sid = res.headers.get("mcp-session-id");
+      if (sid) sessionId = sid;
+      return { res, body: res.status === 202 ? null : ((await res.json()) as Record<string, unknown>) };
+    };
+    const callTool = async (name: string, args: Record<string, unknown> = {}) => {
+      const { res, body } = await mcpRpc("tools/call", { name, arguments: args });
+      expect(res.status).toBe(200);
+      return body!.result as { isError?: boolean; structuredContent: Record<string, unknown>; content: Array<{ type: string; text: string }> };
+    };
+
+    // 4. Streamable HTTP handshake
+    const init = await mcpRpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "zumith", version: "1.0" } });
+    expect(init.res.status).toBe(200);
+    expect(sessionId).toBeTruthy();
+    expect((init.body!.result as { protocolVersion: string }).protocolVersion).toBe("2025-06-18");
+
+    const notif = await mcpRpc("notifications/initialized", {}, null);
+    expect(notif.res.status).toBe(202);
+
+    const toolsList = await mcpRpc("tools/list");
+    const toolNames = ((toolsList.body!.result as { tools: Array<{ name: string }> }).tools).map((t) => t.name);
+    expect(toolNames).toContain("t3_project_list");
+    expect(toolNames).toContain("t3_thread_launch");
+    expect(toolNames).toContain("t3_thread_organize");
+    expect(toolNames).toContain("sentinel_add_project");
+
+    // 5. 0-VM idle reads ($0/hr): t3_project_list + t3_thread_list + t3_worktree_list
+    const projRes = await callTool("t3_project_list");
+    const projects = projRes.structuredContent.projects as Array<{
+      id: string;
+      title: string;
+      repositoryIdentity: { provider: string; owner: string; name: string; canonicalKey: string };
+    }>;
+    expect(projects).toHaveLength(1);
+    expect(projects[0].repositoryIdentity).toEqual({
+      provider: "github",
+      owner: "OmarAlex24",
+      name: "my-app",
+      canonicalKey: "github.com/omaralex24/my-app",
+    });
+    const hubProjectId = projects[0].id;
+
+    const emptyThreads = await callTool("t3_thread_list", { allProjects: true });
+    expect(emptyThreads.structuredContent.threads).toEqual([]);
+    const emptyWorktrees = await callTool("t3_worktree_list");
+    expect(emptyWorktrees.structuredContent.refs).toEqual([]);
+
+    // 6. Structured error on unknown projectId
+    const badProj = await callTool("t3_thread_launch", { projectId: "does-not-exist", title: "Nope" });
+    expect(badProj.isError).toBe(true);
+    expect(badProj.structuredContent.code).toBe("project_not_found");
+
+    // 7. Async < 2s t3_thread_launch while VM boot is paused + clientRequestId deduplication!
+    const t0 = Date.now();
+    const launch1 = await callTool("t3_thread_launch", {
+      projectId: hubProjectId,
+      title: "Autonomous PR",
+      message: "Implement feature X",
+      workspaceStrategy: { type: "worktree", baseRef: "origin/main" },
+      runtimeMode: "full-access",
+      clientRequestId: "zumith-req-1",
+    });
+    expect(Date.now() - t0).toBeLessThan(2_000);
+    expect(launch1.isError).toBeUndefined();
+    const launchedTid = String(launch1.structuredContent.threadId);
+    expect(launch1.structuredContent.status).toBe("preparing");
+    expect(launch1.structuredContent.link).toBe(`t3-thread://v2/${hubEnvId}/${launchedTid}`);
+
+    // Idempotent retry returns SAME threadId, never creates 2nd VM
+    const launchDup = await callTool("t3_thread_launch", {
+      projectId: hubProjectId,
+      title: "Autonomous PR",
+      message: "Implement feature X",
+      clientRequestId: "zumith-req-1",
+    });
+    expect(launchDup.structuredContent.threadId).toBe(launchedTid);
+
+    // 8. Mid-boot reads return 200 with status: "preparing" & sandbox progress; sends queue cleanly!
+    const midRead = await callTool("t3_thread_read", { threadId: launchedTid, limit: 1, maxCharsPerItem: 1, runLimit: 1 });
+    expect(midRead.isError).toBeUndefined();
+    const midThread = midRead.structuredContent.thread as { status: string; link: string; sandbox: { phase: string } };
+    expect(midThread.status).toBe("preparing");
+    expect(midThread.link).toBe(`t3-thread://v2/${hubEnvId}/${launchedTid}`);
+    expect(midThread.sandbox.phase).toBe("booting");
+
+    const midList = await callTool("t3_thread_list", { allProjects: true });
+    expect((midList.structuredContent.threads as Array<{ threadId: string }>)[0].threadId).toBe(launchedTid);
+
+    const queuedSend = await callTool("t3_thread_send", {
+      threadId: launchedTid,
+      message: "Also add unit tests",
+      mode: "auto",
+      clientRequestId: "send-1",
+    });
+    expect(queuedSend.structuredContent.accepted).toBe(true);
+    expect(queuedSend.structuredContent.queued).toBe(true);
+
+    // 9. Release VM boot gate and wait for background launch + queued message flush!
+    releaseBoot();
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline && dispatchedCommands.length === 0) {
+      await Bun.sleep(25);
+    }
+    expect(boat.created).toHaveLength(1);
+    expect(launchedPayloads).toHaveLength(1);
+    expect(launchedPayloads[0].runtimeMode).toBe("full-access");
+    expect(launchedPayloads[0].workspaceStrategy).toEqual({ type: "worktree", baseRef: "origin/main" });
+    expect(dispatchedCommands.some((c) => c.type === "message.dispatch" && c.text === "Also add unit tests")).toBe(true);
+
+    // 10. Live reads: t3_thread_read (messages + incremental afterPosition), PRs, pending requests, respond!
+    const liveRead = await callTool("t3_thread_read", { threadId: launchedTid, view: "messages", limit: 10, maxCharsPerItem: 100 });
+    const liveThread = liveRead.structuredContent.thread as {
+      projectId: string;
+      status: string;
+      pendingRequestCount: number;
+      link: string;
+      sandbox: { phase: string; sandboxId: string };
+    };
+    expect(liveThread.projectId).toBe(hubProjectId);
+    expect(liveThread.status).toBe("waiting"); // because pending user_input request exists!
+    expect(liveThread.pendingRequestCount).toBe(1);
+    expect(liveThread.sandbox.phase).toBe("running");
+    expect((liveRead.structuredContent.items as Array<{ text: string }>).map((i) => i.text)).toEqual([
+      "Implement feature X",
+      "Working on it!",
+      "Also add unit tests",
+    ]);
+
+    const prs = await callTool("list_thread_pull_requests", { threadId: launchedTid });
+    expect((prs.structuredContent.pullRequests as Array<{ number: number }>)[0].number).toBe(42);
+
+    const pendList = await callTool("t3_pending_request", { action: "list", threadId: launchedTid });
+    expect(pendList.structuredContent.requestIds).toEqual(["req-q1"]);
+
+    const pendRead = await callTool("t3_pending_request", { action: "read", threadId: launchedTid, requestId: "req-q1" });
+    expect((pendRead.structuredContent.questions as Array<{ id: string }>)[0].id).toBe("q1");
+
+    const pendResp = await callTool("t3_pending_request", {
+      action: "respond",
+      threadId: launchedTid,
+      requestId: "req-q1",
+      answers: { q1: "Yes" },
+    });
+    expect(pendResp.structuredContent.ok).toBe(true);
+    expect(dispatchedCommands.some((c) => c.type === "runtime-request.respond" && c.requestId === "req-q1")).toBe(true);
+
+    // 11. Settle via t3_thread_organize -> dispatches thread.settle AND destroys Boat VM ($0/hr)!
+    const settled = await callTool("t3_thread_organize", { threadId: launchedTid, action: "settle" });
+    expect(settled.structuredContent.ok).toBe(true);
+    expect(settled.structuredContent.sandboxDestroyed).toBe(true);
+    expect(boat.deleted).toContain(liveThread.sandbox.sandboxId);
+
+    // 12. Sending to destroyed thread returns structured `sandbox_destroyed` error
+    const afterDestroy = await callTool("t3_thread_send", { threadId: launchedTid, message: "Hello?" });
+    expect(afterDestroy.isError).toBe(true);
+    expect(afterDestroy.structuredContent.code).toBe("sandbox_destroyed");
+
+    // 13. Dynamic repo onboarding via sentinel_add_project
+    const added = await callTool("sentinel_add_project", { repo: "OmarAlex24/new-svc", bake: false });
+    expect(added.structuredContent.ok).toBe(true);
+    expect(added.structuredContent.fallbackReady).toBe(true);
+    expect((added.structuredContent.repositoryIdentity as { owner: string; name: string }).name).toBe("new-svc");
+  });
 });

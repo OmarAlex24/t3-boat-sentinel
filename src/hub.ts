@@ -24,6 +24,7 @@ import {
   type AuthRateLimiter,
 } from "./security.ts";
 import type { ProjectConfig, SentinelConfig } from "./config.ts";
+import { HubMcpHandler, type HubSandboxPhase } from "./hub-mcp.ts";
 import type { KlavClient } from "./klav.ts";
 import type { LifecycleManager, WatchdogEventPayload } from "./lifecycle.ts";
 import { buildAutoProjectConfig, type HubSandboxRecord, type StateStore } from "./state.ts";
@@ -529,6 +530,7 @@ export class HubServer {
   private readonly activeProjectClones = new Map<string, ProjectCloneSnapshotState>();
 
   private readonly boat: SandboxProvider;
+  private readonly mcp: HubMcpHandler;
 
   constructor(
     private readonly config: SentinelConfig,
@@ -539,6 +541,60 @@ export class HubServer {
     private readonly rateLimiter?: AuthRateLimiter,
   ) {
     this.boat = asSandboxProvider(provider);
+    this.mcp = new HubMcpHandler(
+      config,
+      state,
+      {
+        callVmUnary: async (sandboxId, tag, payload, timeoutMs) => {
+          const sb = this.state.getHubSandbox(sandboxId);
+          if (!sb || sb.phase !== "running") {
+            return { _tag: "Failure", cause: { _tag: "Fail", error: { message: `Sandbox ${sandboxId} is not running` } } };
+          }
+          const bridge = await this.ensureBridgeOpen(sb);
+          return bridge.callUnary(tag, payload, timeoutMs);
+        },
+        getThreadShell: (threadId) => this.threadShells.get(threadId),
+        listThreadShells: () =>
+          Array.from(this.threadShells.entries()).map(([threadId, shell]) => ({
+            threadId,
+            shell,
+            sandboxId: this.threadToSandbox.get(threadId) ?? null,
+          })),
+        getSandboxForThread: (threadId) => {
+          const sbId = this.threadToSandbox.get(threadId);
+          return sbId ? this.state.getHubSandbox(sbId) : undefined;
+        },
+        wakeSandbox: (sandboxId) => this.wakeHubSandbox(sandboxId),
+        destroySandbox: (sandboxId, reason) => this.destroyHubSandbox(sandboxId, reason),
+        sleepSandbox: (sandboxId) => this.sleepHubSandbox(sandboxId),
+        projectKeyFromHubId: (hubProjectId) => this.projectKeyFromHubId(hubProjectId),
+        ensureHubProjectId: (projectKey) => {
+          const hub = this.state.ensureHub(
+            this.config.hub?.label ?? "Boat",
+            Object.keys(this.state.getAllProjects(this.config)),
+          );
+          if (hub.projectIds[projectKey]) return hub.projectIds[projectKey];
+          const id = randomUUID();
+          this.state.updateHub((h) => {
+            h.projectIds[projectKey] = id;
+          });
+          return id;
+        },
+        spawnSandboxForThread: (projectKey, threadId, onProgress) =>
+          this.spawnSandboxForThread(projectKey, threadId, onProgress),
+        bindThreadToSandbox: (threadId, sandboxId) => this.bindThreadToSandbox(threadId, sandboxId),
+        bindWorktreeToSandbox: (worktreePath, sandboxId) => this.bindWorktreeToSandbox(worktreePath, sandboxId),
+        notifyProjectAdded: (projectKey) => this.notifyProjectAdded(projectKey),
+        startProjectBake: (projectKey) => {
+          void this.lifecycle.bake(projectKey).catch((err) => {
+            console.error(`[hub-mcp] background bake failed for "${projectKey}":`, err);
+          });
+        },
+        providerName: () => this.boat.name,
+        anyRunningSandbox: () => this.anyRunningSandbox(),
+      },
+      rateLimiter,
+    );
     if (config.hub) {
       this.state.ensureHub(config.hub.label, Object.keys(this.state.getAllProjects(config)));
       this.restoreLiveSandboxes();
@@ -567,6 +623,26 @@ export class HubServer {
     const { code, expiresAt } = this.auth.newPairingCode();
     const url = `https://${this.config.hub.host}/pair#token=${encodeURIComponent(code)}`;
     return { url, code, expiresAt };
+  }
+
+  /** Mint a long-lived machine Bearer token for headless MCP clients (e.g. Zumith). Stored hashed only. */
+  mintClientToken(label = "machine"): { clientId: string; token: string; label: string; pairedAt: string } {
+    if (!this.config.hub) throw new Error("Hub is not configured in sentinel.yaml");
+    const token = randomToken(32);
+    const clientId = randomUUID();
+    const pairedAt = new Date().toISOString();
+    const cleanLabel = label.trim() || "machine";
+    this.state.updateHub((h) => {
+      h.clients.push({
+        id: clientId,
+        tokenHash: hashToken(token),
+        label: cleanLabel,
+        pairedAt,
+        lastSyncedSandboxId: null,
+      });
+    });
+    console.log(`[hub] minted machine Bearer token for "${cleanLabel}" (clientId=${clientId})`);
+    return { clientId, token, label: cleanLabel, pairedAt };
   }
 
   getAuth(): SlotAuth {
@@ -779,6 +855,20 @@ export class HubServer {
     const path = url.pathname;
     if (req.method === "GET" && path === "/robots.txt") {
       return applySecurityHeaders(new Response(ROBOTS_TXT, { headers: { "content-type": "text/plain; charset=utf-8" } }));
+    }
+    if (req.method === "GET" && path === "/health") {
+      const activeSandboxes = this.state.listHubSandboxes().filter((s) => s.phase !== "destroying").length;
+      return withCors(
+        Response.json({
+          ok: true,
+          provider: this.boat.name,
+          activeSandboxes,
+          maxSandboxes: this.config.hub?.maxSandboxes ?? 10,
+        }),
+      );
+    }
+    if (path === "/mcp" || path === "/mcp/") {
+      return this.mcp.handleHttp(req);
     }
     const ip = clientIpFromRequest(req);
     const hub = this.state.ensureHub(this.config.hub?.label ?? "Boat", Object.keys(this.state.getAllProjects(this.config)));
@@ -1510,7 +1600,11 @@ export class HubServer {
   }
 
   /** Spawn a brand-new Boat VM dedicated to a single chat thread. */
-  async spawnSandboxForThread(projectKey: string, threadId: string): Promise<HubSandboxRecord> {
+  async spawnSandboxForThread(
+    projectKey: string,
+    threadId: string,
+    onProgress?: (update: { sandboxId?: string | null; phase?: HubSandboxPhase; step: string }) => void,
+  ): Promise<HubSandboxRecord> {
     const existingPromise = this.inFlightSpawns.get(threadId);
     if (existingPromise) return existingPromise;
 
@@ -1520,14 +1614,18 @@ export class HubServer {
       if (sb && sb.phase === "running") return sb;
     }
 
-    const promise = this.doSpawnSandboxForThread(projectKey, threadId).finally(() => {
+    const promise = this.doSpawnSandboxForThread(projectKey, threadId, onProgress).finally(() => {
       this.inFlightSpawns.delete(threadId);
     });
     this.inFlightSpawns.set(threadId, promise);
     return promise;
   }
 
-  private async doSpawnSandboxForThread(projectKey: string, threadId: string): Promise<HubSandboxRecord> {
+  private async doSpawnSandboxForThread(
+    projectKey: string,
+    threadId: string,
+    onProgress?: (update: { sandboxId?: string | null; phase?: HubSandboxPhase; step: string }) => void,
+  ): Promise<HubSandboxRecord> {
     const allProjects = this.state.getAllProjects(this.config);
     const project = allProjects[projectKey];
     if (!project) throw new Error(`Unknown project "${projectKey}"`);
@@ -1666,7 +1764,11 @@ export class HubServer {
     };
 
     try {
+      const notifyProgress = (phase: HubSandboxPhase, step: string) => {
+        onProgress?.({ sandboxId, phase, step });
+      };
       emitStage("fetch", `Creating ${this.boat.name} VM (${size}) from ${snapshotToUse ?? "base image"}...`, 15);
+      notifyProgress("booting", `Creating ${this.boat.name} VM (${size}) from ${snapshotToUse ?? "base image"}...`);
       console.log(
         `[hub] spawning fresh VM ${sandboxName} via ${this.boat.name} for project="${projectKey}" thread=${threadId} (snapshot=${snapshotToUse ?? "base-image"})`,
       );
@@ -1675,10 +1777,12 @@ export class HubServer {
 
       if (effectiveProject.klav && this.klav) {
         emitStage("checkout", `VM ${sandboxId} created — attaching zero-trust Klav proxy...`, 40);
+        notifyProgress("booting", `VM ${sandboxId} created — attaching zero-trust Klav proxy...`);
         const prov = await this.klav.provisionForSandbox(this.boat, sandboxId, effectiveProject.klav);
         klavAgentName = prov.agentName;
       } else {
         emitStage("checkout", `VM ${sandboxId} created — preparing workspace...`, 40);
+        notifyProgress("booting", `VM ${sandboxId} created — preparing workspace...`);
       }
 
       emitStage(
@@ -1687,6 +1791,12 @@ export class HubServer {
           ? `Cloning ${projectKey} & starting T3 Code inside ${sandboxId}...`
           : `Starting T3 Code server & watchdog inside ${sandboxId}...`,
         68,
+      );
+      notifyProgress(
+        fallbackCloning ? "cloning" : "starting_t3",
+        fallbackCloning
+          ? `Cloning ${projectKey} & starting T3 Code inside ${sandboxId}...`
+          : `Starting T3 Code server & watchdog inside ${sandboxId}...`,
       );
       const provisioned = await this.lifecycle.provisionStandaloneVm({
         sandboxId,
@@ -1887,6 +1997,7 @@ export class HubServer {
     const klavAgent = sb.klavAgentName;
 
     this.state.removeHubSandbox(sandboxId);
+    this.mcp.recordThreadsDestroyed(threadIds, reason);
     for (const tid of threadIds) {
       this.threadToSandbox.delete(tid);
       this.threadShells.delete(tid);
