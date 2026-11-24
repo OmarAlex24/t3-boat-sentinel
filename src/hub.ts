@@ -996,8 +996,27 @@ export class HubServer {
       }
       return;
     }
-    if (tag === "server.reportClientActivity") {
+    if (tag === "server.reportClientActivity" || tag === "preview.reportProfiles" || tag === "preview.reportStatus") {
       sendRpcExitSuccess(ws, reqId, undefined);
+      return;
+    }
+    if (tag === "server.refreshProviders") {
+      const cfg = this.buildHubServerConfig();
+      sendRpcExitSuccess(ws, reqId, { providers: cfg.providers ?? [] });
+      return;
+    }
+    if (tag === "server.updateSettings") {
+      const cfg = this.buildHubServerConfig();
+      const merged = {
+        ...((cfg.settings as Record<string, unknown> | undefined) ?? {}),
+        ...((payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {})),
+      };
+      this.state.updateHub((h) => {
+        if (h.serverConfig && typeof h.serverConfig === "object") {
+          h.serverConfig = { ...h.serverConfig, settings: merged };
+        }
+      });
+      sendRpcExitSuccess(ws, reqId, merged);
       return;
     }
     if (tag === "server.probe") {
