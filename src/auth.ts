@@ -77,22 +77,32 @@ export interface ClientCredentialRecord {
  * so destroying and recreating the Boat VM behind a slot never invalidates T3 Mobile pairing.
  */
 export class SlotAuth {
-  private pairing: PairingEntry | null = null;
+  private pairings = new Map<string, number>();
   private tickets = new Map<string, TicketEntry>();
 
   newPairingCode(): { code: string; expiresAt: string } {
+    const now = Date.now();
+    for (const [k, exp] of this.pairings) {
+      if (exp <= now) this.pairings.delete(k);
+    }
     const code = randomToken(32);
-    const expiresAt = Date.now() + PAIRING_TTL_MS;
-    this.pairing = { code, expiresAt };
+    const expiresAt = now + PAIRING_TTL_MS;
+    this.pairings.set(code, expiresAt);
     return { code, expiresAt: new Date(expiresAt).toISOString() };
   }
 
   redeemPairingCode(code: string): boolean {
-    if (!this.pairing) return false;
-    const valid = Date.now() < this.pairing.expiresAt && safeEqual(this.pairing.code, code);
-    if (valid) {
-      this.pairing = null;
-      return true;
+    if (!code) return false;
+    const now = Date.now();
+    for (const [stored, exp] of this.pairings) {
+      if (exp <= now) {
+        this.pairings.delete(stored);
+        continue;
+      }
+      if (safeEqual(stored, code)) {
+        this.pairings.delete(stored);
+        return true;
+      }
     }
     return false;
   }
