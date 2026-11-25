@@ -3776,6 +3776,41 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     expect(boat.deleted).not.toContain(sb.sandboxId);
   });
 
+  test("reaperTick never kills a Hub VM that exists while create() has not returned its ID yet", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-reaper-create-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+
+    const vm = startFakeVmT3Server("vm-reaper-create");
+    cleanups.push(() => vm.server.stop(true));
+
+    const boat = new MockBoat();
+    boat.snapshots.add("env-my-app");
+    boat.upstreamBaseUrl = vm.url;
+
+    const cfg: SentinelConfig = {
+      ...makeTestConfig(0),
+      stateDir: dir,
+      hub: { host: "boat.boat.example.com", label: "Boat", maxSandboxes: 5 },
+    };
+    const handle = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+    cleanups.push(() => handle.stop());
+
+    // `boat new` lists the VM under its prefixed name while it is still starting; the reaper ticks then
+    const origCreate = boat.create.bind(boat);
+    let createdId = "";
+    boat.create = async (name: string, size: string, fromSnapshot?: string) => {
+      createdId = await origCreate(name, size, fromSnapshot);
+      await handle.lifecycle.reaperTick();
+      return createdId;
+    };
+
+    const sb = await handle.hub!.spawnSandboxForThread("my-app", "thread-reaper-create");
+    expect(createdId).not.toBe("");
+    expect(boat.deleted).not.toContain(createdId);
+    expect(sb.sandboxId).toBe(createdId);
+    expect(sb.phase).toBe("running");
+  });
+
   test("server.updateServerWithProgress rebakes base-t3 + project snapshots and streams progress to T3 Desktop", async () => {
     const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-selfupd-"));
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));

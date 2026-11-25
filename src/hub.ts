@@ -2890,7 +2890,14 @@ export class HubServer {
         `[hub] spawning fresh VM ${sandboxName} via ${this.boat.name} for project="${projectKey}" thread=${threadId} (snapshot=${snapshotToUse ?? "base-image"})`,
       );
       lap("prepare");
-      sandboxId = await this.boat.create({ name: sandboxName, size, fromSnapshot: snapshotToUse });
+      // The reaper deletes prefixed VMs it doesn't know; hold it off until create() returns the ID
+      const pendingCreate = `pending-create:${sandboxName}`;
+      this.lifecycle.trackInFlightSandbox(pendingCreate);
+      try {
+        sandboxId = await this.boat.create({ name: sandboxName, size, fromSnapshot: snapshotToUse });
+      } finally {
+        this.lifecycle.untrackInFlightSandbox(pendingCreate);
+      }
       this.lifecycle.trackInFlightSandbox(sandboxId);
       lap("create");
 
