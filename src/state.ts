@@ -73,6 +73,22 @@ export interface HubSandboxRecord {
   lastActiveAt: string;
   lastHeartbeatAt: string | null;
   sleepingSince: string | null;
+  /** Last failed wake of this sleeping VM; cleared by the next successful wake. Holds no secrets. */
+  wakeFailure?: HubWakeFailure | null;
+}
+
+export interface HubWakeFailure {
+  /** Wake step that failed (`resume`, `klav-forward-cleanup`, `klav-provision`, `provision-vm`, `bridge`...). */
+  step: string;
+  /** Redacted reason: never a token, the Klav package, `klav-forward env` output or a URL with secrets. */
+  reason: string;
+  at: string;
+  /** Consecutive failed wakes; sets the backoff. */
+  attempts: number;
+  /** No new wake (no resume, no Klav sandbox) starts before this time. */
+  retryAfter: string;
+  /** False when the VM was resumed and could not be paused again; the Hub retries the pause. */
+  vmPaused: boolean;
 }
 
 export interface HubProjectTemplate {

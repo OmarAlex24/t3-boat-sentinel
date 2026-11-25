@@ -771,9 +771,15 @@ export class LifecycleManager {
         }
         this.state.removeHubSandbox(hubSb.sandboxId);
       } else if (remote && remote.state === "stopped" && hubSb.phase === "running") {
+        // Stopped outside the Hub (watchdog backstop): end its Klav proxy sandbox too; the wake mints a new one
+        const endKlav = this.config.klav?.mode === "proxy" && !!this.klav && !!hubSb.klavAgentName;
+        if (endKlav) {
+          await this.klav!.revokeForSandbox(hubSb.klavAgentName!).catch(() => {});
+        }
         this.state.updateHubSandbox(hubSb.sandboxId, (s) => {
           s.phase = "sleeping";
           s.llmToken = null;
+          if (endKlav) s.klavAgentName = null;
           s.sleepingSince = remote.stoppedAt ?? new Date().toISOString();
         });
       }

@@ -23,7 +23,7 @@ import {
   rateLimitedResponse,
   type AuthRateLimiter,
 } from "./security.ts";
-import type { ProjectConfig, SentinelConfig } from "./config.ts";
+import type { ProjectConfig, ProjectKlavConfig, SentinelConfig } from "./config.ts";
 import { HubMcpHandler, type HubSandboxPhase } from "./hub-mcp.ts";
 import {
   applySettingsOverlay,
@@ -40,9 +40,16 @@ import {
   VM_SETTINGS_PATH,
   type SettingsUpdateInput,
 } from "./hub-settings.ts";
-import type { KlavClient } from "./klav.ts";
+import { releaseVmForwarder, type KlavClient } from "./klav.ts";
+import {
+  HubWakeCooldownError,
+  redactForLog,
+  wakeBackoffMs,
+  type HubWakeEvent,
+  type HubWakeListener,
+} from "./hub-wake.ts";
 import type { LifecycleManager, WatchdogEventPayload } from "./lifecycle.ts";
-import { buildAutoProjectConfig, type HubSandboxRecord, type StateStore } from "./state.ts";
+import { buildAutoProjectConfig, type HubSandboxRecord, type HubWakeFailure, type StateStore } from "./state.ts";
 
 type SelfUpdateStage = "downloading" | "installing";
 type SelfUpdateResult = { targetVersion: string; method: "boot-service" };
@@ -658,6 +665,11 @@ class HubVmBridge {
  * 1 fresh, isolated Boat VM per chat thread (unlimited parallel sandboxes behind 1 Environment!).
  * Auto-destroys each VM when its thread is settled or archived.
  */
+/** A wake that failed; its message is already redacted and safe to send to a client. */
+class HubWakeFailedError extends Error {
+  override name = "HubWakeFailedError";
+}
+
 export class HubServer {
   private readonly auth = new SlotAuth();
   private readonly bridges = new Map<string, HubVmBridge>();
@@ -667,6 +679,16 @@ export class HubServer {
   private readonly threadShells = new Map<string, Record<string, unknown>>();
   private readonly inFlightSpawns = new Map<string, Promise<HubSandboxRecord>>();
   private readonly inFlightWakes = new Map<string, Promise<HubSandboxRecord>>();
+  private readonly inFlightSleeps = new Map<string, Promise<void>>();
+  private readonly wakeListeners = new Set<HubWakeListener>();
+  /** Pause retries for VMs a failed wake left running. */
+  private readonly pauseRetries = new Map<string, ReturnType<typeof setTimeout>>();
+  /** First cooldown after a failed wake; doubles per consecutive failure up to `wakeBackoffMaxMs`. */
+  wakeBackoffBaseMs = 30_000;
+  wakeBackoffMaxMs = 15 * 60_000;
+  pauseRetryMs = 60_000;
+  /** How long a leftover `klav-forward` gets after TERM before KILL. */
+  forwarderTermTimeoutSecs = 10;
   private readonly urlTokenToSandbox = new Map<string, string>();
   private readonly stagedAttachments = new Map<string, StagedAttachment>();
   private readonly stagedUploadTokens = new Map<string, string>(); // uploadToken -> attachmentId
@@ -771,6 +793,8 @@ export class HubServer {
   }
 
   stop(): void {
+    for (const timer of this.pauseRetries.values()) clearTimeout(timer);
+    this.pauseRetries.clear();
     for (const bridge of this.bridges.values()) {
       bridge.stop();
     }
@@ -2167,35 +2191,104 @@ export class HubServer {
     return sb;
   }
 
+  /** Listens to wake transitions (start, success, failure) of sleeping chat VMs; returns an unsubscribe. */
+  onWakeTransition(listener: HubWakeListener): () => void {
+    this.wakeListeners.add(listener);
+    return () => this.wakeListeners.delete(listener);
+  }
+
+  private emitWake(event: HubWakeEvent): void {
+    for (const listener of this.wakeListeners) {
+      try {
+        listener(event);
+      } catch (err) {
+        console.warn(`[hub] wake listener failed: ${redactForLog(err)}`);
+      }
+    }
+  }
+
+  /** Klav settings of a project whose VMs get a fresh proxy sandbox on every wake; `null` otherwise. */
+  private klavProxyProject(projectName: string): ProjectKlavConfig | null {
+    if (this.config.klav?.mode !== "proxy" || !this.klav) return null;
+    return this.state.getAllProjects(this.config)[projectName]?.klav ?? null;
+  }
+
   async wakeHubSandbox(sandboxId: string): Promise<HubSandboxRecord> {
     const existing = this.inFlightWakes.get(sandboxId);
     if (existing) return existing;
 
-    const promise = (async () => {
-      const sb = this.state.getHubSandbox(sandboxId);
-      if (!sb) throw new Error(`Unknown hub sandbox "${sandboxId}"`);
-      if (sb.phase === "running") return sb;
+    const sb = this.state.getHubSandbox(sandboxId);
+    if (!sb) throw new Error(`Unknown hub sandbox "${sandboxId}"`);
+    if (sb.phase === "running") return sb;
+    // During the cooldown after a failed wake: no resume, no Klav sandbox, no log line
+    const failure = sb.wakeFailure;
+    if (failure && Date.parse(failure.retryAfter) > Date.now()) {
+      throw new HubWakeCooldownError(sandboxId, failure.step, failure.reason, failure.retryAfter);
+    }
 
-      if (!hasCapability(this.boat, "pause") || !this.boat.resume) {
-        throw new Error(`Provider "${this.boat.name}" does not support pause/resume`);
-      }
-      console.log(`[hub] waking sleeping sandbox ${sandboxId} (${sb.project})`);
+    const promise = this.doWakeHubSandbox(sandboxId).finally(() => {
+      this.inFlightWakes.delete(sandboxId);
+    });
+    this.inFlightWakes.set(sandboxId, promise);
+    return promise;
+  }
+
+  private async doWakeHubSandbox(sandboxId: string): Promise<HubSandboxRecord> {
+    // A sleep still releasing Klav or pausing must finish before the resume
+    await this.inFlightSleeps.get(sandboxId)?.catch(() => {});
+    const sb = this.state.getHubSandbox(sandboxId);
+    if (!sb) throw new Error(`Unknown hub sandbox "${sandboxId}"`);
+    if (sb.phase === "running") return sb;
+
+    if (!hasCapability(this.boat, "pause") || !this.boat.resume) {
+      throw new Error(`Provider "${this.boat.name}" does not support pause/resume`);
+    }
+
+    this.clearPauseRetry(sandboxId);
+    this.emitWake({ type: "wake-start", sandboxId, threadIds: [...sb.threadIds] });
+    console.log(`[hub] waking sleeping sandbox ${sandboxId} (${sb.project})`);
+    let step = "resume";
+    let resumed = false;
+    let newKlavSandbox: string | null = null;
+    try {
       const res = await this.boat.resume(sandboxId, sb.size);
       if (res === "data_expired") {
+        const threadIds = [...sb.threadIds];
         await this.destroyHubSandbox(sandboxId, "data-expired");
-        throw new Error("Sandbox disk expired after 14 days stopped");
+        const reason = "Sandbox disk expired after 14 days stopped";
+        console.warn(`[hub] wake of sandbox ${sandboxId} failed at step resume: ${reason}; sandbox destroyed`);
+        this.emitWake({ type: "wake-failure", sandboxId, threadIds, step, reason, retryAfter: null, attempts: 1 });
+        throw new HubWakeFailedError(reason);
       }
+      resumed = true;
 
       const project = this.state.getAllProjects(this.config)[sb.project];
+      const klavProject = this.klavProxyProject(sb.project);
       let nextKlavAgent = sb.klavAgentName;
-      if (this.config.klav?.mode === "proxy" && project?.klav && this.klav) {
-        if (sb.klavAgentName) await this.klav.revokeForSandbox(sb.klavAgentName).catch(() => {});
-        const prov = await this.klav.provisionForSandbox(this.boat, sandboxId, project.klav);
+      if (klavProject && this.klav) {
+        // Left by a pause the Hub did not make (watchdog backstop, reaper) or by an older Hub
+        if (sb.klavAgentName) {
+          step = "klav-revoke-previous";
+          const previous = sb.klavAgentName;
+          await this.klav.revokeForSandbox(previous).catch((err) => {
+            console.warn(`[hub] Klav revoke of previous sandbox failed for ${sandboxId}: ${redactForLog(err)}`);
+          });
+          this.state.updateHubSandbox(sandboxId, (s) => {
+            if (s.klavAgentName === previous) s.klavAgentName = null;
+          });
+        }
+        // Before `klav sandbox start`, so a port that stays taken mints nothing
+        step = "klav-forward-cleanup";
+        await releaseVmForwarder(this.boat, sandboxId, { termTimeoutSecs: this.forwarderTermTimeoutSecs });
+        step = "klav-provision";
+        const prov = await this.klav.provisionForSandbox(this.boat, sandboxId, klavProject);
+        newKlavSandbox = prov.agentName;
         nextKlavAgent = prov.agentName;
       }
 
       const llmToken = this.config.llmProxy ? `t3llm_${randomToken(24)}` : null;
       if (llmToken) {
+        step = "provision-vm";
         // Re-inject fresh ephemeral llmToken on wake
         await this.lifecycle.provisionStandaloneVm({
           sandboxId,
@@ -2210,6 +2303,7 @@ export class HubServer {
         });
       }
 
+      step = "expose-port";
       const endpoint = await this.boat.exposePort(sandboxId, 3773, {
         visibility: this.config.boat.hostVisibility,
       });
@@ -2223,30 +2317,168 @@ export class HubServer {
         s.lastActiveAt = now;
         s.lastHeartbeatAt = now;
         s.sleepingSince = null;
+        s.wakeFailure = null;
       })!;
 
+      step = "bridge";
       this.attachBridge(updated);
       await this.bridges.get(sandboxId)!.waitUntilOpen(20_000);
+      step = "settings-replay";
       await this.settingsReplayDone(sandboxId);
-      return updated;
-    })().finally(() => {
-      this.inFlightWakes.delete(sandboxId);
+      this.emitWake({ type: "wake-success", sandboxId, threadIds: [...updated.threadIds] });
+      return this.state.getHubSandbox(sandboxId) ?? updated;
+    } catch (err) {
+      if (err instanceof HubWakeFailedError) throw err;
+      const failure = await this.rollBackFailedWake(sandboxId, { step, resumed, newKlavSandbox, err });
+      throw new HubWakeFailedError(
+        `Waking chat VM ${sandboxId} failed at ${failure.step} (${failure.reason}); next try after ${failure.retryAfter}`,
+      );
+    }
+  }
+
+  /**
+   * Undoes a wake that failed after it started: no bridge, no Klav sandbox, no LLM token, the VM paused
+   * again (or a pause retry scheduled), and a failure record that holds off the next wake.
+   */
+  private async rollBackFailedWake(
+    sandboxId: string,
+    ctx: { step: string; resumed: boolean; newKlavSandbox: string | null; err: unknown },
+  ): Promise<HubWakeFailure> {
+    const reason = redactForLog(ctx.err);
+    this.bridges.get(sandboxId)?.stop();
+    this.bridges.delete(sandboxId);
+
+    if (ctx.newKlavSandbox && this.klav) {
+      await releaseVmForwarder(this.boat, sandboxId, { termTimeoutSecs: this.forwarderTermTimeoutSecs }).catch(() => {});
+      await this.klav.revokeForSandbox(ctx.newKlavSandbox).catch((err) => {
+        console.warn(`[hub] Klav revoke after failed wake failed for ${sandboxId}: ${redactForLog(err)}`);
+      });
+    }
+
+    let vmPaused = !ctx.resumed;
+    if (ctx.resumed && this.boat.pause) {
+      try {
+        await this.boat.pause(sandboxId);
+        vmPaused = true;
+      } catch {
+        vmPaused = false;
+      }
+    }
+
+    const nowMs = Date.now();
+    const before = this.state.getHubSandbox(sandboxId);
+    const attempts = (before?.wakeFailure?.attempts ?? 0) + 1;
+    const failure: HubWakeFailure = {
+      step: ctx.step,
+      reason,
+      at: new Date(nowMs).toISOString(),
+      attempts,
+      retryAfter: new Date(nowMs + wakeBackoffMs(attempts, this.wakeBackoffBaseMs, this.wakeBackoffMaxMs)).toISOString(),
+      vmPaused,
+    };
+    const klavProxy = before ? this.klavProxyProject(before.project) !== null : false;
+    const updated = this.state.updateHubSandbox(sandboxId, (s) => {
+      s.phase = "sleeping";
+      s.llmToken = null;
+      if (klavProxy || s.klavAgentName === ctx.newKlavSandbox) s.klavAgentName = null;
+      s.sleepingSince = s.sleepingSince ?? failure.at;
+      s.wakeFailure = failure;
     });
 
-    this.inFlightWakes.set(sandboxId, promise);
-    return promise;
+    console.warn(
+      `[hub] wake of sandbox ${sandboxId} failed at step ${failure.step} (attempt ${attempts}, VM ${vmPaused ? "paused" : "still running, pause retry scheduled"}, next try after ${failure.retryAfter}): ${reason}`,
+    );
+    if (!vmPaused) this.schedulePauseRetry(sandboxId);
+    this.emitWake({
+      type: "wake-failure",
+      sandboxId,
+      threadIds: [...(updated?.threadIds ?? [])],
+      step: failure.step,
+      reason,
+      retryAfter: failure.retryAfter,
+      attempts,
+    });
+    return failure;
+  }
+
+  /** Pauses a VM a failed wake left running; retries on its own until it is paused or woken. */
+  private schedulePauseRetry(sandboxId: string, delayMs = this.pauseRetryMs): void {
+    this.clearPauseRetry(sandboxId);
+    const timer = setTimeout(() => {
+      this.pauseRetries.delete(sandboxId);
+      void this.retryPauseAfterFailedWake(sandboxId);
+    }, delayMs);
+    (timer as { unref?: () => void }).unref?.();
+    this.pauseRetries.set(sandboxId, timer);
+  }
+
+  private clearPauseRetry(sandboxId: string): void {
+    const timer = this.pauseRetries.get(sandboxId);
+    if (timer) clearTimeout(timer);
+    this.pauseRetries.delete(sandboxId);
+  }
+
+  private async retryPauseAfterFailedWake(sandboxId: string): Promise<void> {
+    const sb = this.state.getHubSandbox(sandboxId);
+    if (!sb || sb.phase !== "sleeping" || sb.wakeFailure?.vmPaused !== false || !this.boat.pause) return;
+    if (this.inFlightWakes.has(sandboxId)) return;
+    try {
+      await this.boat.pause(sandboxId);
+      this.state.updateHubSandbox(sandboxId, (s) => {
+        if (s.wakeFailure) s.wakeFailure.vmPaused = true;
+      });
+      console.log(`[hub] paused sandbox ${sandboxId} left running by a failed wake`);
+    } catch (err) {
+      console.warn(`[hub] pause retry failed for ${sandboxId}: ${redactForLog(err)}`);
+      this.schedulePauseRetry(sandboxId);
+    }
   }
 
   async sleepHubSandbox(sandboxId: string): Promise<void> {
     const sb = this.state.getHubSandbox(sandboxId);
-    if (!sb || sb.phase !== "running") return;
+    if (!sb) return;
+    if (sb.phase === "sleeping" && sb.wakeFailure?.vmPaused === false) {
+      return this.retryPauseAfterFailedWake(sandboxId);
+    }
+    if (sb.phase !== "running") return;
     if (!hasCapability(this.boat, "pause") || !this.boat.pause) {
       console.warn(`[hub] provider "${this.boat.name}" does not support pause; skipping idle sleep for ${sandboxId}`);
       return;
     }
+    if (this.inFlightWakes.has(sandboxId)) return;
+    const existing = this.inFlightSleeps.get(sandboxId);
+    if (existing) return existing;
+    const promise = this.doSleepHubSandbox(sandboxId).finally(() => {
+      this.inFlightSleeps.delete(sandboxId);
+    });
+    this.inFlightSleeps.set(sandboxId, promise);
+    return promise;
+  }
+
+  private async doSleepHubSandbox(sandboxId: string): Promise<void> {
+    const sb = this.state.getHubSandbox(sandboxId);
+    if (!sb || sb.phase !== "running" || !this.boat.pause) return;
     console.log(`[hub] pausing idle sandbox ${sandboxId} (${sb.project})`);
     this.bridges.get(sandboxId)?.stop();
     this.bridges.delete(sandboxId);
+
+    // No live credentials in a sleeping VM: stop the forwarder while its control socket still answers,
+    // then end the Klav sandbox on the issuer side. The wake provisions a fresh one.
+    if (this.klavProxyProject(sb.project) && this.klav) {
+      await releaseVmForwarder(this.boat, sandboxId, { termTimeoutSecs: this.forwarderTermTimeoutSecs }).catch((err) => {
+        console.warn(`[hub] klav-forward release before sleep failed for ${sandboxId}: ${redactForLog(err)}`);
+      });
+      const klavSandbox = sb.klavAgentName;
+      if (klavSandbox) {
+        await this.klav.revokeForSandbox(klavSandbox).catch((err) => {
+          console.warn(`[hub] Klav revoke before sleep failed for ${sandboxId}: ${redactForLog(err)}`);
+        });
+      }
+      this.state.updateHubSandbox(sandboxId, (s) => {
+        s.klavAgentName = null;
+      });
+    }
+
     await this.boat.pause(sandboxId);
     this.state.updateHubSandbox(sandboxId, (s) => {
       s.phase = "sleeping";
