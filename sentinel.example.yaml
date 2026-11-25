@@ -161,6 +161,11 @@ projects:
       elif [ -f package-lock.json ]; then npm ci; fi
     bootCmd: |
       cd /home/user/my-app && git fetch origin --prune || true
+    # New chat VMs start on the remote's latest default branch (default true): before T3 starts, sentinel
+    # fetches origin and resets the workdir to origin/<default branch>, discarding what the bake left
+    # (lockfiles, stray files). Ignored files (node_modules, build caches) are kept. Resumed VMs are never
+    # touched. If the fetch fails or takes over 40s, the chat starts on the snapshot's code.
+    # syncToRemoteOnStart: true
     # Optional Klav proxy profiles granted to this repo's VMs:
     # klav:
     #   profiles: [northflank]

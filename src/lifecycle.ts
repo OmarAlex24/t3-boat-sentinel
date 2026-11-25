@@ -12,6 +12,7 @@ import {
 import type { ProjectConfig, SentinelConfig } from "./config.ts";
 import type { KlavClient } from "./klav.ts";
 import { ProviderSessionStore, STAGED_SESSIONS_DIR } from "./provider-sessions.ts";
+import { buildRepoSyncScript, describeRepoSync, parseRepoSyncOutput, type RepoSyncResult } from "./repo-sync.ts";
 import type { SlotRecord, StateStore } from "./state.ts";
 import { T3ReleaseResolver } from "./t3-release.ts";
 import { ensureT3Project, launchT3Thread, type LaunchThreadOptions } from "./t3rpc.ts";
@@ -56,6 +57,8 @@ export class LifecycleManager {
   private inFlightSpawns = new Set<string>();
   private reaperTimer: ReturnType<typeof setInterval> | null = null;
   private warnedNoSessionInject = false;
+  /** How long a fresh chat VM may spend moving its checkout to the remote before booting anyway. */
+  repoSyncTimeoutMs = 40_000;
   private bakeTimer: ReturnType<typeof setInterval> | null = null;
 
   private readonly boat: SandboxProvider;
@@ -897,12 +900,21 @@ export class LifecycleManager {
      * at boot, since no baked base image carries those runtimes.
      */
     installProviderRuntimes?: boolean;
+    /**
+     * Fresh VMs from a project snapshot only: move `project.workdir` to the remote's default branch
+     * (discarding what the bake left), before `envFile`, `bootCmd` and T3. Never on wake.
+     */
+    syncRepoToRemote?: boolean;
   }): Promise<{
     descriptor?: Record<string, unknown>;
     authSession?: Record<string, unknown>;
     upstreamToken?: string;
     /** Instance IDs whose stored sign-in was staged into this VM. */
     injectedProviderSessions?: string[];
+    /** Outcome of `syncRepoToRemote`, when it ran. */
+    repoSync?: RepoSyncResult;
+    /** How long `syncRepoToRemote` took, when it ran. */
+    repoSyncMs?: number;
   }> {
     const { sandboxId, watchdogSlotKey, environmentId, label, projectName, project, watchdogSecret, llmToken, mintToken } = opts;
     // Stored sign-ins are only staged on providers with a file transfer (`download`): elsewhere the
@@ -1000,6 +1012,12 @@ export class LifecycleManager {
       await this.boat.execOk(sandboxId, `chmod ${file.mode ?? "600"} ${file.to}`, 30);
     }
 
+    // After `injectFiles` (which may carry git credentials), before the `.env` and `bootCmd` that use the tree
+    const repoSyncStartedAt = Date.now();
+    const repoSync =
+      opts.syncRepoToRemote && project ? await this.syncRepoToRemote(sandboxId, projectName, project) : undefined;
+    const repoSyncMs = Date.now() - repoSyncStartedAt;
+
     if (project?.envFile && existsSync(project.envFile)) {
       const target = project.envTarget ?? `${project.workdir}/.env`;
       await this.boat.upload(sandboxId, project.envFile, target);
@@ -1040,7 +1058,33 @@ export class LifecycleManager {
     if (injected.size > 0) {
       console.log(`[sessions] copied stored ${[...injected].join(", ")} session(s) into ${sandboxId}`);
     }
-    return { ...parsed, injectedProviderSessions: [...injected] };
+    return { ...parsed, injectedProviderSessions: [...injected], ...(repoSync ? { repoSync, repoSyncMs } : {}) };
+  }
+
+  /** Bounded and non-fatal: a failure or timeout boots the chat on the snapshot's code, with one log line. */
+  private async syncRepoToRemote(sandboxId: string, projectName: string, project: ProjectConfig): Promise<RepoSyncResult> {
+    const ms = Math.max(1, this.repoSyncTimeoutMs);
+    // The script stops changing the tree 5s before the Hub stops waiting
+    const script = buildRepoSyncScript(
+      project.workdir,
+      Math.max(1, Math.floor(ms / 1000) - 5),
+      this.config.boat.injectFiles.map((f) => f.to),
+    );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<RepoSyncResult>((resolve) => {
+      timer = setTimeout(() => resolve({ status: "failed", reason: "timeout" }), ms);
+    });
+    const run = this.boat
+      .exec(sandboxId, script, Math.ceil(ms / 1000))
+      .then((r): RepoSyncResult => (r.exitCode === 0 ? parseRepoSyncOutput(r.stdout) : { status: "failed", reason: "exec-failed" }))
+      // Never log the provider's message: it can echo the script or git's output
+      .catch((): RepoSyncResult => ({ status: "failed", reason: "exec-failed" }));
+    const result = await Promise.race([run, timedOut]);
+    clearTimeout(timer);
+    const line = describeRepoSync(projectName, sandboxId, result);
+    if (result.status === "failed") console.warn(line);
+    else console.log(line);
+    return result;
   }
 
   private async provisionRunningVm(
