@@ -869,6 +869,11 @@ const PARKED_NOTICE =
   "This chat is settled and its VM is parked. Unsettle it or send a message to wake the VM and continue.";
 const EXPIRED_NOTICE =
   "This chat's VM expired after 14 days settled, so the chat is read only. Its history stays here; start a new chat to continue the work.";
+const SLEEPING_RPC_DETAIL =
+  "This chat's VM is asleep, so it cannot answer this. Send a message to wake it.";
+const SLEEPING_NOTICE = "This chat's VM is asleep. Sending a message wakes it.";
+/** Bookkeeping commands kept per sleeping chat for its next wake; the oldest go past this many. */
+const MAX_HELD_BOOKKEEPING = 50;
 const PARKED_RPC_DETAIL =
   "This chat is settled and its VM is parked, so it cannot answer this. Unsettle the chat or send a message to wake it.";
 
@@ -932,6 +937,8 @@ export class HubServer {
   private parkedSweepTimer: ReturnType<typeof setInterval> | null = null;
   /** Chats answered before their VM was ready (booting or failed), by thread id. */
   private readonly pendingThreads = new Map<string, PendingThreadLaunch>();
+  /** Bookkeeping commands (visit, pin, tag...) for chats whose VM is asleep, sent when it next wakes; by thread id. */
+  private readonly heldBookkeeping = new Map<string, Record<string, unknown>[]>();
   /** Thread streams the Hub serves while the thread's VM is not up, by thread id. */
   private readonly localThreadSubs = new Map<string, LocalThreadSub[]>();
   /** A sleeping VM being woken, or whose last wake failed (with the reason), by sandbox id. */
@@ -2288,6 +2295,11 @@ export class HubServer {
         this.serveParkedThreadRpc(ws, reqId, tag, payload, tid);
         return;
       }
+      if (this.idleSleepingSandboxForThread(tid)) {
+        // Nor does reading a chat whose VM sleeps: only sending it a message wakes it
+        this.serveParkedThreadRpc(ws, reqId, tag, payload, tid, SLEEPING_RPC_DETAIL);
+        return;
+      }
       const servable = tag === "orchestration.subscribeThread" || tag === "orchestration.getThreadProjection";
       const pending = this.pendingThreads.get(tid);
       if (pending && servable) {
@@ -2527,9 +2539,14 @@ export class HubServer {
         sendRpcExitSuccess(ws, reqId, { sequence: this.forgetOrphanThread(tid, cmdType) });
         return;
       }
+      if (BOOKKEEPING_COMMANDS.has(cmdType) && !pending && this.idleSleepingSandboxForThread(tid)) {
+        // Opening a sleeping chat records a visit: answered now, kept for the VM's next wake (never starts one)
+        sendRpcExitSuccess(ws, reqId, { sequence: this.state.ensureHub().sequence });
+        this.holdBookkeeping(tid, payload);
+        return;
+      }
       if (BOOKKEEPING_COMMANDS.has(cmdType) && !this.threadVmIsUp(tid)) {
-        // Answered now so opening a booting or sleeping chat raises no slow-request warning; the VM
-        // gets it once up (for a sleeping chat this starts the wake, as opening it always did)
+        // Answered now so opening a booting or waking chat raises no slow-request warning; the VM gets it once up
         sendRpcExitSuccess(ws, reqId, { sequence: this.state.ensureHub().sequence });
         void this.forwardWhenUp(tid, payload);
         return;
@@ -2911,6 +2928,46 @@ export class HubServer {
     return sb.phase === "sleeping" || this.inFlightWakes.has(sb.sandboxId) ? sb : undefined;
   }
 
+  /**
+   * The VM of a chat that sleeps (or is going to sleep) and is not parked or waking. Reading such a
+   * chat is answered by the Hub; only an action that needs the VM (a message, an answer) wakes it.
+   */
+  private idleSleepingSandboxForThread(threadId: string): HubSandboxRecord | undefined {
+    const sbId = this.threadToSandbox.get(threadId);
+    const sb = sbId ? this.state.getHubSandbox(sbId) : undefined;
+    if (!sb || sb.parkedAt || this.inFlightWakes.has(sb.sandboxId) || this.destroyingSandboxes.has(sb.sandboxId)) return undefined;
+    return sb.phase === "sleeping" || this.inFlightSleeps.has(sb.sandboxId) ? sb : undefined;
+  }
+
+  /** Keeps a bookkeeping command for a sleeping chat; a newer visit replaces an older one. */
+  private holdBookkeeping(threadId: string, payload: Record<string, unknown>): void {
+    let held = this.heldBookkeeping.get(threadId) ?? [];
+    if (payload.type === "thread.visit") held = held.filter((p) => p.type !== "thread.visit");
+    held.push(payload);
+    if (held.length > MAX_HELD_BOOKKEEPING) held = held.slice(held.length - MAX_HELD_BOOKKEEPING);
+    this.heldBookkeeping.set(threadId, held);
+  }
+
+  /** Sends a woken chat's held bookkeeping commands to its VM, in order. */
+  private async deliverHeldBookkeeping(threadId: string, sb: HubSandboxRecord): Promise<void> {
+    const held = this.heldBookkeeping.get(threadId);
+    this.heldBookkeeping.delete(threadId);
+    if (!held?.length) return;
+    const bridge = this.bridges.get(sb.sandboxId);
+    for (const payload of held) {
+      if (!bridge?.isOpen()) {
+        void this.forwardWhenUp(threadId, payload);
+        continue;
+      }
+      const exit = await bridge.callUnary(
+        "orchestration.dispatchCommand",
+        rewriteProjectIds(payload, sb.hubProjectId, sb.vmProjectId),
+        60_000,
+      );
+      if (exit._tag !== "Success") console.warn(`[hub] held ${String(payload.type)} for ${threadId} failed: ${formatRpcFailure(exit.cause)}`);
+    }
+  }
+
   // ── Settled chats whose VM is parked ───────────────────────────────────────────────────────────
 
   /** True when a VM whose chats are all settled is parked instead of deleted. */
@@ -2936,12 +2993,13 @@ export class HubServer {
     return sb.threadIds.filter((tid) => tid !== except && isOpenTopLevelRow(this.threadShells.get(tid)));
   }
 
-  /** True when `cwd` is the worktree of a parked or read-only chat. */
-  private isParkedWorkspace(cwd: string): boolean {
+  /** True when `cwd` is the worktree of a chat whose VM is parked or asleep (not waking), or a read-only chat. */
+  private isAsleepWorkspace(cwd: string): boolean {
     const inside = (wt: unknown) => typeof wt === "string" && wt !== "" && (cwd === wt || cwd.startsWith(`${wt}/`));
     for (const [wt, sbId] of this.worktreeToSandbox) {
       const sb = this.state.getHubSandbox(sbId);
-      if (inside(wt) && sb?.phase === "sleeping" && sb.parkedAt) return true;
+      if (!inside(wt) || !sb || this.inFlightWakes.has(sbId)) continue;
+      if (sb.phase === "sleeping" || this.inFlightSleeps.has(sbId)) return true;
     }
     for (const threadId of Object.keys(this.state.getHub()?.expiredThreads ?? {})) {
       if (inside(this.threadShells.get(threadId)?.worktreePath)) return true;
@@ -2972,8 +3030,9 @@ export class HubServer {
     tag: string,
     payload: unknown,
     threadId: string,
+    vmDetail: string = PARKED_RPC_DETAIL,
   ): void {
-    const detail = this.expiredThread(threadId) ? EXPIRED_NOTICE : PARKED_RPC_DETAIL;
+    const detail = this.expiredThread(threadId) ? EXPIRED_NOTICE : vmDetail;
     if (tag === "orchestration.subscribeThread" || tag === "orchestration.getThreadProjection") {
       // No copy of the history: a client holding its own keeps it (only `synchronized`)
       const afterSequence = (payload as { afterSequence?: unknown } | null)?.afterSequence;
@@ -3046,6 +3105,7 @@ export class HubServer {
   /** Archive or delete of a chat whose VM record is gone: its row, streams and cached copy go. */
   private forgetOrphanThread(threadId: string, command: string): number {
     this.threadToSandbox.delete(threadId);
+    this.heldBookkeeping.delete(threadId);
     this.deleteThreadShell(threadId);
     this.localThreadSubs.delete(threadId);
     this.dropProjectionCache(threadId);
@@ -3204,6 +3264,7 @@ export class HubServer {
       this.mcp.recordThreadsDestroyed([...sb.threadIds], `parked-expired-${reason}`);
       for (const threadId of sb.threadIds) {
         this.threadToSandbox.delete(threadId);
+        this.heldBookkeeping.delete(threadId);
         if (kept.has(threadId)) continue;
         this.deleteThreadShell(threadId);
         this.localThreadSubs.delete(threadId);
@@ -3250,15 +3311,15 @@ export class HubServer {
       return {
         outcome: "failed",
         summary: coolingDown
-          ? `This chat's VM could not wake. The next try is allowed after ${status.retryAfter}; ${parked ? "send a message" : "open the chat or send a message"} then.`
+          ? `This chat's VM could not wake. The next try is allowed after ${status.retryAfter}; send a message then.`
           : parked
             ? "This chat's VM could not wake. Send a message or unsettle it to retry."
-            : "This chat's VM could not wake. Open the chat again or send a message to retry.",
+            : "This chat's VM could not wake. Send a message to retry.",
         detail: status.error,
       };
     }
     if (this.state.getHubSandbox(sandboxId)?.parkedAt) return { outcome: "updated", summary: PARKED_NOTICE };
-    return { outcome: "updated", summary: "This chat's VM is asleep. Opening the chat or sending a message wakes it." };
+    return { outcome: "updated", summary: SLEEPING_NOTICE };
   }
 
   /** The Hub's view of a sleeping chat: its cached projection (or its sidebar row) with a status row. */
@@ -3270,8 +3331,8 @@ export class HubServer {
   }
 
   /**
-   * Serves a sleeping chat's thread view at once and starts waking its VM; the stream moves to the VM
-   * once it is up. False when the Hub knows nothing of the thread (then the request waits for the wake).
+   * Serves a waking chat's thread view at once; the stream moves to the VM once it is up. Never starts
+   * a wake. False when the Hub knows nothing of the thread (then the request waits for the wake).
    */
   private serveSleepingThread(
     ws: ServerWebSocket<HubWsData>,
@@ -3294,9 +3355,6 @@ export class HubServer {
       if (!view && !clientHasCopy) return false;
     }
     this.serveLocalThread(ws, reqId, tag, payload, view);
-    if (!this.inFlightWakes.has(sb.sandboxId)) {
-      void this.wakeHubSandbox(sb.sandboxId).catch(() => {});
-    }
     return true;
   }
 
@@ -3309,6 +3367,7 @@ export class HubServer {
     for (const threadId of sb.threadIds) {
       if (!status) {
         this.handOffLocalThreadSubs(threadId, sb);
+        void this.deliverHeldBookkeeping(threadId, sb);
         continue;
       }
       const subs = this.liveLocalThreadSubs(threadId);
@@ -3379,10 +3438,13 @@ export class HubServer {
     const hubProjId = typeof obj.projectId === "string" ? obj.projectId : null;
 
     let sb: HubSandboxRecord | undefined;
-    // A parked or read-only chat gets the Hub's own answer: no wake, and never another chat's VM
+    // A parked, sleeping or read-only chat gets the Hub's own answer: no wake, and never another chat's VM
     const parked =
-      (tid !== null && (this.parkedSandboxForThread(tid) !== undefined || this.expiredThread(tid) !== undefined)) ||
-      (cwd !== null && this.isParkedWorkspace(cwd));
+      (tid !== null &&
+        (this.parkedSandboxForThread(tid) !== undefined ||
+          this.idleSleepingSandboxForThread(tid) !== undefined ||
+          this.expiredThread(tid) !== undefined)) ||
+      (cwd !== null && this.isAsleepWorkspace(cwd));
     if (!parked && tid && this.threadToSandbox.has(tid) && !this.pendingThreads.has(tid)) {
       try {
         sb = await this.resolveSandboxForThread(tid);
@@ -3468,7 +3530,9 @@ export class HubServer {
     threadId: string,
   ): Promise<void> {
     const parked = this.parkedSandboxForThread(threadId) !== undefined || this.expiredThread(threadId) !== undefined;
-    if (parked || !this.threadHasVm(threadId)) {
+    // Answering a request the agent made (a secret, feedback) needs the VM; anything else waits for a message
+    const asleep = !parked && !tag.endsWith(".answerRequest") && this.idleSleepingSandboxForThread(threadId) !== undefined;
+    if (parked || asleep || !this.threadHasVm(threadId)) {
       if (tag === "preview.list") {
         // Asked for every open chat, drafts included: a chat with no VM has no previews
         sendRpcExitSuccess(ws, reqId, { sessions: [], serverEpoch: "boat-hub", revision: 0 });
@@ -3480,7 +3544,13 @@ export class HubServer {
         return;
       }
       // A parked chat's VM is stopped, not gone; the answer is the same shape, with its own text
-      const detail = !parked ? THREAD_VM_GONE_DETAIL : this.expiredThread(threadId) ? EXPIRED_NOTICE : PARKED_RPC_DETAIL;
+      const detail = asleep
+        ? SLEEPING_RPC_DETAIL
+        : !parked
+          ? THREAD_VM_GONE_DETAIL
+          : this.expiredThread(threadId)
+            ? EXPIRED_NOTICE
+            : PARKED_RPC_DETAIL;
       const typed = threadGoneError(tag, payload, detail);
       if (typed) sendRpcExitFail(ws, reqId, typed);
       else sendRpcExitFailure(ws, reqId, detail);
@@ -3555,15 +3625,15 @@ export class HubServer {
     }
     const ownerId = this.attachmentToSandbox.get(attachmentId);
     const owner = ownerId ? this.state.getHubSandbox(ownerId) : undefined;
-    if (owner?.phase === "sleeping" && owner.parkedAt) {
-      // A parked VM is never woken to read
-      sendRpcExitFail(ws, reqId, notFound);
-      return;
-    }
     if (owner?.phase === "sleeping") {
-      // Like a chat's own images: an idle VM is woken, not skipped
+      // A sleeping or parked VM is never woken to read; one already waking is waited for
+      const waking = this.inFlightWakes.get(owner.sandboxId);
+      if (!waking) {
+        sendRpcExitFail(ws, reqId, notFound);
+        return;
+      }
       try {
-        const bridge = await this.ensureBridgeOpen(await this.wakeHubSandbox(owner.sandboxId));
+        const bridge = await this.ensureBridgeOpen(await waking);
         bridge.forwardToClient(ws, reqId, "assets.createUrl", payload, headers);
       } catch (err) {
         sendRpcExitFailure(ws, reqId, err instanceof Error ? err.message : String(err));
@@ -4510,6 +4580,7 @@ export class HubServer {
     this.mcp.recordThreadsDestroyed(threadIds, reason);
     for (const tid of threadIds) {
       this.threadToSandbox.delete(tid);
+      this.heldBookkeeping.delete(tid);
       this.deleteThreadShell(tid);
       this.localThreadSubs.delete(tid);
       this.dropProjectionCache(tid);

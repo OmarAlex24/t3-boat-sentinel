@@ -2350,12 +2350,14 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       await until(() => !existsSync(join(rows, "thread-ghost.json")));
       await until(() => existsSync(join(rows, "thread-legacy.json")));
 
-      // Opening a rebuilt chat works like before the restart: the Hub's view at once, and its VM wakes,
-      // whose live row then replaces the rebuilt one
+      // Opening a rebuilt chat works like before the restart: the Hub's view at once, without a wake;
+      // once its VM wakes, its live row replaces the rebuilt one
       client2.request("legacy-view", "orchestration.getThreadProjection", { threadId: "thread-legacy" });
       const view = await client2.waitForFrame((f) => f._tag === "Exit" && f.requestId === "legacy-view");
       expect((view.exit as { _tag: string })._tag).toBe("Success");
       if (t3Contracts) expect(t3Contracts.decodeFrame("orchestration.getThreadProjection", view)).toEqual([{ ok: true }]);
+      expect(boat.resumed).not.toContain(sandboxOf("thread-legacy"));
+      await handle2.hub!.wakeHubSandbox(sandboxOf("thread-legacy"));
       await client2.waitForFrame(shellThreadUpdate("thread-legacy", (t) => t.title === "Chat thread-legacy"));
 
       // The VM renamed the chat while the Hub was down: once it runs, its live row replaces the stored one
@@ -2411,12 +2413,9 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       await until(() => !existsSync(join(dir, "hub-thread-shells", "thread-arch.json")));
     });
 
-    test("opening a sleeping chat shows its history at once, says it is waking, then hands over to the VM", async () => {
+    test("opening a sleeping chat shows its history at once without waking it; a message wakes it and hands over", async () => {
       const { vm, client, boat, sandboxId, dir } = await sleepingChat("vm-sleep");
       expect(existsSync(join(dir, "hub-thread-cache", "thread-zz.json"))).toBe(true);
-      let release!: () => void;
-      boat.resumeGate = new Promise<void>((r) => (release = r));
-      cleanups.push(() => release());
       const seenBefore = vm.seenMethods.length;
 
       // The app reopens the chat with its cached cursor, and records the visit
@@ -2431,19 +2430,34 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       const snap = (first.values as Array<{ kind: string; projection?: { messages: Array<{ text: string }> } }>)[0];
       expect(snap.kind).toBe("snapshot");
       expect(snap.projection!.messages[0].text).toBe("What we said before");
+      expect(noticeOf(first)?.summary).toBe("This chat's VM is asleep. Sending a message wakes it.");
       expect((first.values as Array<{ kind: string }>).some((v) => v.kind === "synchronized")).toBe(true);
-      // Answered at once, not after the wake
+      if (t3Contracts) for (const r of t3Contracts.decodeFrame("orchestration.subscribeThread", first)) expect(r).toEqual({ ok: true });
+      // Answered at once
       const visit = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "visit", 1_000);
       expect((visit.exit as { _tag: string })._tag).toBe("Success");
-      await client.waitForFrame(threadChunk("sub", (n) => n?.summary?.startsWith("Waking this chat's VM") === true), 2_000);
+      await Bun.sleep(200);
       expect(boat.resumed).toHaveLength(0);
 
+      // A message wakes it: the chat says so while it wakes
+      let release!: () => void;
+      boat.resumeGate = new Promise<void>((r) => (release = r));
+      cleanups.push(() => release());
+      client.request("send", "orchestration.dispatchCommand", {
+        type: "thread.turn.start",
+        commandId: "cmd-send",
+        threadId: "thread-zz",
+        message: { messageId: "m-1", text: "Back to work", attachments: [] },
+      });
+      await client.waitForFrame(threadChunk("sub", (n) => n?.summary?.startsWith("Waking this chat's VM") === true), 2_000);
       release();
+      expect((await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "send", 5_000)).exit).toMatchObject({ _tag: "Success" });
       await until(() => vm.seenMethods.slice(seenBefore).some((m) => m.tag === "orchestration.subscribeThread"));
       const handedOff = vm.seenMethods.slice(seenBefore).find((m) => m.tag === "orchestration.subscribeThread")!.payload as Record<string, unknown>;
       // It got the Hub's copy, so the VM sends a full snapshot
       expect("afterSequence" in handedOff).toBe(false);
       expect(boat.resumed).toEqual([sandboxId]);
+      // The visit made while it slept reaches the VM after the wake
       await until(() =>
         vm.seenMethods
           .slice(seenBefore)
@@ -2451,8 +2465,83 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       );
     });
 
+    test("the app's whole open sequence never wakes a sleeping chat; a message then wakes it, delivers the held visit and hands over", async () => {
+      const { vm, client, boat, handle, sandboxId } = await sleepingChat("vm-open-seq");
+      const worktree = String(vm.threads.get("thread-zz")!.worktreePath);
+      const seenBefore = vm.seenMethods.length;
+      const exitOf = (reqId: string) => client.waitForFrame((f) => f._tag === "Exit" && f.requestId === reqId);
+
+      // What the T3 app sends when the user opens a chat (production log of 2026-11-25)
+      client.request("sub", "orchestration.subscribeThread", { threadId: "thread-zz", afterSequence: 7, requestCompletionMarker: true });
+      client.request("visit", "orchestration.dispatchCommand", {
+        type: "thread.visit",
+        commandId: "cmd-visit",
+        threadId: "thread-zz",
+        visitedAt: new Date().toISOString(),
+      });
+      client.request("previews", "preview.list", { threadId: "thread-zz" });
+      client.request("vcs", "subscribeVcsStatus", { cwd: worktree });
+      client.request("setup", "subscribeWorktreeSetup", { threadId: "thread-zz" });
+      client.request("refs", "vcs.listRefs", { cwd: worktree });
+      client.request("read", "projects.readFile", { cwd: worktree, relativePath: "README.md" });
+      client.request("task", "workspace.taskFolder", { threadId: "thread-zz" });
+      client.request("diff", "review.getDiffPreview", { cwd: worktree, threadId: "thread-zz" });
+      client.request("branch", "vcs.refreshBranch", { cwd: worktree });
+      client.request("meta", "filesystem.getMetadata", { path: worktree });
+      client.request("providers", "server.refreshProviders", {});
+
+      const sub = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "sub");
+      expect(noticeOf(sub)?.summary).toBe("This chat's VM is asleep. Sending a message wakes it.");
+      expect(((await exitOf("visit")).exit as { _tag: string })._tag).toBe("Success");
+      const previews = await exitOf("previews");
+      expect((previews.exit as { value: { sessions: unknown[] } }).value.sessions).toEqual([]);
+      if (t3Contracts) expect(t3Contracts.decodeFrame("preview.list", previews)).toEqual([{ ok: true }]);
+      await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "setup");
+      const refs = await exitOf("refs");
+      expect((refs.exit as { _tag: string })._tag).toBe("Success");
+      if (t3Contracts) expect(t3Contracts.decodeFrame("vcs.listRefs", refs)).toEqual([{ ok: true }]);
+      // The rest is answered by the Hub (some as a VM that cannot serve now), each promptly
+      for (const reqId of ["read", "task", "diff", "branch", "meta", "providers"]) await exitOf(reqId);
+
+      await Bun.sleep(300);
+      expect(boat.resumed).toEqual([]);
+      expect(handle.state.getHubSandbox(sandboxId)?.phase).toBe("sleeping");
+      // None of it reached the VM (its bridge's first-connect harvest may still trail in, and is not the app's)
+      const openTags = new Set([
+        "orchestration.subscribeThread",
+        "orchestration.dispatchCommand",
+        "preview.list",
+        "subscribeVcsStatus",
+        "subscribeWorktreeSetup",
+        "projects.readFile",
+        "workspace.taskFolder",
+        "review.getDiffPreview",
+        "vcs.refreshBranch",
+        "filesystem.getMetadata",
+        "server.refreshProviders",
+      ]);
+      const harvest = (m: { tag: string; payload: unknown }) => m.tag === "vcs.listRefs" && (m.payload as { cwd?: unknown }).cwd === "/home/user/my-app";
+      expect(vm.seenMethods.slice(seenBefore).filter((m) => openTags.has(m.tag) || (m.tag === "vcs.listRefs" && !harvest(m)))).toEqual([]);
+      expect(client.inbox.some((f) => f.requestId === "vcs" && f._tag === "Exit")).toBe(false);
+
+      // Sending a message is what wakes it
+      client.request("send", "orchestration.dispatchCommand", {
+        type: "thread.turn.start",
+        commandId: "cmd-send",
+        threadId: "thread-zz",
+        message: { messageId: "m-1", text: "Back to work", attachments: [] },
+      });
+      expect(((await exitOf("send")).exit as { _tag: string })._tag).toBe("Success");
+      expect(boat.resumed).toEqual([sandboxId]);
+      const after = () => vm.seenMethods.slice(seenBefore);
+      await until(() => after().some((m) => m.tag === "orchestration.dispatchCommand" && (m.payload as { type?: string }).type === "thread.visit"));
+      expect(after().some((m) => m.tag === "orchestration.dispatchCommand" && (m.payload as { type?: string }).type === "thread.turn.start")).toBe(true);
+      // The open chat's stream moved to the VM
+      await until(() => after().some((m) => m.tag === "orchestration.subscribeThread" && (m.payload as { threadId?: string }).threadId === "thread-zz"));
+    });
+
     test("with no Hub copy, a client's own cached history is kept, not replaced by an empty view", async () => {
-      const { client, boat, dir } = await sleepingChat("vm-nocache", { failProjection: true });
+      const { client, boat, dir, handle, sandboxId } = await sleepingChat("vm-nocache", { failProjection: true });
       expect(existsSync(join(dir, "hub-thread-cache", "thread-zz.json"))).toBe(false);
       let release!: () => void;
       boat.resumeGate = new Promise<void>((r) => (release = r));
@@ -2461,22 +2550,21 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       client.request("sub", "orchestration.subscribeThread", { threadId: "thread-zz", afterSequence: 7, requestCompletionMarker: true });
       const first = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "sub");
       expect(first.values).toEqual([{ kind: "synchronized" }]);
-      // The wake starts and its status is not pushed over the client's copy
+      // A wake (a message elsewhere) starts, and its status is not pushed over the client's copy
+      void handle.hub!.wakeHubSandbox(sandboxId).catch(() => {});
       await Bun.sleep(150);
       expect(client.inbox.some((f) => f._tag === "Chunk" && f.requestId === "sub")).toBe(false);
       release();
     });
 
     test("a failed wake says why in the chat, and commands fail with a readable reason", async () => {
-      const { client, boat } = await sleepingChat("vm-wakefail");
+      const { client, boat, handle } = await sleepingChat("vm-wakefail");
       boat.resumeError = new Error("klav-forward is not listening");
+      // No cooldown, so the notice says a message retries now
+      handle.hub!.wakeBackoffBaseMs = 0;
 
       client.request("sub", "orchestration.subscribeThread", { threadId: "thread-zz" });
-      const failed = await client.waitForFrame(threadChunk("sub", (n) => n?.outcome === "failed"));
-      const notice = noticeOf(failed)!;
-      expect(notice.summary).toContain("could not wake");
-      expect(notice.detail).toContain("klav-forward is not listening");
-
+      await client.waitForFrame(threadChunk("sub", (n) => n?.summary === "This chat's VM is asleep. Sending a message wakes it."));
       client.request("msg", "orchestration.dispatchCommand", {
         type: "message.dispatch",
         commandId: "cmd-m",
@@ -2485,6 +2573,11 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
         text: "hello?",
         attachments: [],
       });
+      const failed = await client.waitForFrame(threadChunk("sub", (n) => n?.outcome === "failed"));
+      const notice = noticeOf(failed)!;
+      expect(notice.summary).toBe("This chat's VM could not wake. Send a message to retry.");
+      expect(notice.detail).toContain("klav-forward is not listening");
+
       const exit = (await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "msg")).exit as {
         _tag: string;
         cause: Array<{ _tag: string; error?: Record<string, unknown> }>;
@@ -2508,6 +2601,15 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       boat.resumeError = new Error("boat resume failed: KLAV_SANDBOX=ksb1_onetimepackagesecret capacity unavailable");
 
       client.request("sub", "orchestration.subscribeThread", { threadId: "thread-zz" });
+      client.request("msg0", "orchestration.dispatchCommand", {
+        type: "message.dispatch",
+        commandId: "cmd-0",
+        threadId: "thread-zz",
+        messageId: "m-0",
+        text: "hello?",
+        attachments: [],
+      });
+      expect(((await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "msg0")).exit as { _tag: string })._tag).toBe("Failure");
       const failed = await client.waitForFrame(threadChunk("sub", (n) => n?.outcome === "failed"));
       const notice = noticeOf(failed)!;
       expect(notice.detail).toContain("capacity unavailable");
@@ -2538,7 +2640,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       const term = (await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "term", 1_000)).exit as { _tag: string };
       expect(term._tag).toBe("Failure");
       const reopened = noticeOf(await client.waitForFrame(threadChunk("sub2", (n) => n?.outcome === "failed"), 1_000))!;
-      expect(reopened.summary).toContain(`next try is allowed after ${retryAfter}`);
+      expect(reopened.summary).toBe(`This chat's VM could not wake. The next try is allowed after ${retryAfter}; send a message then.`);
       expect(reopened.detail).toContain("capacity unavailable");
       expect(Date.now() - started).toBeLessThan(1_000);
       await Bun.sleep(50);
@@ -5354,9 +5456,19 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       expect(boat.resumed).toHaveLength(0);
       expect(vm.mediaConnections.filter((c) => c.path === "/api/preview-stream/ws")).toHaveLength(1);
 
-      // The preview RPC wakes the chat, and the next reconnect streams again
+      // Listing previews (opening the chat) does not wake it either: the Hub answers with none
       client.request("list", "preview.list", { threadId: "thread-zz" });
-      await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "list");
+      const list = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "list");
+      expect((list.exit as { value: { sessions: unknown[] } }).value.sessions).toEqual([]);
+      expect(boat.resumed).toHaveLength(0);
+      // A message wakes the chat, and the next reconnect streams again
+      client.request("send", "orchestration.dispatchCommand", {
+        type: "thread.turn.start",
+        commandId: "cmd-send",
+        threadId: "thread-zz",
+        message: { messageId: "m-1", text: "Back to work", attachments: [] },
+      });
+      await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "send");
       expect(boat.resumed).toEqual([sandboxId]);
       const awake = await openMedia(handle, cfg, path);
       await until(() => awake.binary.length > 0);
