@@ -243,6 +243,7 @@ function makeTestConfig(port = 0): SentinelConfig {
       archiveGraceSecs: 20,
       deleteWhen: "archived",
       archiveAction: "delete",
+      settleAction: "park",
       reaperIntervalSecs: 300,
       maxSleepingHours: 0,
       sandboxPrefix: "t3s-",
@@ -2441,6 +2442,324 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       await handle.hub!.sleepHubSandbox(sandboxId);
       await Bun.sleep(100);
       expect(client.inbox.some((f) => f._tag === "Exit" && f.requestId === "tasks")).toBe(false);
+    });
+  });
+
+  describe("settled chats park their VM", () => {
+    type HubClient = Awaited<ReturnType<typeof connectHubClient>>;
+    const until = async (cond: () => boolean, timeoutMs = 5_000) => {
+      const start = Date.now();
+      while (!cond()) {
+        if (Date.now() - start > timeoutMs) throw new Error("condition not met in time");
+        await Bun.sleep(20);
+      }
+    };
+    const DAY_MS = 24 * 3600_000;
+    const settledConfig = (cfg: SentinelConfig): SentinelConfig => ({ ...cfg, boat: { ...cfg.boat, deleteWhen: "archived-or-settled" } });
+    type Exit = { _tag: string; cause?: Array<{ _tag: string; error?: { _tag: string; message?: string }; defect?: unknown }> };
+    const exitOf = (f: Record<string, unknown>) => f.exit as Exit;
+    /** The text of a failed Exit: a typed error's message, or a defect. */
+    const failureText = (f: Record<string, unknown>) => {
+      const reason = exitOf(f).cause?.[0];
+      return String(reason?.error?.message ?? reason?.defect ?? "");
+    };
+    type Row = { item: { type: string; summary?: string } };
+    const snapshotOf = (f: Record<string, unknown>) =>
+      (f.values as Array<{ kind: string; projection?: { messages: Array<{ text: string }>; visibleTurnItems: Row[] } }>).find(
+        (v) => v.kind === "snapshot",
+      )?.projection;
+    const noticeOf = (f: Record<string, unknown>) => snapshotOf(f)?.visibleTurnItems.find((r) => r.item.type === "notification")?.item;
+    const shellThreads = async (client: HubClient, reqId: string) => {
+      client.request(reqId, "orchestration.subscribeShell");
+      const shell = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === reqId);
+      return (shell.values as Array<{ snapshot: { threads: Array<Record<string, unknown>> } }>)[0].snapshot.threads;
+    };
+    const dispatch = (client: HubClient, reqId: string, threadId: string, type: string, extra: Record<string, unknown> = {}) =>
+      client.request(reqId, "orchestration.dispatchCommand", { type, commandId: `cmd-${reqId}`, threadId, ...extra });
+    const exitFrame = (client: HubClient, reqId: string, timeoutMs?: number) =>
+      client.waitForFrame((f) => f._tag === "Exit" && f.requestId === reqId, timeoutMs);
+    const hubProjectIdOf = (handle: SentinelServerHandle) => handle.state.getHub()!.projectIds["my-app"];
+
+    /**
+     * One chat on its own VM, settled by the user: the VM's row carries `settledAt` and, after the
+     * grace, its watchdog reports `all-archived` (all top-level chats archived, deleted or settled).
+     */
+    async function parkedChat(prefix: string, opts: { maxSandboxes?: number; vms?: number; settleAction?: "park" | "delete" } = {}) {
+      const vms = Array.from({ length: opts.vms ?? 1 }, (_, i) => startFakeVmT3Server(`${prefix}-${i + 1}`));
+      for (const vm of vms) cleanups.push(() => vm.server.stop(true));
+      const hub = await startHubWithVm(vms[0], `t3-sentinel-hub-${prefix}-`, {
+        maxSandboxes: opts.maxSandboxes,
+        patchConfig: (cfg) => {
+          const settled = settledConfig(cfg);
+          return { ...settled, boat: { ...settled.boat, settleAction: opts.settleAction ?? "park" } };
+        },
+      });
+      // One fake VM per sandbox, as in production (each lists only its own threads)
+      hub.boat.hostPublic = async (id: string) => vms[Number(id.slice("sb-".length)) - 1].url;
+      const client: HubClient = await connectHubClient(hub.handle, hub.cfg);
+      await launchThreadOnHub(client, "thread-p");
+      const sandboxId = hub.handle.state.listHubSandboxes()[0].sandboxId;
+      const vm = vms[0];
+      const settledRow = { ...vm.threads.get("thread-p")!, status: "idle", settledAt: new Date().toISOString() };
+      vm.threads.set("thread-p", settledRow);
+      (hub.handle.hub as unknown as { handleVmShellItems(id: string, items: unknown[]): void }).handleVmShellItems(sandboxId, [
+        { kind: "thread.updated", sequence: 5, location: "active", thread: settledRow },
+      ]);
+      await client.waitForFrame(shellThreadUpdate("thread-p", (t) => typeof t.settledAt === "string"));
+      await hub.handle.hub!.handleWatchdogEvent({ slot: `hub:${sandboxId}`, sandboxId, event: "all-archived" });
+      return { vms, vm, client, sandboxId, ...hub };
+    }
+
+    /** Launches another chat (on the next VM) like the app's first send, and waits for its VM. */
+    async function launchAnother(client: HubClient, handle: SentinelServerHandle, threadId: string) {
+      client.request(`launch-${threadId}`, "orchestration.launchThread", clientLaunchPayload(threadId, hubProjectIdOf(handle)));
+      return exitFrame(client, `launch-${threadId}`);
+    }
+
+    test("settling every chat on a VM parks it: stopped, not deleted, still listed as settled", async () => {
+      const { boat, handle, client, sandboxId, dir } = await parkedChat("park-settle");
+      expect(boat.deleted).toEqual([]);
+      expect(boat.stopped).toEqual([sandboxId]);
+      const record = handle.state.getHubSandbox(sandboxId)!;
+      expect(record.phase).toBe("sleeping");
+      expect(typeof record.parkedAt).toBe("string");
+      expect(record.llmToken).toBeNull();
+      // History cached before the stop, row kept on disk
+      expect(existsSync(join(dir, "hub-thread-cache", "thread-p.json"))).toBe(true);
+      await until(() => existsSync(join(dir, "hub-thread-shells", "thread-p.json")));
+      const listed = await shellThreads(client, "shell2");
+      expect(listed.map((t) => t.id)).toEqual(["thread-p"]);
+      expect(typeof listed[0].settledAt).toBe("string");
+      // The watchdog keeps reporting while it runs; a repeat changes nothing
+      await handle.hub!.handleWatchdogEvent({ slot: `hub:${sandboxId}`, sandboxId, event: "all-archived" });
+      expect(boat.deleted).toEqual([]);
+      expect(boat.stopped).toEqual([sandboxId]);
+    });
+
+    test("settleAction delete keeps deleting a settled chat's VM", async () => {
+      const { boat, handle, sandboxId } = await parkedChat("park-delete-config", { settleAction: "delete" });
+      expect(boat.deleted).toEqual([sandboxId]);
+      expect(handle.state.getHubSandbox(sandboxId)).toBeUndefined();
+    });
+
+    test("parked VMs do not count toward maxSandboxes; a parked chat cannot wake while the limit is full", async () => {
+      const { boat, handle, client, sandboxId } = await parkedChat("park-limit", { maxSandboxes: 1, vms: 2 });
+      // The only place is free again: a new chat starts
+      const launched = await launchAnother(client, handle, "thread-q");
+      expect(exitOf(launched)._tag).toBe("Success");
+      await client.waitForFrame(shellThreadUpdate("thread-q", (t) => t.status === "running"));
+      expect(handle.state.getHubSandbox(sandboxId)?.parkedAt).toBeTruthy();
+      expect(handle.state.listHubSandboxes()).toHaveLength(2);
+
+      // Now the limit is full: continuing the parked chat fails with a clear reason, no wake, no backoff
+      dispatch(client, "unsettle-full", "thread-p", "thread.unsettle", { reason: "user" });
+      const refused = await exitFrame(client, "unsettle-full");
+      expect(exitOf(refused)._tag).toBe("Failure");
+      expect(failureText(refused)).toContain("Hub sandbox limit reached (1/1)");
+      if (t3Contracts) expect(t3Contracts.decodeFrame("orchestration.dispatchCommand", refused)).toEqual([{ ok: true }]);
+      expect(boat.resumed).toEqual([]);
+      const record = handle.state.getHubSandbox(sandboxId)!;
+      expect(record.parkedAt).toBeTruthy();
+      expect(record.wakeFailure ?? null).toBeNull();
+    });
+
+    test("opening a parked chat serves its cached history and never wakes its VM", async () => {
+      const { boat, handle, client, vm, sandboxId } = await parkedChat("park-open");
+      const seenBefore = vm.seenMethods.length;
+      const worktree = String(vm.threads.get("thread-p")!.worktreePath);
+      // What the app sends when a chat is opened
+      client.request("sub", "orchestration.subscribeThread", { threadId: "thread-p", afterSequence: 7, requestCompletionMarker: true });
+      client.request("proj", "orchestration.getThreadProjection", { threadId: "thread-p" });
+      client.request("family", "orchestration.getThreadFamily", { threadId: "thread-p" });
+      dispatch(client, "visit", "thread-p", "thread.visit", { visitedAt: new Date().toISOString() });
+      client.request("diff", "orchestration.getFullThreadDiff", { threadId: "thread-p", toTurnCount: 1 });
+      client.request("refs", "vcs.listRefs", { cwd: worktree });
+      client.request("vcs", "subscribeVcsStatus", { cwd: worktree });
+      client.request("previews", "preview.list", { threadId: "thread-p" });
+
+      const sub = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "sub");
+      expect(snapshotOf(sub)!.messages[0].text).toBe("What we said before");
+      expect(noticeOf(sub)?.summary).toStartWith("This chat is settled and its VM is parked");
+      if (t3Contracts) for (const r of t3Contracts.decodeFrame("orchestration.subscribeThread", sub)) expect(r).toEqual({ ok: true });
+      const proj = await exitFrame(client, "proj");
+      expect(exitOf(proj)._tag).toBe("Success");
+      if (t3Contracts) expect(t3Contracts.decodeFrame("orchestration.getThreadProjection", proj)).toEqual([{ ok: true }]);
+      const family = await exitFrame(client, "family");
+      expect(((family.exit as { value: { threads: Array<{ id: string }> } }).value.threads)[0].id).toBe("thread-p");
+      if (t3Contracts) expect(t3Contracts.decodeFrame("orchestration.getThreadFamily", family)).toEqual([{ ok: true }]);
+      expect(exitOf(await exitFrame(client, "visit"))._tag).toBe("Success");
+      const diff = await exitFrame(client, "diff");
+      expect(exitOf(diff)._tag).toBe("Failure");
+      if (t3Contracts) expect(t3Contracts.decodeFrame("orchestration.getFullThreadDiff", diff)).toEqual([{ ok: true }]);
+      const refs = await exitFrame(client, "refs");
+      expect(exitOf(refs)._tag).toBe("Success");
+      if (t3Contracts) expect(t3Contracts.decodeFrame("vcs.listRefs", refs)).toEqual([{ ok: true }]);
+      const previews = await exitFrame(client, "previews");
+      expect(exitOf(previews)._tag).toBe("Success");
+
+      await Bun.sleep(300);
+      expect(boat.resumed).toEqual([]);
+      // Nothing reached the VM (besides the project refs its bridge asked for when it first opened)
+      const harvest = (m: { tag: string; payload: unknown }) => m.tag === "vcs.listRefs" && (m.payload as { cwd?: unknown }).cwd === "/home/user/my-app";
+      expect(vm.seenMethods.slice(seenBefore).filter((m) => !harvest(m)).map((m) => m.tag)).toEqual([]);
+      expect(client.inbox.some((f) => f.requestId === "vcs" && f._tag === "Exit")).toBe(false);
+      expect(handle.state.getHubSandbox(sandboxId)).toMatchObject({ phase: "sleeping" });
+      expect(handle.state.getHubSandbox(sandboxId)?.parkedAt).toBeTruthy();
+    });
+
+    test("unsettling a parked chat wakes its VM as it was and forwards the command; it counts again", async () => {
+      const { boat, handle, client, vm, sandboxId } = await parkedChat("park-unsettle");
+      client.request("sub", "orchestration.subscribeThread", { threadId: "thread-p", requestCompletionMarker: true });
+      await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "sub");
+
+      dispatch(client, "unsettle", "thread-p", "thread.unsettle", { reason: "user" });
+      const exit = await exitFrame(client, "unsettle", 10_000);
+      expect(exitOf(exit)._tag).toBe("Success");
+      expect(boat.resumed).toEqual([sandboxId]);
+      expect(boat.created).toHaveLength(1);
+      const forwarded = vm.seenMethods.find(
+        (m) => m.tag === "orchestration.dispatchCommand" && (m.payload as { type?: string }).type === "thread.unsettle",
+      );
+      expect(forwarded?.payload).toMatchObject({ threadId: "thread-p", reason: "user" });
+      const record = handle.state.getHubSandbox(sandboxId)!;
+      expect(record.phase).toBe("running");
+      expect(record.parkedAt ?? null).toBeNull();
+      // The open chat moved to its VM
+      await until(() => vm.seenMethods.some((m) => m.tag === "orchestration.subscribeThread"));
+
+      // Its watchdog may still report the pre-park state once: the woken VM is not parked again
+      await handle.hub!.handleWatchdogEvent({ slot: `hub:${sandboxId}`, sandboxId, event: "all-archived" });
+      expect(handle.state.getHubSandbox(sandboxId)?.phase).toBe("running");
+      expect(boat.stopped).toEqual([sandboxId]);
+      expect(boat.deleted).toEqual([]);
+    });
+
+    for (const command of ["thread.archive", "thread.delete"]) {
+      test(`${command} of a parked chat deletes its VM without waking it`, async () => {
+        const { boat, handle, client, sandboxId, dir } = await parkedChat(`park-${command.slice(7)}`);
+        expect(boat.deleted).toEqual([]);
+        dispatch(client, "close", "thread-p", command);
+        const exit = await exitFrame(client, "close");
+        expect(exitOf(exit)._tag).toBe("Success");
+        if (t3Contracts) expect(t3Contracts.decodeFrame("orchestration.dispatchCommand", exit)).toEqual([{ ok: true }]);
+        const removed = await client.waitForFrame(
+          (f) =>
+            f._tag === "Chunk" &&
+            f.requestId === "shell" &&
+            (f.values as Array<{ kind?: string; threadId?: string }>).some((v) => v.kind === "thread.removed" && v.threadId === "thread-p"),
+        );
+        if (t3Contracts) for (const r of t3Contracts.decodeFrame("orchestration.subscribeShell", removed)) expect(r).toEqual({ ok: true });
+        expect(boat.resumed).toEqual([]);
+        expect(boat.deleted).toEqual([sandboxId]);
+        expect(handle.state.getHubSandbox(sandboxId)).toBeUndefined();
+        await until(() => !existsSync(join(dir, "hub-thread-shells", "thread-p.json")));
+        expect(existsSync(join(dir, "hub-thread-cache", "thread-p.json"))).toBe(false);
+      });
+    }
+
+    test("a Hub restart keeps a parked VM parked: listed, read without waking, not counted", async () => {
+      const { boat, handle, cfg, sandboxId } = await parkedChat("park-restart", { maxSandboxes: 1, vms: 2 });
+      handle.stop();
+
+      const handle2 = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+      cleanups.push(() => handle2.stop());
+      expect(handle2.state.getHubSandbox(sandboxId)).toMatchObject({ phase: "sleeping" });
+      expect(handle2.state.getHubSandbox(sandboxId)?.parkedAt).toBeTruthy();
+      const client2: HubClient = await connectHubClient(handle2, cfg);
+      expect((await shellThreads(client2, "shell")).map((t) => t.id)).toEqual(["thread-p"]);
+      client2.request("sub", "orchestration.subscribeThread", { threadId: "thread-p", requestCompletionMarker: true });
+      const sub = await client2.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "sub");
+      expect(snapshotOf(sub)!.messages[0].text).toBe("What we said before");
+      expect(noticeOf(sub)?.summary).toStartWith("This chat is settled");
+      const launched = await launchAnother(client2, handle2, "thread-q");
+      expect(exitOf(launched)._tag).toBe("Success");
+      await client2.waitForFrame(shellThreadUpdate("thread-q", (t) => t.status === "running"));
+      expect(boat.resumed).toEqual([]);
+    });
+
+    test("after 14 days parked the chat is read only: listed, not counted, and it refuses to continue", async () => {
+      const { boat, handle, client, cfg, sandboxId, dir } = await parkedChat("park-expire", { maxSandboxes: 1, vms: 2 });
+      // Not yet: 13 days
+      handle.state.updateHubSandbox(sandboxId, (s) => {
+        s.sleepingSince = new Date(Date.now() - 13 * DAY_MS).toISOString();
+      });
+      expect(await handle.hub!.expireParkedSandboxes()).toBe(0);
+      handle.state.updateHubSandbox(sandboxId, (s) => {
+        s.sleepingSince = new Date(Date.now() - 14 * DAY_MS - 60_000).toISOString();
+      });
+      client.request("sub", "orchestration.subscribeThread", { threadId: "thread-p", requestCompletionMarker: true });
+      await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "sub");
+      expect(await handle.hub!.expireParkedSandboxes()).toBe(1);
+      // The open chat is told at once
+      const told = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "sub" && !!noticeOf(f)?.summary?.includes("expired"));
+      expect(noticeOf(told)?.summary).toContain("expired after 14 days settled");
+      // The Boat sandbox is deleted; no named snapshot is made
+      expect(boat.deleted).toEqual([sandboxId]);
+      expect(boat.savedSnapshots).toEqual([]);
+      expect(handle.state.getHubSandbox(sandboxId)).toBeUndefined();
+      expect(handle.state.getHub()?.expiredThreads?.["thread-p"]).toMatchObject({ sandboxId, reason: "parked-14-days" });
+
+      // Still listed with its history
+      expect((await shellThreads(client, "shell2")).map((t) => t.id)).toEqual(["thread-p"]);
+      client.request("proj", "orchestration.getThreadProjection", { threadId: "thread-p" });
+      const proj = await exitFrame(client, "proj");
+      expect((proj.exit as { value: { messages: Array<{ text: string }> } }).value.messages[0].text).toBe("What we said before");
+      if (t3Contracts) expect(t3Contracts.decodeFrame("orchestration.getThreadProjection", proj)).toEqual([{ ok: true }]);
+
+      // Continuing it fails with a clear notice, never a wake
+      dispatch(client, "unsettle", "thread-p", "thread.unsettle", { reason: "user" });
+      const refused = await exitFrame(client, "unsettle");
+      expect(failureText(refused)).toContain("expired after 14 days settled");
+      if (t3Contracts) expect(t3Contracts.decodeFrame("orchestration.dispatchCommand", refused)).toEqual([{ ok: true }]);
+      dispatch(client, "send", "thread-p", "thread.turn.start", { message: { messageId: "m2", text: "Again", attachments: [] } });
+      expect(failureText(await exitFrame(client, "send"))).toContain("expired after 14 days settled");
+      expect(boat.resumed).toEqual([]);
+
+      // Counts toward nothing: the only place takes a new chat
+      const launched = await launchAnother(client, handle, "thread-q");
+      expect(exitOf(launched)._tag).toBe("Success");
+      await client.waitForFrame(shellThreadUpdate("thread-q", (t) => t.status === "running"));
+
+      // A restart keeps it listed and read only
+      handle.stop();
+      const handle2 = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+      cleanups.push(() => handle2.stop());
+      const client2: HubClient = await connectHubClient(handle2, cfg);
+      expect((await shellThreads(client2, "shell")).map((t) => t.id).sort()).toEqual(["thread-p", "thread-q"]);
+      await Bun.sleep(400);
+      expect(existsSync(join(dir, "hub-thread-shells", "thread-p.json"))).toBe(true);
+      dispatch(client2, "unsettle2", "thread-p", "thread.unsettle", { reason: "user" });
+      expect(failureText(await exitFrame(client2, "unsettle2"))).toContain("expired after 14 days settled");
+
+      // Archiving it is the only way out of the sidebar
+      dispatch(client2, "archive", "thread-p", "thread.archive");
+      expect(exitOf(await exitFrame(client2, "archive"))._tag).toBe("Success");
+      expect((await shellThreads(client2, "shell3")).map((t) => t.id)).toEqual(["thread-q"]);
+      expect(handle2.state.getHub()?.expiredThreads?.["thread-p"]).toBeUndefined();
+    });
+
+    test("a parked VM whose disk Boat dropped early turns read only on wake, without retrying", async () => {
+      const { boat, handle, client, sandboxId } = await parkedChat("park-dropped");
+      boat.sandboxes.delete(sandboxId);
+      dispatch(client, "unsettle", "thread-p", "thread.unsettle", { reason: "user" });
+      const refused = await exitFrame(client, "unsettle");
+      expect(exitOf(refused)._tag).toBe("Failure");
+      expect(failureText(refused)).toContain("expired after 14 days settled");
+      expect(handle.state.getHubSandbox(sandboxId)).toBeUndefined();
+      expect(handle.state.getHub()?.expiredThreads?.["thread-p"]).toMatchObject({ reason: "data-expired" });
+      expect((await shellThreads(client, "shell2")).map((t) => t.id)).toEqual(["thread-p"]);
+      // A second try is answered by the Hub: no resume, no backoff loop
+      dispatch(client, "unsettle2", "thread-p", "thread.unsettle", { reason: "user" });
+      expect(failureText(await exitFrame(client, "unsettle2"))).toContain("expired after 14 days settled");
+    });
+
+    test("the reaper turns a parked VM Boat no longer lists into a read-only chat", async () => {
+      const { boat, handle, client, sandboxId } = await parkedChat("park-reaped");
+      boat.sandboxes.delete(sandboxId);
+      await handle.lifecycle.reaperTick();
+      expect(handle.state.getHubSandbox(sandboxId)).toBeUndefined();
+      expect(handle.state.getHub()?.expiredThreads?.["thread-p"]).toMatchObject({ reason: "gone-remotely" });
+      expect((await shellThreads(client, "shell2")).map((t) => t.id)).toEqual(["thread-p"]);
     });
   });
 

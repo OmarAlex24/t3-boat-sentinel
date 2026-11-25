@@ -75,6 +75,34 @@ export interface HubSandboxRecord {
   sleepingSince: string | null;
   /** Last failed wake of this sleeping VM; cleared by the next successful wake. Holds no secrets. */
   wakeFailure?: HubWakeFailure | null;
+  /**
+   * Set while the VM is parked: stopped because every chat on it is settled (none open). A parked VM
+   * does not count toward `hub.maxSandboxes`, and reading its chats never wakes it. Cleared by the
+   * next successful wake and by an idle sleep.
+   */
+  parkedAt?: string | null;
+}
+
+/** True when the sandbox takes a place under `hub.maxSandboxes`: it exists and is not parked. */
+export function countsTowardHubLimit(sb: HubSandboxRecord): boolean {
+  if (sb.phase === "destroying") return false;
+  return !(sb.phase === "sleeping" && sb.parkedAt);
+}
+
+/**
+ * A settled chat whose parked VM is gone (Boat drops a stopped VM's disk after 14 days). Its sidebar
+ * row and cached history stay on the Hub, read only; it has no sandbox and counts toward nothing.
+ */
+export interface HubExpiredThreadRecord {
+  threadId: string;
+  project: string;
+  hubProjectId: string;
+  /** The sandbox the chat ran on (deleted). */
+  sandboxId: string;
+  parkedAt: string | null;
+  expiredAt: string;
+  /** `parked-14-days`, `data-expired` (Boat dropped it early) or `gone-remotely`. */
+  reason: string;
 }
 
 export interface HubWakeFailure {
@@ -150,6 +178,8 @@ export interface HubStateRecord {
   settingsOverlay: HubSettingsOverlay | null;
   /** Chats answered before their VM was ready, by thread id (see `HubPendingLaunchRecord`). */
   pendingLaunches?: Record<string, HubPendingLaunchRecord>;
+  /** Read-only settled chats whose parked VM expired, by thread id (see `HubExpiredThreadRecord`). */
+  expiredThreads?: Record<string, HubExpiredThreadRecord>;
 }
 
 export interface PersistedState {
@@ -256,6 +286,9 @@ export class StateStore {
         settingsOverlay: normalizeSettingsOverlay(prevHub?.settingsOverlay),
         ...(prevHub?.pendingLaunches && Object.keys(prevHub.pendingLaunches).length > 0
           ? { pendingLaunches: prevHub.pendingLaunches }
+          : {}),
+        ...(prevHub?.expiredThreads && Object.keys(prevHub.expiredThreads).length > 0
+          ? { expiredThreads: prevHub.expiredThreads }
           : {}),
       };
     }

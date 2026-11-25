@@ -18,7 +18,7 @@ controlSecret: ${CONTROL_SECRET}
 
 # Recommended: Single-Environment Hub Multiplexer (1 Environment -> up to N parallel disposable Boat VMs)
 # Pair `https://boat.example.com` ONCE on T3 Desktop & ONCE on T3 Mobile.
-# Every new chat automatically spawns 1 fresh isolated Boat VM and destroys ONLY that VM when settled/archived!
+# Every new chat automatically spawns 1 fresh isolated Boat VM; archiving it destroys ONLY that VM, settling it parks it.
 hub:
   host: boat.example.com
   label: Boat
@@ -97,6 +97,10 @@ boat:
   deleteWhen: archived-or-settled
   # Action on settle/archive: "delete" (permanently delete VM -> $0) | "stop" (pause VM; Boat keeps disk 14d)
   archiveAction: delete
+  # Hub, with deleteWhen archived-or-settled: a VM whose chats are all settled (not archived or deleted) is
+  # "park"ed (default: stopped, the chat stays in the sidebar, it does not count toward hub.maxSandboxes and
+  # wakes when you continue it; after 14 days Boat drops the disk and the chat stays read only) or "delete"d
+  settleAction: park
   # How often sentinel reconciles `boat list --all` to kill orphan sandboxes
   reaperIntervalSecs: 300
   # Optional safety cap in hours for sleeping sandboxes (0 = disabled)

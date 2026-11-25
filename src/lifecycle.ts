@@ -96,6 +96,9 @@ export class LifecycleManager {
     return this.boat;
   }
 
+  /** Set by the Hub: a parked VM Boat no longer lists; its chats become read only instead of vanishing. */
+  onParkedHubSandboxGone?: (sandboxId: string) => Promise<void>;
+
   /** Protect a newly created Hub VM from orphan reaping while it is still provisioning. */
   trackInFlightSandbox(sandboxId: string): void {
     this.inFlightSpawns.add(sandboxId);
@@ -784,7 +787,11 @@ export class LifecycleManager {
     for (const hubSb of this.state.listHubSandboxes()) {
       activeIds.add(hubSb.sandboxId);
       const remote = liveById.get(hubSb.sandboxId);
-      if (!remote && hubSb.phase !== "provisioning") {
+      if (!remote && hubSb.phase === "sleeping" && hubSb.parkedAt && this.onParkedHubSandboxGone) {
+        // A parked VM Boat no longer lists (its disk expired): its settled chat stays, read only
+        console.warn(`[reaper] parked hub sandbox ${hubSb.sandboxId} disappeared remotely -> its chat stays read only`);
+        await this.onParkedHubSandboxGone(hubSb.sandboxId).catch((e) => console.warn("[reaper] parked expiry failed:", e));
+      } else if (!remote && hubSb.phase !== "provisioning") {
         console.warn(`[reaper] hub sandbox ${hubSb.sandboxId} disappeared remotely -> removing`);
         if (hubSb.klavAgentName && this.klav) {
           await this.klav.revokeForSandbox(hubSb.klavAgentName).catch(() => {});
@@ -804,6 +811,8 @@ export class LifecycleManager {
         this.state.updateHubSandbox(hubSb.sandboxId, (s) => {
           s.phase = "sleeping";
           s.llmToken = null;
+          // Stopped by its own watchdog (idle backstop), not parked by the Hub
+          s.parkedAt = null;
           if (endKlav) s.klavAgentName = null;
           s.sleepingSince = remote.stoppedAt ?? new Date().toISOString();
         });

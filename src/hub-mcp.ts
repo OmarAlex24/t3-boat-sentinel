@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { authenticateClient } from "./auth.ts";
 import type { ProjectConfig, SentinelConfig } from "./config.ts";
 import { clientIpFromRequest, rateLimitedResponse, type AuthRateLimiter } from "./security.ts";
-import { buildAutoProjectConfig, type HubSandboxRecord, type StateStore } from "./state.ts";
+import { buildAutoProjectConfig, countsTowardHubLimit, type HubSandboxRecord, type StateStore } from "./state.ts";
 
 export const MCP_PROTOCOL_VERSION = "2025-06-18";
 
@@ -48,6 +48,8 @@ export interface HubMcpBridge {
   wakeSandbox: (sandboxId: string) => Promise<HubSandboxRecord>;
   destroySandbox: (sandboxId: string, reason: string) => Promise<void>;
   sleepSandbox: (sandboxId: string) => Promise<void>;
+  /** Parks a VM whose chats are all settled (see `boat.settleAction`); true when it ends parked. */
+  parkSandbox: (sandboxId: string) => Promise<boolean>;
   projectKeyFromHubId: (hubProjectId: string) => string | null;
   ensureHubProjectId: (projectKey: string) => string;
   spawnSandboxForThread: (
@@ -184,7 +186,7 @@ const MCP_TOOLS = [
   },
   {
     name: "t3_thread_organize",
-    description: "Organize a thread (settle, archive, pin, unpin, snooze, unsnooze, unsettle, unarchive, mark_unread). Settling or archiving destroys the ephemeral VM for $0/hr idle.",
+    description: "Organize a thread (settle, archive, pin, unpin, snooze, unsnooze, unsettle, unarchive, mark_unread). Archiving destroys the chat's VM for $0/hr idle; settling stops (parks) it and keeps the chat, unless boat.settleAction is delete.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1116,8 +1118,7 @@ export class HubMcpHandler {
 
     // 3. Validate capacity up front before returning
     const maxSandboxes = this.config.hub?.maxSandboxes ?? 10;
-    const activeCount =
-      this.state.listHubSandboxes().filter((s) => s.phase !== "destroying").length + this.countBootingLaunches();
+    const activeCount = this.state.listHubSandboxes().filter(countsTowardHubLimit).length + this.countBootingLaunches();
     if (activeCount >= maxSandboxes) {
       throw new HubMcpToolError(
         "capacity_exceeded",
@@ -1442,7 +1443,12 @@ export class HubMcpHandler {
     }
 
     let sandboxDestroyed = false;
-    if (isDestructiveCleanup) {
+    let sandboxParked = false;
+    const parksOnSettle = this.config.boat.settleAction === "park" && this.config.boat.deleteWhen === "archived-or-settled";
+    if (action === "settle" && parksOnSettle) {
+      // Like a settle in the app: the chat stays, its VM is parked
+      sandboxParked = await this.bridge.parkSandbox(sb.sandboxId);
+    } else if (isDestructiveCleanup) {
       if (this.config.boat.archiveAction === "stop") {
         await this.bridge.sleepSandbox(sb.sandboxId);
       } else {
@@ -1451,7 +1457,7 @@ export class HubMcpHandler {
       }
     }
 
-    return { ok: true, threadId, action, sandboxDestroyed };
+    return { ok: true, threadId, action, sandboxDestroyed, ...(sandboxParked ? { sandboxParked } : {}) };
   }
 
   private async toolListThreadPullRequests(args: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -1664,13 +1670,15 @@ export class HubMcpHandler {
       label: hub.label,
       provider: this.bridge.providerName(),
       maxSandboxes: this.config.hub?.maxSandboxes ?? 10,
-      activeSandboxes: sandboxes.filter((s) => s.phase !== "destroying").length,
+      activeSandboxes: sandboxes.filter(countsTowardHubLimit).length,
+      parkedSandboxes: sandboxes.filter((s) => s.phase === "sleeping" && s.parkedAt).length,
       bootingLaunches: this.countBootingLaunches(),
       sandboxes: sandboxes.map((s) => ({
         sandboxId: s.sandboxId,
         project: s.project,
         phase: s.phase,
         threadIds: s.threadIds,
+        parkedAt: s.parkedAt ?? null,
         createdAt: s.createdAt,
         lastHeartbeatAt: s.lastHeartbeatAt,
       })),

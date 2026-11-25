@@ -52,6 +52,7 @@ export function createSentinelServer(
 
   if (opts.startBackgroundLoops !== false) {
     lifecycle.startBackgroundLoops();
+    hub?.startBackgroundLoops();
   }
 
   const slotWs = proxy.wsHandlers();
