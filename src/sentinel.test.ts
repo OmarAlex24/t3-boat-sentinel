@@ -38,9 +38,15 @@ class MockBoat implements BoatClient {
   execScripts: string[] = [];
   upstreamBaseUrl: string | null = null;
   onBeforeBakeStop?: (tempId: string) => Promise<void>;
+  /** While set, `create` waits on it (a VM that is still booting). */
+  createGate: Promise<void> | null = null;
+  /** When set, `create` fails with it. */
+  createError: Error | null = null;
   private seq = 1;
 
   async create(name: string, size: string, fromSnapshot?: string): Promise<string> {
+    if (this.createGate) await this.createGate;
+    if (this.createError) throw this.createError;
     const id = `sb-${this.seq++}`;
     this.created.push({ name, size, from: fromSnapshot });
     this.sandboxes.set(id, { id, name, state: "running", stoppedAt: null });
@@ -889,6 +895,8 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       refreshProviders?: unknown[];
       /** Apply `server.updateSettings` to `configSnapshot.settings` and answer with the result, like T3. */
       applySettings?: boolean;
+      /** Fail `orchestration.launchThread` with this message. */
+      rejectLaunch?: string;
     } = {},
   ) {
     let vmSettings = (opts.configSnapshot?.settings ?? null) as Record<string, unknown> | null;
@@ -1022,6 +1030,16 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
             );
             return;
           }
+          if (frame.tag === "orchestration.launchThread" && opts.rejectLaunch) {
+            ws.sendText(
+              JSON.stringify({
+                _tag: "Exit",
+                requestId: frame.id,
+                exit: { _tag: "Failure", cause: [{ _tag: "Die", defect: opts.rejectLaunch }] },
+              }),
+            );
+            return;
+          }
           if (frame.tag === "orchestration.launchThread") {
             const p = frame.payload ?? {};
             const threadId = String(p.threadId);
@@ -1142,7 +1160,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     };
     const request = (id: string | number, tag: string, payload: unknown = {}) =>
       ws.send(JSON.stringify({ _tag: "Request", id, tag, payload, headers: [] }));
-    return { ws, inbox, waitForFrame, request };
+    return { ws, inbox, waitForFrame, request, bearer, base };
   }
 
   type ProviderStub = { instanceId: string; installed?: boolean };
@@ -1159,7 +1177,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
   async function startHubWithVm(
     vm: ReturnType<typeof startFakeVmT3Server>,
     dirPrefix: string,
-    opts: { persistProviderSessions?: string[]; beforeStart?: (dir: string) => void } = {},
+    opts: { persistProviderSessions?: string[]; beforeStart?: (dir: string) => void; maxSandboxes?: number } = {},
   ) {
     const dir = mkdtempSync(join(tmpdir(), dirPrefix));
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
@@ -1172,7 +1190,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       ...base,
       stateDir: dir,
       t3: { ...base.t3, ...(opts.persistProviderSessions ? { persistProviderSessions: opts.persistProviderSessions } : {}) },
-      hub: { host: "boat.boat.example.com", label: "Boat", maxSandboxes: 5 },
+      hub: { host: "boat.boat.example.com", label: "Boat", maxSandboxes: opts.maxSandboxes ?? 5 },
     };
     opts.beforeStart?.(dir);
     const handle = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
@@ -1181,23 +1199,340 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     return { cfg, handle, boat, dir };
   }
 
-  async function launchThreadOnHub(client: Awaited<ReturnType<typeof connectHubClient>>, threadId: string) {
+  /** Opens the client's shell stream ("shell") and returns the Hub project id. */
+  async function subscribeHubShell(client: Awaited<ReturnType<typeof connectHubClient>>): Promise<string> {
     client.request("shell", "orchestration.subscribeShell");
     const shellSnap = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "shell");
-    const hubProjectId = String(
+    return String(
       (((shellSnap.values as Array<Record<string, unknown>>)[0].snapshot as Record<string, unknown>).projects as Array<
         Record<string, unknown>
       >)[0].id,
     );
-    client.request(`launch-${threadId}`, "orchestration.launchThread", {
+  }
+
+  /** An `orchestration.launchThread` payload shaped like the T3 app's first send in a new chat. */
+  function clientLaunchPayload(threadId: string, projectId: string, text = "Hello", title = "Providers") {
+    return {
+      commandId: `cmd-${threadId}`,
+      creationSource: "web",
       threadId,
-      projectId: hubProjectId,
-      title: "Providers",
+      projectId,
+      title,
+      generateTitle: true,
+      modelSelection: { instanceId: "claudeAgent", model: "claude-opus-5-5" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
       workspaceStrategy: { type: "root" },
-    });
+      initialMessage: { messageId: `msg-${threadId}`, text, attachments: [] },
+    };
+  }
+
+  /** A shell chunk on the client's "shell" stream carrying `thread.updated` for this thread. */
+  const shellThreadUpdate =
+    (threadId: string, pred: (thread: Record<string, unknown>) => boolean = () => true) =>
+    (f: Record<string, unknown>) =>
+      f._tag === "Chunk" &&
+      f.requestId === "shell" &&
+      (f.values as Array<{ kind?: string; thread?: Record<string, unknown> }>)?.some(
+        (v) => v.kind === "thread.updated" && v.thread?.id === threadId && pred(v.thread),
+      );
+
+  /** Launches a chat like the app does and waits until the thread exists on its VM. */
+  async function launchThreadOnHub(client: Awaited<ReturnType<typeof connectHubClient>>, threadId: string) {
+    const hubProjectId = await subscribeHubShell(client);
+    client.request(`launch-${threadId}`, "orchestration.launchThread", clientLaunchPayload(threadId, hubProjectId));
     const exit = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === `launch-${threadId}`);
     expect((exit.exit as Record<string, unknown>)._tag).toBe("Success");
+    // The Hub answers at once; the VM's own shell update says the thread exists there
+    await client.waitForFrame(shellThreadUpdate(threadId, (t) => t.status === "running"));
   }
+
+  describe("new chats open at once while their VM boots", () => {
+    type HubClient = Awaited<ReturnType<typeof connectHubClient>>;
+    const exitOf = (f: Record<string, unknown>) =>
+      f.exit as { _tag: string; value?: Record<string, unknown>; cause?: unknown };
+    const until = async (cond: () => boolean, timeoutMs = 5_000) => {
+      const start = Date.now();
+      while (!cond()) {
+        if (Date.now() - start > timeoutMs) throw new Error("condition not met in time");
+        await Bun.sleep(20);
+      }
+    };
+    /** A VM create that waits until `release()`. */
+    const holdCreate = (boat: MockBoat) => {
+      let release!: () => void;
+      boat.createGate = new Promise<void>((r) => (release = r));
+      return () => {
+        boat.createGate = null;
+        release();
+      };
+    };
+    const httpThreadSnapshot = (client: HubClient, cfg: SentinelConfig, threadId: string) =>
+      fetch(`${client.base}/api/orchestration/threads/${threadId}/bounded`, {
+        headers: { host: cfg.hub!.host, authorization: `Bearer ${client.bearer}` },
+      });
+
+    test("replies to launchThread at once with a placeholder chat, before the VM exists", async () => {
+      const vm = startFakeVmT3Server("vm-instant");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-instant-");
+      const release = holdCreate(boat);
+      cleanups.push(release);
+      const client = await connectHubClient(handle, cfg);
+      const hubProjectId = await subscribeHubShell(client);
+
+      const sentAt = Date.now();
+      client.request("launch", "orchestration.launchThread", clientLaunchPayload("thread-fast", hubProjectId, "Fix the flaky test"));
+      await until(() => client.inbox.some((f) => f._tag === "Exit" && f.requestId === "launch"), 2_000);
+      expect(Date.now() - sentAt).toBeLessThan(1_000);
+      // The sidebar row arrives before the reply, so the app can open the chat right away
+      const rowIdx = client.inbox.findIndex(shellThreadUpdate("thread-fast", (t) => t.status === "preparing"));
+      const exitIdx = client.inbox.findIndex((f) => f._tag === "Exit" && f.requestId === "launch");
+      expect(rowIdx).toBeGreaterThanOrEqual(0);
+      expect(rowIdx).toBeLessThan(exitIdx);
+
+      const exit = exitOf(client.inbox[exitIdx]);
+      expect(exit._tag).toBe("Success");
+      expect(exit.value!.threadId).toBe("thread-fast");
+      expect(exit.value!.resumed).toBe(false);
+      expect("sequence" in exit.value!).toBe(false);
+      const projection = exit.value!.projection as {
+        thread: { id: string; projectId: string };
+        runs: Array<{ status: string; userMessageId: string }>;
+        messages: Array<{ id: string; text: string }>;
+      };
+      expect(projection.thread).toMatchObject({ id: "thread-fast", projectId: hubProjectId });
+      expect(projection.runs).toMatchObject([{ status: "preparing", userMessageId: "msg-thread-fast" }]);
+      expect(projection.messages).toMatchObject([{ id: "msg-thread-fast", text: "Fix the flaky test" }]);
+      expect(boat.created).toHaveLength(0);
+      expect(vm.seenMethods.some((m) => m.tag === "orchestration.launchThread")).toBe(false);
+
+      // The thread view is served by the Hub until the VM is up
+      client.request("sub", "orchestration.subscribeThread", { threadId: "thread-fast", requestCompletionMarker: true });
+      const sub = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "sub");
+      const [snap, synced] = sub.values as Array<{ kind: string; snapshotSequence?: number; projection?: unknown }>;
+      expect(snap).toMatchObject({ kind: "snapshot", snapshotSequence: 0, projection: { thread: { id: "thread-fast" } } });
+      expect(synced.kind).toBe("synchronized");
+      // HTTP snapshots answer 503, never another VM's 404 (the app would mark the chat deleted)
+      expect((await httpThreadSnapshot(client, cfg, "thread-fast")).status).toBe(503);
+      // A re-sent launch (the app re-sends after a socket loss) gets the same chat, no second VM
+      client.request("launch-again", "orchestration.launchThread", clientLaunchPayload("thread-fast", hubProjectId, "Fix the flaky test"));
+      const again = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "launch-again");
+      expect(exitOf(again).value!.threadId).toBe("thread-fast");
+      // A new subscriber (another window, or after a reconnect) sees the chat in the shell snapshot
+      client.request("shell-2", "orchestration.subscribeShell");
+      const shell2 = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "shell-2");
+      const threads = ((shell2.values as Array<{ snapshot: { threads: Array<{ id: string }> } }>)[0].snapshot.threads);
+      expect(threads.map((t) => t.id)).toContain("thread-fast");
+
+      release();
+      await client.waitForFrame(shellThreadUpdate("thread-fast", (t) => t.status === "running"));
+      expect(boat.created).toHaveLength(1);
+      expect(handle.state.getHub()!.pendingLaunches).toBeUndefined();
+    });
+
+    test("delivers the first message and messages sent while booting once the VM is ready", async () => {
+      const vm = startFakeVmT3Server("vm-queue");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-queue-");
+      const release = holdCreate(boat);
+      cleanups.push(release);
+      const client = await connectHubClient(handle, cfg);
+      const hubProjectId = await subscribeHubShell(client);
+
+      client.request("setup", "subscribeWorktreeSetup", { threadId: "thread-q" });
+      client.request("launch", "orchestration.launchThread", clientLaunchPayload("thread-q", hubProjectId, "Write the migration"));
+      expect(exitOf(await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "launch"))._tag).toBe("Success");
+      // The client holds the placeholder (sequence 0) and subscribes with that cursor
+      client.request("sub", "orchestration.subscribeThread", { threadId: "thread-q", afterSequence: 0 });
+      await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "sub");
+      client.request("msg-2", "orchestration.dispatchCommand", {
+        type: "message.dispatch",
+        commandId: "cmd-2",
+        threadId: "thread-q",
+        messageId: "msg-2",
+        text: "Also add a test",
+        attachments: [],
+      });
+      await Bun.sleep(100);
+      // Held, not failed, while the VM boots
+      expect(client.inbox.some((f) => f._tag === "Exit" && f.requestId === "msg-2")).toBe(false);
+
+      release();
+      const msgExit = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "msg-2");
+      expect(exitOf(msgExit)._tag).toBe("Success");
+      await client.waitForFrame(shellThreadUpdate("thread-q", (t) => t.status === "running"));
+
+      const tags = vm.seenMethods.map((m) => m.tag);
+      const launch = vm.seenMethods.find((m) => m.tag === "orchestration.launchThread")!.payload as Record<string, unknown>;
+      expect(launch).toMatchObject({
+        threadId: "thread-q",
+        projectId: vm.vmProjectId,
+        commandId: "cmd-thread-q",
+        initialMessage: { messageId: "msg-thread-q", text: "Write the migration" },
+      });
+      const queuedIdx = vm.seenMethods.findIndex(
+        (m) => m.tag === "orchestration.dispatchCommand" && (m.payload as { messageId?: string }).messageId === "msg-2",
+      );
+      expect(tags.indexOf("orchestration.launchThread")).toBeLessThan(queuedIdx);
+      // The thread stream moved to the VM without the placeholder's cursor, so it gets a full snapshot
+      await until(() => vm.seenMethods.some((m) => m.tag === "orchestration.subscribeThread"));
+      const forwardedSub = vm.seenMethods.find((m) => m.tag === "orchestration.subscribeThread")!.payload as Record<string, unknown>;
+      expect(forwardedSub.threadId).toBe("thread-q");
+      expect("afterSequence" in forwardedSub).toBe(false);
+      // The setup card finished
+      await client.waitForFrame(
+        (f) => f._tag === "Chunk" && f.requestId === "setup" && (f.values as Array<{ phase?: string }>)[0]?.phase === "done",
+      );
+      // HTTP snapshots now go to the chat's own VM
+      expect((await httpThreadSnapshot(client, cfg, "thread-q")).status).toBe(200);
+    });
+
+    test("shows a VM spawn failure in the chat instead of dropping it", async () => {
+      const vm = startFakeVmT3Server("vm-fail");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-fail-");
+      boat.createError = new Error("no capacity in region eu-1");
+      const client = await connectHubClient(handle, cfg);
+      const hubProjectId = await subscribeHubShell(client);
+
+      client.request("setup", "subscribeWorktreeSetup", { threadId: "thread-x" });
+      client.request("launch", "orchestration.launchThread", clientLaunchPayload("thread-x", hubProjectId));
+      expect(exitOf(await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "launch"))._tag).toBe("Success");
+
+      const failedRow = await client.waitForFrame(shellThreadUpdate("thread-x", (t) => t.status === "failed"));
+      const row = (failedRow.values as Array<{ thread: Record<string, unknown> }>)[0].thread;
+      expect(String(row.lastError)).toContain("no capacity in region eu-1");
+      const setupFailed = await client.waitForFrame(
+        (f) => f._tag === "Chunk" && f.requestId === "setup" && (f.values as Array<{ phase?: string }>)[0]?.phase === "failed",
+      );
+      expect(String((setupFailed.values as Array<{ error: string }>)[0].error)).toContain("no capacity in region eu-1");
+
+      // The chat stays: in the shell, in its thread view (run failed), and in state for a Hub restart
+      expect(client.inbox.some((f) => f._tag === "Chunk" && (f.values as Array<{ kind?: string } | null>)?.some((v) => v?.kind === "thread.removed"))).toBe(false);
+      client.request("sub", "orchestration.subscribeThread", { threadId: "thread-x" });
+      const sub = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "sub");
+      const projection = (sub.values as Array<{ projection: { runs: Array<{ status: string }> } }>)[0].projection;
+      expect(projection.runs[0].status).toBe("failed");
+      expect(handle.state.getHub()!.pendingLaunches!["thread-x"]).toMatchObject({ phase: "failed" });
+      // Sending to it fails with the reason
+      client.request("msg", "orchestration.dispatchCommand", {
+        type: "message.dispatch",
+        commandId: "cmd-x2",
+        threadId: "thread-x",
+        messageId: "msg-x2",
+        text: "retry?",
+        attachments: [],
+      });
+      const msgExit = exitOf(await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "msg"));
+      expect(msgExit._tag).toBe("Failure");
+      expect(JSON.stringify(msgExit.cause)).toContain("no capacity in region eu-1");
+      // Archiving the failed chat removes it
+      client.request("archive", "orchestration.dispatchCommand", { type: "thread.archive", commandId: "cmd-arch", threadId: "thread-x" });
+      expect(exitOf(await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "archive"))._tag).toBe("Success");
+      expect(handle.state.getHub()!.pendingLaunches).toBeUndefined();
+    });
+
+    test("keeps the chat and destroys the VM when the VM rejects the launch", async () => {
+      const vm = startFakeVmT3Server("vm-reject", { rejectLaunch: "workspace is not a git repository" });
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-reject-");
+      const client = await connectHubClient(handle, cfg);
+      const hubProjectId = await subscribeHubShell(client);
+
+      client.request("launch", "orchestration.launchThread", clientLaunchPayload("thread-r", hubProjectId));
+      expect(exitOf(await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "launch"))._tag).toBe("Success");
+      const failedRow = await client.waitForFrame(shellThreadUpdate("thread-r", (t) => t.status === "failed"));
+      expect(String((failedRow.values as Array<{ thread: { lastError: string } }>)[0].thread.lastError)).toContain(
+        "workspace is not a git repository",
+      );
+      await until(() => boat.deleted.length === 1);
+      expect(handle.state.listHubSandboxes()).toHaveLength(0);
+      // Destroying the VM did not remove the failed chat
+      expect(client.inbox.some((f) => f._tag === "Chunk" && (f.values as Array<{ kind?: string } | null>)?.some((v) => v?.kind === "thread.removed"))).toBe(false);
+    });
+
+    test("archiving a chat while its VM boots cancels the launch and destroys the VM", async () => {
+      const vm = startFakeVmT3Server("vm-archive");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-archive-");
+      const release = holdCreate(boat);
+      cleanups.push(release);
+      const client = await connectHubClient(handle, cfg);
+      const hubProjectId = await subscribeHubShell(client);
+
+      client.request("launch", "orchestration.launchThread", clientLaunchPayload("thread-a", hubProjectId));
+      expect(exitOf(await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "launch"))._tag).toBe("Success");
+      client.request("archive", "orchestration.dispatchCommand", { type: "thread.archive", commandId: "cmd-arch", threadId: "thread-a" });
+      expect(exitOf(await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "archive"))._tag).toBe("Success");
+      const removed = await client.waitForFrame(
+        (f) =>
+          f._tag === "Chunk" &&
+          f.requestId === "shell" &&
+          (f.values as Array<{ kind?: string; threadId?: string }>).some((v) => v.kind === "thread.removed" && v.threadId === "thread-a"),
+      );
+      expect(removed).toBeTruthy();
+      expect(handle.state.getHub()!.pendingLaunches).toBeUndefined();
+
+      release();
+      await until(() => boat.deleted.length === 1);
+      expect(boat.created).toHaveLength(1);
+      expect(vm.seenMethods.some((m) => m.tag === "orchestration.launchThread")).toBe(false);
+      expect(handle.state.listHubSandboxes()).toHaveLength(0);
+    });
+
+    test("counts booting chats toward maxSandboxes and refuses the launch over the limit", async () => {
+      const vm = startFakeVmT3Server("vm-cap");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-cap-", { maxSandboxes: 1 });
+      const release = holdCreate(boat);
+      cleanups.push(release);
+      const client = await connectHubClient(handle, cfg);
+      const hubProjectId = await subscribeHubShell(client);
+
+      client.request("launch-1", "orchestration.launchThread", clientLaunchPayload("thread-c1", hubProjectId));
+      expect(exitOf(await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "launch-1"))._tag).toBe("Success");
+      client.request("launch-2", "orchestration.launchThread", clientLaunchPayload("thread-c2", hubProjectId));
+      const second = exitOf(await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "launch-2"));
+      // A failed request lets the app restore the draft; no row was added for it
+      expect(second._tag).toBe("Failure");
+      expect(JSON.stringify(second.cause)).toContain("Hub sandbox limit reached (1/1)");
+      expect(client.inbox.some(shellThreadUpdate("thread-c2"))).toBe(false);
+      release();
+      await client.waitForFrame(shellThreadUpdate("thread-c1", (t) => t.status === "running"));
+    });
+
+    test("a Hub restart while a VM boots resumes the launch", async () => {
+      const vm = startFakeVmT3Server("vm-restart");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-restart-");
+      holdCreate(boat); // this VM never finishes: the Hub goes down first
+      const client = await connectHubClient(handle, cfg);
+      const hubProjectId = await subscribeHubShell(client);
+      client.request("launch", "orchestration.launchThread", clientLaunchPayload("thread-s", hubProjectId, "Survive restarts"));
+      expect(exitOf(await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "launch"))._tag).toBe("Success");
+      expect(handle.state.getHub()!.pendingLaunches!["thread-s"]).toMatchObject({ phase: "booting" });
+      handle.stop();
+
+      const boat2 = new MockBoat();
+      boat2.snapshots.add("base-t3");
+      boat2.snapshots.add("env-my-app");
+      boat2.upstreamBaseUrl = vm.url;
+      const handle2 = createSentinelServer(cfg, boat2, { startBackgroundLoops: false });
+      cleanups.push(() => handle2.stop());
+      const client2 = await connectHubClient(handle2, cfg);
+      // Restored in the shell, then started on a fresh VM with the original first message
+      await until(() => vm.seenMethods.some((m) => m.tag === "orchestration.launchThread"));
+      const launch = vm.seenMethods.find((m) => m.tag === "orchestration.launchThread")!.payload as Record<string, unknown>;
+      expect(launch).toMatchObject({ threadId: "thread-s", initialMessage: { text: "Survive restarts" } });
+      expect(boat2.created).toHaveLength(1);
+      await until(() => handle2.state.getHub()!.pendingLaunches === undefined);
+      client2.request("shell", "orchestration.subscribeShell");
+      const shell = await client2.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "shell");
+      const threads = (shell.values as Array<{ snapshot: { threads: Array<{ id: string }> } }>)[0].snapshot.threads;
+      expect(threads.map((t) => t.id)).toContain("thread-s");
+    });
+  });
 
   test("follows live providerStatuses from a VM after its stale boot snapshot and pushes them to clients", async () => {
     const staleSnapshot = {
