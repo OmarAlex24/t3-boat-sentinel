@@ -184,6 +184,22 @@ describe("CelestoProvider", () => {
     expect(keyless.registryEntries()).toEqual([]);
   });
 
+  test("create prepares /home/user for the run user as root, and deletes the computer if that fails", async () => {
+    const { fake, provider } = setup();
+    const id = await provider.create({ name: "t3s-hub-home-1", size: "default" });
+    const execs = fake.execCommands();
+    expect(execs).toEqual(["mkdir -p /home/user && chown ohm: /home/user && chmod 755 /home/user"]);
+    // Sent raw (as root), not wrapped in sudo -u ohm
+    expect(execs[0]).not.toContain("sudo");
+    expect(provider.registryEntries().map((e) => e.id)).toEqual([id]);
+
+    fake.execHandler = () => ({ exit_code: 1, stderr: "chown: invalid user" });
+    await expect(provider.create({ name: "t3s-hub-home-2", size: "default" })).rejects.toThrow(/chown: invalid user/);
+    const failedId = fake.calls.filter((c) => c.method === "DELETE").map((c) => c.path);
+    expect(failedId).toHaveLength(1);
+    expect(failedId[0]).not.toContain(id);
+  });
+
   test("create sends Idempotency-Key + size_id and never cpus or RAM, then waits for running", async () => {
     const { fake, provider } = setup();
     const id = await provider.create({ name: "t3s-hub-abc-1", size: "default" });

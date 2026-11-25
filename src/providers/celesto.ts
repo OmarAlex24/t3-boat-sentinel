@@ -262,7 +262,22 @@ export class CelestoProvider implements SandboxProvider {
       this.creating.delete(idempotencyKey);
     }
     await this.waitForStatus(id, ["running"], 180_000, `start ${opts.name}`);
+    try {
+      await this.prepareHomeUser(id);
+    } catch (err) {
+      // The caller never learns this id, so nothing else would clean the computer up promptly
+      await this.delete(id).catch(() => {});
+      throw err;
+    }
     return id;
+  }
+
+  /**
+   * Sentinel's default workdirs (repos added from T3, Klav) live under `/home/user`, which only
+   * root can create on Celesto. Exec runs as root before `asUser` wraps it, so do it once here.
+   */
+  private async prepareHomeUser(id: string): Promise<void> {
+    await this.rootOk(id, `mkdir -p /home/user && chown ${this.user}: /home/user && chmod 755 /home/user`);
   }
 
   /** POST /computers, retrying transient failures with the SAME key, and records the id. */

@@ -35,7 +35,7 @@ hub:
 # Or run Hub chats on Celesto (celesto.ai) cloud computers. No snapshots: T3 installs at every boot.
 # Uploads (boot secrets included) travel inside Celesto exec requests, published URLs are public
 # (T3's bearer auth is the only gate) and provider sign-ins are not kept. The Free plan (nano only)
-# is too small for T3. Project workdirs must live under /home/ohm. See README "Celesto".
+# is too small for T3. See README "Celesto".
 # provider:
 #   type: celesto
 #   apiKey: ${CELESTO_API_KEY}   # optional; falls back to the CELESTO_API_KEY environment variable

@@ -253,7 +253,7 @@ How it differs from Boat:
 - **Published URLs are public.** Celesto has no private preview, so `boat.hostVisibility` is ignored. T3's bearer auth is the only gate on each computer's URL.
 - **Pause keeps everything.** An idle chat's computer is stopped and started again on the next message. Disk, running processes and the URL survive.
 - **Sentinel only touches its own computers.** Celesto ignores computer names, so sentinel records the computers it creates in `<stateDir>/celesto-computers.json` (0600). The reaper never sees or deletes your other Celesto computers. Do not delete that file while chats are running: sentinel would lose track of their computers.
-- **Home directory.** Projects run as `ohm`, so set each project's `workdir` under `/home/ohm`. Repos added from T3 default to `/home/user/<name>`, which `ohm` cannot create. Klav provisioning also assumes `/home/user` and has not been tested on Celesto.
+- **Home directory.** T3 and its agents run as `ohm` (home `/home/ohm`). When a computer starts, sentinel creates `/home/user` owned by `ohm`, so project workdirs under `/home/user` work as on Boat, including repos added from T3 (`/home/user/<name>`). Klav provisioning has not been tested on Celesto.
 - **Plan.** The Free plan only offers `nano` computers, which are too small for T3. Use a paid plan with `standard` or larger.
 
 ---
