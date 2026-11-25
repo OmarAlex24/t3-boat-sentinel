@@ -37,6 +37,16 @@ import { asSandboxProvider, type ProviderCapability, type SandboxProvider } from
 import { ProviderSessionStore } from "./provider-sessions.ts";
 import { StateStore } from "./state.ts";
 import { T3ReleaseResolver } from "./t3-release.ts";
+import { ATTACHMENT_UPLOAD_URL_TTL_MS, parseUploadRequest } from "./hub-attachments.ts";
+import { loadT3Contracts } from "./testing/t3-contracts.ts";
+
+/**
+ * The installed T3 app's own RPC schemas (`T3_APP_ASAR`, else the macOS Nightly app), or null when
+ * no app is installed (CI): contract decodes then skip, the plain assertions next to them still run.
+ */
+const t3Contracts = await loadT3Contracts();
+if (t3Contracts) console.log(`[contracts] decoding with the T3 app's schemas, version ${t3Contracts.version}`);
+else console.log("[contracts] no T3 app bundle found: contract decodes skipped");
 
 class MockBoat implements BoatClient {
   sandboxes = new Map<string, BoatSandbox>();
@@ -937,6 +947,10 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     } = {},
   ) {
     let assetSeq = 0;
+    let uploadSeq = 0;
+    /** Upload URLs this VM issued, and the bytes clients (the Hub) posted to them. */
+    const uploadUrls = new Map<string, { attachmentId: string; payload: Record<string, unknown> }>();
+    const uploads: Array<{ attachmentId: string; payload: Record<string, unknown>; contentType: string | null; bytes: Uint8Array }> = [];
     let vmSettings = (opts.configSnapshot?.settings ?? null) as Record<string, unknown> | null;
     const seenMethods: Array<{ tag: string; payload: unknown }> = [];
     const acks: string[] = [];
@@ -955,6 +969,14 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
           return Response.json({
             projects: [{ id: vmProjectId, title: "my-app", workspaceRoot: "/home/user/my-app" }],
             threads: [],
+          });
+        }
+        if (req.method === "POST" && url.pathname.startsWith("/api/attachments/upload/")) {
+          const issued = uploadUrls.get(url.pathname.slice("/api/attachments/upload/".length));
+          if (!issued) return new Response("Not Found", { status: 404 });
+          return req.arrayBuffer().then((buf) => {
+            uploads.push({ ...issued, contentType: req.headers.get("content-type"), bytes: new Uint8Array(buf) });
+            return new Response(null, { status: 204 });
           });
         }
         return Response.json({ ok: true, vmTag });
@@ -1164,6 +1186,19 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
             ws.sendText(JSON.stringify({ _tag: "Exit", requestId: frame.id, exit }));
             return;
           }
+          if (frame.tag === "attachments.createUploadUrl") {
+            const n = ++uploadSeq;
+            const attachmentId = `vm-${vmTag}-att-${n}`;
+            uploadUrls.set(`vmtok-${n}`, { attachmentId, payload: frame.payload ?? {} });
+            ws.sendText(
+              JSON.stringify({
+                _tag: "Exit",
+                requestId: frame.id,
+                exit: { _tag: "Success", value: { attachmentId, relativeUrl: `/api/attachments/upload/vmtok-${n}`, expiresAt: Date.now() + 600_000 } },
+              }),
+            );
+            return;
+          }
           if (frame.tag === "terminal.open") {
             ws.sendText(
               JSON.stringify({
@@ -1196,6 +1231,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       vmProjectId,
       pushConfigItems,
       getSettings: () => vmSettings,
+      uploads,
     };
   }
 
@@ -1730,6 +1766,222 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
         (t) => t.id === "thread-late",
       );
       expect(row?.status).toBe("failed");
+    });
+  });
+
+  describe("attachments staged by the Hub (the app's upload flow)", () => {
+    const UPLOAD_URL_PATTERN = /^\/api\/attachments\/upload\/(?!\.{1,2}$)[\w.-]+$/;
+    type HubClient = Awaited<ReturnType<typeof connectHubClient>>;
+    const exitOf = async (client: HubClient, id: string) =>
+      (await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === id)) as Record<string, unknown> & {
+        exit: { _tag: string; value?: any; cause?: any };
+      };
+    /** Decodes a frame with the app's schema for `tag` (when the app is installed). */
+    const expectDecodes = (tag: string, frame: Record<string, unknown>) => {
+      if (t3Contracts) expect(t3Contracts.decodeFrame(tag, frame)).toEqual([{ ok: true }]);
+    };
+
+    /**
+     * One composer file, as the app sends it (attachmentUploadQueue + utils chunks): mint an upload URL,
+     * XHR `POST` the bytes with `Content-Type: <mimeType>` (any 2xx is success), then check the upload
+     * with `assets.createUrl({ _tag: "attachment" })` before sending the message.
+     */
+    async function uploadLikeTheApp(
+      client: HubClient,
+      cfg: SentinelConfig,
+      key: string,
+      input: { type?: "image" | "file"; name: string; mimeType: string },
+      bytes: Uint8Array<ArrayBuffer>,
+    ): Promise<string> {
+      const before = Date.now();
+      client.request(`mint-${key}`, "attachments.createUploadUrl", { ...input, sizeBytes: bytes.byteLength });
+      const mint = await exitOf(client, `mint-${key}`);
+      expect(mint.exit._tag).toBe("Success");
+      expectDecodes("attachments.createUploadUrl", mint);
+      const { attachmentId, relativeUrl, expiresAt } = mint.exit.value as { attachmentId: string; relativeUrl: string; expiresAt: number };
+      expect(relativeUrl).toMatch(UPLOAD_URL_PATTERN);
+      expect(expiresAt).toBeGreaterThanOrEqual(before + ATTACHMENT_UPLOAD_URL_TTL_MS);
+      expect(expiresAt).toBeLessThanOrEqual(Date.now() + ATTACHMENT_UPLOAD_URL_TTL_MS);
+
+      const posted = await fetch(`${client.base}${relativeUrl}`, {
+        method: "POST",
+        headers: { host: cfg.hub!.host, "content-type": input.mimeType },
+        body: bytes,
+      });
+      expect(posted.status).toBe(204);
+
+      client.request(`verify-${key}`, "assets.createUrl", { resource: { _tag: "attachment", attachmentId } });
+      const verify = await exitOf(client, `verify-${key}`);
+      expect(verify.exit._tag).toBe("Success");
+      expectDecodes("assets.createUrl", verify);
+      const asset = await fetch(`${client.base}${(verify.exit.value as { relativeUrl: string }).relativeUrl}`, { headers: { host: cfg.hub!.host } });
+      expect(asset.headers.get("content-type")).toBe(input.mimeType);
+      expect(new Uint8Array(await asset.arrayBuffer())).toEqual(bytes);
+      return attachmentId;
+    }
+
+    test("the upload URL result decodes with the app's contract; ids, names and the upload route follow T3", async () => {
+      if (t3Contracts) {
+        expect(t3Contracts.exported("ATTACHMENT_UPLOAD_URL_TTL_MS")).toBe(ATTACHMENT_UPLOAD_URL_TTL_MS);
+        // The answer the Hub gave before this fix: rejected by the app, hence "failed to upload"
+        const old = { attachmentId: "att_1", relativeUrl: "/api/attachments/upload/tok", uploadUrl: "https://boat.example.com/api/attachments/upload/tok" };
+        expect(t3Contracts.decodeSuccess("attachments.createUploadUrl", old).error).toContain("expiresAt");
+      }
+      // T3's input rules: type defaults to image; a file that is an SVG is stored with a .svg name
+      expect(parseUploadRequest({ name: "image.png", mimeType: "image/png", sizeBytes: 3 })).toMatchObject({ type: "image", name: "image.png" });
+      expect(parseUploadRequest({ type: "file", name: "diagram", mimeType: "image/svg+xml", sizeBytes: 3 })?.name).toBe("diagram.svg");
+      expect(parseUploadRequest({ type: "file", name: "logo", mimeType: "application/octet-stream", sizeBytes: 3 })?.name).toBe("logo");
+      expect(parseUploadRequest({ type: "video", name: "a", mimeType: "x/y", sizeBytes: 3 })).toBeNull();
+      expect(parseUploadRequest({ name: "a.png", mimeType: "image/png", sizeBytes: 0 })).toBeNull();
+
+      const vm = startFakeVmT3Server("vm1");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle } = await startHubWithVm(vm, "t3-sentinel-hub-att-contract-");
+      const client = await connectHubClient(handle, cfg);
+      const mint = async (key: string, payload: Record<string, unknown>) => {
+        client.request(key, "attachments.createUploadUrl", payload);
+        const frame = await exitOf(client, key);
+        expectDecodes("attachments.createUploadUrl", frame);
+        return frame.exit;
+      };
+      expect((await mint("img", { name: "image.png", mimeType: "image/png", sizeBytes: 4 })).value.attachmentId).toMatch(
+        /^pending-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+      );
+      expect((await mint("pdf", { type: "file", name: "report.pdf", mimeType: "application/pdf", sizeBytes: 4 })).value.attachmentId).toEndWith("-pdf");
+      expect((await mint("svg", { type: "file", name: "diagram", mimeType: "image/svg+xml", sizeBytes: 4 })).value.attachmentId).toEndWith("-svg");
+      expect((await mint("bin", { type: "file", name: "Makefile", mimeType: "text/plain", sizeBytes: 4 })).value.attachmentId).toEndWith("-bin");
+      // A payload T3's schema rejects gets a defect, like T3
+      const bad = await mint("bad", { type: "file", name: "", mimeType: "text/plain", sizeBytes: 4 });
+      expect(bad.cause[0]._tag).toBe("Die");
+
+      // The upload route answers like T3's: 400 for a size that differs, 204 once, then 404
+      const url = (await mint("once", { name: "image.png", mimeType: "image/png", sizeBytes: 4 })).value.relativeUrl as string;
+      const post = (body: Uint8Array<ArrayBuffer>) =>
+        fetch(`${client.base}${url}`, { method: "POST", headers: { host: cfg.hub!.host, "content-type": "image/png" }, body });
+      expect((await post(new Uint8Array(3))).status).toBe(400);
+      expect((await post(new Uint8Array(4))).status).toBe(204);
+      expect((await post(new Uint8Array(4))).status).toBe(404);
+
+      // Removing a staged upload from the composer drops it on the Hub (void success is null on the wire)
+      const discard = (await mint("discard", { name: "image.png", mimeType: "image/png", sizeBytes: 4 })).value;
+      client.request("del", "attachments.delete", { attachmentId: discard.attachmentId });
+      const del = await exitOf(client, "del");
+      expect(del.exit).toEqual({ _tag: "Success", value: null });
+      expectDecodes("attachments.delete", del);
+      const late = await fetch(`${client.base}${discard.relativeUrl}`, { method: "POST", headers: { host: cfg.hub!.host }, body: new Uint8Array(4) });
+      expect(late.status).toBe(404);
+      // An upload that never finished is not there yet
+      client.request("unfinished", "assets.createUrl", { resource: { _tag: "attachment", attachmentId: (await mint("u", { name: "a.png", mimeType: "image/png", sizeBytes: 4 })).value.attachmentId } });
+      const unfinished = await exitOf(client, "unfinished");
+      expect(unfinished.exit.cause[0].error._tag).toBe("AssetAttachmentNotFoundError");
+      expectDecodes("assets.createUrl", unfinished);
+    });
+
+    test("an image in a new chat and a file in a later message reach the chat's VM with their type, bytes and the VM's ids", async () => {
+      const vm = startFakeVmT3Server("vm1");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle } = await startHubWithVm(vm, "t3-sentinel-hub-att-e2e-");
+      const client = await connectHubClient(handle, cfg);
+      const hubProjectId = await subscribeHubShell(client);
+
+      // 1. An image attached to the first message of a new chat, uploaded before any VM exists
+      const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+      const imageId = await uploadLikeTheApp(client, cfg, "img", { name: "image.png", mimeType: "image/png" }, png);
+      const image = { type: "image", id: imageId, name: "image.png", mimeType: "image/png", sizeBytes: png.byteLength };
+      const launch = clientLaunchPayload("thread-att", hubProjectId, "What is in this image?");
+      launch.initialMessage.attachments = [image] as never[];
+      if (t3Contracts) expect(t3Contracts.decodePayload("orchestration.launchThread", launch)).toEqual({ ok: true });
+      client.request("launch", "orchestration.launchThread", launch);
+      expect((await exitOf(client, "launch")).exit._tag).toBe("Success");
+      await client.waitForFrame(shellThreadUpdate("thread-att", (t) => t.status === "running"));
+
+      expect(vm.uploads).toHaveLength(1);
+      expect(vm.uploads[0]).toMatchObject({ attachmentId: "vm-vm1-att-1", contentType: "image/png", bytes: png });
+      expect(vm.uploads[0].payload).toEqual({ name: "image.png", mimeType: "image/png", sizeBytes: png.byteLength });
+      const vmLaunch = vm.seenMethods.find((m) => m.tag === "orchestration.launchThread")!.payload as typeof launch;
+      expect(vmLaunch.initialMessage.attachments).toEqual([{ ...image, id: "vm-vm1-att-1" }] as never[]);
+
+      // 2. A file attached to a later message in the same chat
+      const pdf = new TextEncoder().encode("%PDF-1.7 hello");
+      const fileId = await uploadLikeTheApp(client, cfg, "pdf", { type: "file", name: "report.pdf", mimeType: "application/pdf" }, pdf);
+      expect(fileId).toEndWith("-pdf");
+      const file = { type: "file", id: fileId, name: "report.pdf", mimeType: "application/pdf", sizeBytes: pdf.byteLength };
+      const command = {
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        dispatchMode: { type: "start_immediately" },
+        commandId: "cmd-file",
+        threadId: "thread-att",
+        messageId: "msg-file",
+        text: "And this report?",
+        attachments: [file],
+      };
+      if (t3Contracts) expect(t3Contracts.decodePayload("orchestration.dispatchCommand", command)).toEqual({ ok: true });
+      client.request("send-file", "orchestration.dispatchCommand", command);
+      const sent = await exitOf(client, "send-file");
+      expect(sent.exit._tag).toBe("Success");
+      expectDecodes("orchestration.dispatchCommand", sent);
+
+      expect(vm.uploads).toHaveLength(2);
+      // `type: "file"` reaches the VM, so it stores a file (an image-only request would be rejected)
+      expect(vm.uploads[1].payload).toEqual({ type: "file", name: "report.pdf", mimeType: "application/pdf", sizeBytes: pdf.byteLength });
+      expect(vm.uploads[1]).toMatchObject({ attachmentId: "vm-vm1-att-2", contentType: "application/pdf", bytes: pdf });
+      const vmDispatch = vm.seenMethods.filter((m) => m.tag === "orchestration.dispatchCommand").at(-1)!.payload as typeof command;
+      expect(vmDispatch.attachments).toEqual([{ ...file, id: "vm-vm1-att-2" }]);
+
+      // 3. A VM that rejects the bytes fails the send with the reason, instead of passing an id the VM lacks
+      const again = await uploadLikeTheApp(client, cfg, "again", { type: "file", name: "notes.txt", mimeType: "text/plain" }, new TextEncoder().encode("hi"));
+      vm.uploads.length = 0;
+      const realFetch = globalThis.fetch;
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) =>
+        String(input).includes("/api/attachments/upload/vmtok-") ? new Response("nope", { status: 400 }) : realFetch(input, init)) as typeof fetch;
+      try {
+        client.request("send-bad", "orchestration.dispatchCommand", {
+          ...command,
+          commandId: "cmd-bad",
+          messageId: "msg-bad",
+          attachments: [{ type: "file", id: again, name: "notes.txt", mimeType: "text/plain", sizeBytes: 2 }],
+        });
+        const failed = await exitOf(client, "send-bad");
+        expect(failed.exit.cause[0].error).toMatchObject({ _tag: "OrchestrationV2DispatchCommandError", commandId: "cmd-bad" });
+        expect(failed.exit.cause[0].error.message).toContain("Attachment 'notes.txt' could not be sent to the chat's VM");
+        expectDecodes("orchestration.dispatchCommand", failed);
+      } finally {
+        globalThis.fetch = realFetch;
+      }
+    });
+
+    test("the app's delete right after sending to a new chat does not drop an upload its booting VM still needs", async () => {
+      const vm = startFakeVmT3Server("vm1");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-att-pinned-");
+      const client = await connectHubClient(handle, cfg);
+      const hubProjectId = await subscribeHubShell(client);
+      const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 9, 9]);
+      const imageId = await uploadLikeTheApp(client, cfg, "img", { name: "image.png", mimeType: "image/png" }, png);
+
+      let release!: () => void;
+      boat.createGate = new Promise<void>((r) => (release = r));
+      cleanups.push(() => release());
+      const launch = clientLaunchPayload("thread-pin", hubProjectId, "Look");
+      launch.initialMessage.attachments = [{ type: "image", id: imageId, name: "image.png", mimeType: "image/png", sizeBytes: png.byteLength }] as never[];
+      client.request("launch", "orchestration.launchThread", launch);
+      expect((await exitOf(client, "launch")).exit._tag).toBe("Success");
+      // What the app does once the send succeeded (attachmentUploadQueue: release the composer's uploads)
+      client.request("del", "attachments.delete", { attachmentId: imageId });
+      expect((await exitOf(client, "del")).exit).toEqual({ _tag: "Success", value: null });
+
+      boat.createGate = null;
+      release();
+      await client.waitForFrame(shellThreadUpdate("thread-pin", (t) => t.status === "running"));
+      expect(vm.uploads).toHaveLength(1);
+      expect(vm.uploads[0].bytes).toEqual(png);
+      const vmLaunch = vm.seenMethods.find((m) => m.tag === "orchestration.launchThread")!.payload as typeof launch;
+      expect((vmLaunch.initialMessage.attachments[0] as { id: string }).id).toBe("vm-vm1-att-1");
+      // Sent, so it is gone from the Hub now
+      client.request("gone", "assets.createUrl", { resource: { _tag: "attachment", attachmentId: imageId } });
+      expect((await exitOf(client, "gone")).exit._tag).toBe("Failure");
     });
   });
 

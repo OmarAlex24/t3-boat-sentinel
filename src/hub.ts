@@ -28,6 +28,16 @@ import {
 import type { ProjectConfig, ProjectKlavConfig, SentinelConfig } from "./config.ts";
 import { HubMcpHandler, formatRpcFailure, type HubSandboxPhase } from "./hub-mcp.ts";
 import {
+  ATTACHMENT_UPLOAD_ROUTE_PREFIX,
+  ATTACHMENT_UPLOAD_URL_TTL_MS,
+  STAGED_ATTACHMENT_MAX_AGE_MS,
+  parseUploadRequest,
+  replayUploadRequest,
+  stagedAssetHeaders,
+  stagedAttachmentId,
+  type StagedAttachment,
+} from "./hub-attachments.ts";
+import {
   buildPlaceholderThread,
   failPlaceholderThread,
   placeholderInputFrom,
@@ -156,15 +166,6 @@ const BOOKKEEPING_COMMANDS = new Set([
   "thread.active.reorder",
   "thread.tag.set",
 ]);
-
-interface StagedAttachment {
-  id: string;
-  name: string;
-  mimeType: string;
-  sizeBytes: number;
-  bytes: Uint8Array | null;
-  createdAt: number;
-}
 
 const HOP_BY_HOP = new Set([
   "connection",
@@ -761,6 +762,13 @@ export class HubServer {
   private readonly urlTokenToSandbox = new Map<string, string>();
   private readonly stagedAttachments = new Map<string, StagedAttachment>();
   private readonly stagedUploadTokens = new Map<string, string>(); // uploadToken -> attachmentId
+  /** Asset URL tokens the Hub signed for a staged upload (the client checks an upload before sending) -> attachment id. */
+  private readonly stagedAssetTokens = new Map<string, string>();
+  /**
+   * Staged uploads a chat answered before its VM is up still has to send. The app deletes its uploads
+   * right after a send succeeds, which for such a chat is before the Hub replays them into the VM.
+   */
+  private readonly pinnedStagedAttachments = new Set<string>();
   /** Attachment ids a VM issued when the Hub replayed a staged upload into it -> that VM. */
   private readonly attachmentToSandbox = new Map<string, string>();
   private readonly worktreeSetupSnapshots = new Map<string, WorktreeSetupSnapshotState>();
@@ -1321,16 +1329,10 @@ export class HubServer {
     }
 
     // 7. Attachment upload route (staged locally if pre-spawn, else proxied to owning VM)
-    if (req.method === "POST" && path.startsWith("/api/attachments/upload/")) {
-      const uploadToken = path.slice("/api/attachments/upload/".length);
+    if (req.method === "POST" && path.startsWith(ATTACHMENT_UPLOAD_ROUTE_PREFIX)) {
+      const uploadToken = path.slice(ATTACHMENT_UPLOAD_ROUTE_PREFIX.length);
       const stagedId = this.stagedUploadTokens.get(uploadToken);
-      if (stagedId) {
-        const entry = this.stagedAttachments.get(stagedId);
-        if (!entry) return withCors(new Response("Not Found", { status: 404 }));
-        entry.bytes = new Uint8Array(await req.arrayBuffer());
-        this.stagedUploadTokens.delete(uploadToken);
-        return withCors(new Response(null, { status: 204 }));
-      }
+      if (stagedId) return withCors(await this.receiveStagedUpload(req, uploadToken, stagedId));
       const sandboxId = this.urlTokenToSandbox.get(uploadToken);
       const sb = sandboxId ? this.state.getHubSandbox(sandboxId) : undefined;
       if (sb && sb.phase === "running") {
@@ -1343,6 +1345,12 @@ export class HubServer {
     if ((req.method === "GET" || req.method === "HEAD") && path.startsWith("/api/assets/")) {
       const suffix = path.slice("/api/assets/".length);
       const token = suffix.split("/")[0] ?? "";
+      const stagedAssetId = this.stagedAssetTokens.get(token);
+      if (stagedAssetId) {
+        const staged = this.stagedAttachments.get(stagedAssetId);
+        if (!staged?.bytes) return withCors(new Response("Not Found", { status: 404 }));
+        return withCors(new Response(req.method === "HEAD" ? null : Buffer.from(staged.bytes), { headers: stagedAssetHeaders(staged) }));
+      }
       const sandboxId = this.urlTokenToSandbox.get(token);
       const sb = sandboxId ? this.state.getHubSandbox(sandboxId) : this.anyRunningSandbox();
       if (sb && sb.phase === "running") {
@@ -1678,25 +1686,31 @@ export class HubServer {
 
     // 2. Attachment upload URL creation (stage locally if no VM is targeted yet)
     if (tag === "attachments.createUploadUrl") {
-      const p = (payload ?? {}) as { name?: string; mimeType?: string; sizeBytes?: number };
-      const id = `att_${randomUUID().replace(/-/g, "")}`;
+      const upload = parseUploadRequest(payload);
+      if (!upload) {
+        // A T3 server rejects a payload its schema does not accept with a defect
+        sendRpcExitFailure(ws, reqId, "Invalid attachments.createUploadUrl payload");
+        return;
+      }
+      this.sweepStagedAttachments();
+      const now = Date.now();
+      const id = stagedAttachmentId(upload.type, upload.name);
       const uploadToken = randomToken(24);
-      this.stagedAttachments.set(id, {
-        id,
-        name: p.name ?? "attachment",
-        mimeType: p.mimeType ?? "application/octet-stream",
-        sizeBytes: Number(p.sizeBytes ?? 0),
-        bytes: null,
-        createdAt: Date.now(),
-      });
+      const expiresAt = now + ATTACHMENT_UPLOAD_URL_TTL_MS;
+      this.stagedAttachments.set(id, { id, ...upload, bytes: null, createdAt: now, expiresAt });
       this.stagedUploadTokens.set(uploadToken, id);
-      const relativeUrl = `/api/attachments/upload/${uploadToken}`;
-      sendRpcExitSuccess(ws, reqId, {
-        attachmentId: id,
-        relativeUrl,
-        uploadUrl: `https://${this.config.hub!.host}${relativeUrl}`,
-      });
+      sendRpcExitSuccess(ws, reqId, { attachmentId: id, relativeUrl: `${ATTACHMENT_UPLOAD_ROUTE_PREFIX}${uploadToken}`, expiresAt });
       return;
+    }
+    if (tag === "attachments.delete") {
+      // A staged upload is the Hub's own: drop it here (the client discards drafts this way)
+      const attachmentId = String((payload as { attachmentId?: unknown } | null)?.attachmentId ?? "");
+      if (this.stagedAttachments.has(attachmentId)) {
+        // One a booting chat still has to send is kept until it reaches the VM (or the chat closes)
+        if (!this.pinnedStagedAttachments.has(attachmentId)) this.dropStagedAttachment(attachmentId);
+        sendRpcExitSuccess(ws, reqId, null);
+        return;
+      }
     }
 
     // 3. Thread launch -> SPAWN A FRESH BOAT VM PER CHAT!
@@ -1913,7 +1927,11 @@ export class HubServer {
         }
         const sb = await this.spawnSandboxForThread(projectKey, threadId);
         const bridge = await this.ensureBridgeOpen(sb);
-        const forwarded = rewriteProjectIds(payload, sb.hubProjectId, sb.vmProjectId);
+        const forwarded = await this.replayStagedAttachmentsInPayload(
+          sb,
+          bridge,
+          rewriteProjectIds(payload, sb.hubProjectId, sb.vmProjectId) as Record<string, unknown>,
+        );
         const exit = await bridge.callUnary("orchestration.dispatchCommand", forwarded, 60_000);
         if (exit._tag === "Success") {
           sendRpcExitSuccess(ws, reqId, { sequence: this.state.nextHubSequence() });
@@ -1985,6 +2003,7 @@ export class HubServer {
       createdAt: input.now,
     });
     this.persistPendingLaunch(pending.record);
+    for (const id of this.stagedIdsIn(payload)) this.pinnedStagedAttachments.add(id);
     const sequence = this.state.nextHubSequence();
     this.broadcastShellItem({ kind: "thread.updated", sequence, location: "active", thread: placeholder.shell });
     console.log(`[hub] chat ${input.threadId} answered at once; booting its VM in the background (project=${projectKey})`);
@@ -2073,7 +2092,11 @@ export class HubServer {
         });
         exit = await bridge.callUnary("orchestration.launchThread", payload, 120_000);
       } else {
-        const payload = rewriteProjectIds({ ...pending.record.payload, threadId }, sb.hubProjectId, sb.vmProjectId);
+        const payload = await this.replayStagedAttachmentsInPayload(
+          sb,
+          bridge,
+          rewriteProjectIds({ ...pending.record.payload, threadId }, sb.hubProjectId, sb.vmProjectId) as Record<string, unknown>,
+        );
         exit = await bridge.callUnary("orchestration.dispatchCommand", payload, 60_000);
       }
       if (exit._tag !== "Success") throw new Error(`The chat's VM could not start it: ${formatRpcFailure(exit.cause)}`);
@@ -2103,6 +2126,7 @@ export class HubServer {
   private cancelPendingLaunch(pending: PendingThreadLaunch, command: string): number {
     const { threadId } = pending.record;
     pending.cancelled = true;
+    for (const id of this.stagedIdsIn(pending.record.payload)) this.dropStagedAttachment(id);
     this.forgetPendingLaunch(threadId);
     this.threadShells.delete(threadId);
     this.localThreadSubs.delete(threadId);
@@ -2124,6 +2148,7 @@ export class HubServer {
   private failPendingLaunch(pending: PendingThreadLaunch, message: string, sb: HubSandboxRecord | null): void {
     const { threadId } = pending.record;
     console.error(`[hub] chat ${threadId} failed to start: ${message}`);
+    for (const id of this.stagedIdsIn(pending.record.payload)) this.dropStagedAttachment(id);
     const failed = failPlaceholderThread({ shell: pending.record.shell, projection: pending.record.projection }, message);
     pending.record = { ...pending.record, ...failed, phase: "failed", error: message };
     this.persistPendingLaunch(pending.record);
@@ -2599,6 +2624,21 @@ export class HubServer {
     attachmentId: string,
   ): Promise<void> {
     const notFound = { _tag: "AssetAttachmentNotFoundError", resource };
+    const staged = this.stagedAttachments.get(attachmentId);
+    if (staged) {
+      // The client checks a finished upload before sending it; one still staged lives on the Hub
+      if (!staged.bytes) {
+        sendRpcExitFail(ws, reqId, notFound);
+        return;
+      }
+      const token = randomToken(24);
+      this.stagedAssetTokens.set(token, attachmentId);
+      sendRpcExitSuccess(ws, reqId, {
+        relativeUrl: `/api/assets/${token}/${encodeURIComponent(staged.name)}`,
+        expiresAt: Date.now() + ATTACHMENT_UPLOAD_URL_TTL_MS,
+      });
+      return;
+    }
     const ownerId = this.attachmentToSandbox.get(attachmentId);
     const owner = ownerId ? this.state.getHubSandbox(ownerId) : undefined;
     if (owner?.phase === "sleeping") {
@@ -2642,6 +2682,54 @@ export class HubServer {
     sendRpcExitFail(ws, reqId, notFound);
   }
 
+  /** The client's `POST` of a staged upload's bytes; answered like T3's upload route. */
+  private async receiveStagedUpload(req: Request, uploadToken: string, stagedId: string): Promise<Response> {
+    const entry = this.stagedAttachments.get(stagedId);
+    if (!entry || entry.expiresAt <= Date.now()) {
+      this.stagedUploadTokens.delete(uploadToken);
+      return new Response("Not Found", { status: 404 });
+    }
+    const contentLength = req.headers.get("content-length");
+    if (contentLength !== null && Number(contentLength) !== entry.sizeBytes) {
+      return new Response("Content-Length must match the upload size.", { status: 400 });
+    }
+    const bytes = new Uint8Array(await req.arrayBuffer());
+    if (bytes.byteLength !== entry.sizeBytes) {
+      return new Response(`Body was ${bytes.byteLength} bytes, expected ${entry.sizeBytes}.`, { status: 400 });
+    }
+    entry.bytes = bytes;
+    this.stagedUploadTokens.delete(uploadToken);
+    return new Response(null, { status: 204 });
+  }
+
+  /** Staged uploads a send payload (launch, `thread.create`, `message.dispatch`) refers to. */
+  private stagedIdsIn(payload: Record<string, unknown>): string[] {
+    const message = payload.initialMessage as { attachments?: unknown } | undefined;
+    const lists = [message?.attachments, payload.attachments].filter(Array.isArray) as unknown[][];
+    return lists
+      .flat()
+      .map((att) => (att && typeof att === "object" ? (att as { id?: unknown }).id : undefined))
+      .filter((id): id is string => typeof id === "string" && this.stagedAttachments.has(id));
+  }
+
+  private dropStagedAttachment(attachmentId: string): void {
+    this.pinnedStagedAttachments.delete(attachmentId);
+    this.stagedAttachments.delete(attachmentId);
+    for (const map of [this.stagedUploadTokens, this.stagedAssetTokens]) {
+      for (const [token, id] of map) if (id === attachmentId) map.delete(token);
+    }
+  }
+
+  /** Forgets staged uploads never sent, after a day as T3 does (and unfinished ones once their URL expired). */
+  private sweepStagedAttachments(): void {
+    const now = Date.now();
+    for (const staged of this.stagedAttachments.values()) {
+      if (this.pinnedStagedAttachments.has(staged.id)) continue;
+      const stale = staged.bytes ? now - staged.createdAt > STAGED_ATTACHMENT_MAX_AGE_MS : staged.expiresAt <= now;
+      if (stale) this.dropStagedAttachment(staged.id);
+    }
+  }
+
   private async replayStagedAttachmentsInPayload(
     sb: HubSandboxRecord,
     bridge: HubVmBridge,
@@ -2667,31 +2755,30 @@ export class HubServer {
         nextAttachments.push(att);
         continue;
       }
-      const created = await bridge.callUnary("attachments.createUploadUrl", {
-        name: staged.name,
-        mimeType: staged.mimeType,
-        sizeBytes: staged.bytes.byteLength,
-      });
-      if (created._tag === "Success" && created.value && typeof created.value === "object") {
-        const res = created.value as { attachmentId?: string; relativeUrl?: string };
-        if (res.attachmentId && res.relativeUrl) {
-          await fetch(`${sb.upstreamUrl}${res.relativeUrl}`, {
-            method: "POST",
-            headers: {
-              ...(sb.upstreamHeaders ?? {}),
-              "content-type": staged.mimeType,
-              "content-length": String(staged.bytes.byteLength),
-            },
-            body: Buffer.from(staged.bytes),
-          });
-          remapped.set(id, res.attachmentId);
-          this.attachmentToSandbox.set(res.attachmentId, sb.sandboxId);
-          this.stagedAttachments.delete(id);
-          nextAttachments.push({ ...att, id: res.attachmentId });
-          continue;
-        }
+      // Same request the client made (type included, so a file is stored as a file), then the bytes
+      const created = await bridge.callUnary("attachments.createUploadUrl", replayUploadRequest(staged));
+      const res = (created._tag === "Success" ? created.value : null) as { attachmentId?: string; relativeUrl?: string } | null;
+      if (!res?.attachmentId || !res.relativeUrl) {
+        const reason = created._tag === "Success" ? "no upload URL" : formatRpcFailure(created.cause);
+        throw new Error(`Attachment '${staged.name}' could not be sent to the chat's VM: ${reason}`);
       }
-      nextAttachments.push(att);
+      const upload = await fetch(`${sb.upstreamUrl}${res.relativeUrl}`, {
+        method: "POST",
+        headers: {
+          ...(sb.upstreamHeaders ?? {}),
+          "content-type": staged.mimeType,
+          "content-length": String(staged.bytes.byteLength),
+        },
+        body: Buffer.from(staged.bytes),
+      });
+      await upload.body?.cancel();
+      if (!upload.ok) {
+        throw new Error(`Attachment '${staged.name}' could not be sent to the chat's VM: upload rejected (${upload.status})`);
+      }
+      remapped.set(id, res.attachmentId);
+      this.attachmentToSandbox.set(res.attachmentId, sb.sandboxId);
+      this.dropStagedAttachment(id);
+      nextAttachments.push({ ...att, id: res.attachmentId });
     }
 
     if (remapped.size === 0) return payload;
