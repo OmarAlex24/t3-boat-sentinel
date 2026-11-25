@@ -12,6 +12,7 @@ import {
 import { loadConfig, type SentinelConfig } from "./config.ts";
 import { ControlPlane } from "./control.ts";
 import { HubServer, type HubMediaWsData, type HubSocketData, type HubWsData } from "./hub.ts";
+import type { PortGatewayWsData } from "./hub-port-gateway.ts";
 import { JobManager } from "./jobs.ts";
 import { KlavCliProvider, type KlavClient } from "./klav.ts";
 import { LifecycleManager } from "./lifecycle.ts";
@@ -21,7 +22,7 @@ import { SlotProxy, type WsData } from "./proxy.ts";
 import { AuthRateLimiter, applySecurityHeaders } from "./security.ts";
 import { StateStore } from "./state.ts";
 
-export type ServerWsData = WsData | HubSocketData;
+export type ServerWsData = WsData | HubSocketData | PortGatewayWsData;
 
 export interface SentinelServerHandle {
   server: Bun.Server<ServerWsData>;
@@ -56,6 +57,7 @@ export function createSentinelServer(
   }
 
   const slotWs = proxy.wsHandlers();
+  const portGatewayWs = hub?.portGateway?.wsHandlers();
   const server = Bun.serve<ServerWsData>({
     hostname: config.listenHost,
     port: config.listenPort,
@@ -68,6 +70,9 @@ export function createSentinelServer(
       }
       if (hub && config.hub && host === config.hub.host) {
         return hub.handleHttp(req, srv as unknown as Bun.Server<HubSocketData>);
+      }
+      if (hub?.portGateway?.resolveHost(req.headers.get("host"))) {
+        return hub.portGateway.handleHttp(req, srv as unknown as Bun.Server<PortGatewayWsData>);
       }
       if (host === config.controlHost.toLowerCase() || host === "localhost" || host === "127.0.0.1") {
         return control.handle(req);
@@ -84,6 +89,8 @@ export function createSentinelServer(
           hub.onWsOpen(ws as Bun.ServerWebSocket<HubWsData>);
         } else if (hub && "kind" in ws.data && ws.data.kind === "hub-media") {
           hub.onMediaOpen(ws as Bun.ServerWebSocket<HubMediaWsData>);
+        } else if (portGatewayWs && "kind" in ws.data && ws.data.kind === "port-gateway") {
+          portGatewayWs.open?.(ws as Bun.ServerWebSocket<PortGatewayWsData>);
         } else {
           slotWs.open?.(ws as Bun.ServerWebSocket<WsData>);
         }
@@ -93,6 +100,8 @@ export function createSentinelServer(
           hub.onWsMessage(ws as Bun.ServerWebSocket<HubWsData>, msg);
         } else if (hub && "kind" in ws.data && ws.data.kind === "hub-media") {
           hub.onMediaMessage(ws as Bun.ServerWebSocket<HubMediaWsData>, msg);
+        } else if (portGatewayWs && "kind" in ws.data && ws.data.kind === "port-gateway") {
+          portGatewayWs.message?.(ws as Bun.ServerWebSocket<PortGatewayWsData>, msg);
         } else {
           slotWs.message?.(ws as Bun.ServerWebSocket<WsData>, msg);
         }
@@ -102,6 +111,8 @@ export function createSentinelServer(
           hub.onWsClose(ws as Bun.ServerWebSocket<HubWsData>, code, reason);
         } else if (hub && "kind" in ws.data && ws.data.kind === "hub-media") {
           hub.onMediaClose(ws as Bun.ServerWebSocket<HubMediaWsData>, code, reason);
+        } else if (portGatewayWs && "kind" in ws.data && ws.data.kind === "port-gateway") {
+          portGatewayWs.close?.(ws as Bun.ServerWebSocket<PortGatewayWsData>, code, reason);
         } else {
           slotWs.close?.(ws as Bun.ServerWebSocket<WsData>, code, reason);
         }

@@ -758,6 +758,7 @@ export class LifecycleManager {
         `T3_CHANNEL=${shellQuote(effectiveT3Channel)}`,
         `BAKE_CLEAN=1`,
       ];
+      if (isBase && this.config.t3.preinstallBrowser === true) bakeEnv.push(`T3_PREINSTALL_BROWSER=1`);
       // Project bakes also report the project's refs and default branch (see provision-base.sh)
       if (project) bakeEnv.push(`BAKE_PROJECT_WORKDIR=${shellQuote(project.workdir)}`);
       // Base bakes install the runtimes; project bakes (built from base-t3) only verify them. Either way the

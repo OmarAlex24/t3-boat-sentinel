@@ -60,7 +60,9 @@ import {
   withoutHubTicket,
   type HubMediaWsData,
   type MediaTarget,
+  type PreviewStreamTuneOptions,
 } from "./hub-media.ts";
+import { HubPortGateway, PREVIEW_BOOTSTRAP_PATH, parseLoopbackPreviewUrl } from "./hub-port-gateway.ts";
 import {
   buildPlaceholderThread,
   failPlaceholderThread,
@@ -135,6 +137,14 @@ export type { HubMediaWsData } from "./hub-media.ts";
 interface FanoutStream {
   rawId: string | number;
   tag: string;
+  payload: unknown;
+  /** sandboxId -> upstream request id on that VM. */
+  upstream: Map<string, string>;
+}
+
+/** A client's merged `subscribeDiscoveredLocalServers` stream, fanned out to every running VM. */
+interface DiscoveredServersStream {
+  rawId: string | number;
   payload: unknown;
   /** sandboxId -> upstream request id on that VM. */
   upstream: Map<string, string>;
@@ -890,10 +900,21 @@ export class HubServer {
   private readonly urlTokenToSandbox = new Map<string, string>();
   /** Preview streams and device-hub sockets, piped to the VM that runs the chat. */
   private readonly media = new HubMediaProxy((data) => this.resolveMediaTarget(data));
+  /** Lazy public port gateway for desktop-proxy previews; present only in that mode. */
+  readonly portGateway?: HubPortGateway;
   /** How long a media socket waits for its chat's VM to finish booting or waking. */
   mediaJoinTimeoutMs = 60_000;
   /** Client event streams merged from every open VM, per client: request key -> stream. */
   private readonly fanoutStreams = new Map<ServerWebSocket<HubWsData>, Map<string, FanoutStream>>();
+  /** Merged local-server discovery streams (desktop-proxy mode only), per client: request key -> stream. */
+  private readonly discoveredServersSubs = new Map<ServerWebSocket<HubWsData>, Map<string, DiscoveredServersStream>>();
+  /** Single shared upstream `subscribeDiscoveredLocalServers` subscription per open sandbox. */
+  private readonly discoveredServersUpstream = new Map<string, string>();
+  /** Latest local-server list reported by each VM, keyed by sandbox id. */
+  private readonly discoveredServersBySandbox = new Map<
+    string,
+    { servers: Record<string, unknown>[]; configuredUrlProbing?: true }
+  >();
   /** The app's last browser-profile report, replayed to each VM whose bridge opens. */
   private lastPreviewProfiles: unknown = undefined;
   private readonly stagedAttachments = new Map<string, StagedAttachment>();
@@ -945,6 +966,21 @@ export class HubServer {
     private readonly rateLimiter?: AuthRateLimiter,
   ) {
     this.boat = asSandboxProvider(provider);
+    const previewCfg = config.hub?.preview;
+    if (previewCfg?.mode === "desktop-proxy") {
+      this.portGateway = new HubPortGateway({
+        domain: this.config.domain,
+        signingSecret: this.config.controlSecret,
+        exposePort: (sandboxId, port) => this.boat.exposePort(sandboxId, port, { visibility: this.config.boat.hostVisibility }),
+        isSandboxRunning: (sandboxId) => {
+          const sb = this.state.getHubSandbox(sandboxId);
+          return sb?.phase === "running" && !this.destroyingSandboxes.has(sandboxId) && !this.inFlightSleeps.has(sandboxId);
+        },
+        bootstrapHost: this.config.hub?.host,
+        edgeWorkerHost: previewCfg.edgeWorkerHost,
+        edgeWorkerSecret: previewCfg.edgeWorkerSecret,
+      });
+    }
     this.shellStore = new HubShellStore(config.stateDir, (threadId) => this.keepsStoredShell(threadId));
     this.mcp = new HubMcpHandler(
       config,
@@ -1127,6 +1163,7 @@ export class HubServer {
     }
     this.bridges.clear();
     this.media.closeAll(MEDIA_RETRY_CLOSE, "The Hub is restarting");
+    this.portGateway?.closeAll();
     this.lifecycle.providerSessions.stop();
   }
 
@@ -1384,6 +1421,7 @@ export class HubServer {
     for (const client of this.clients) {
       for (const [key, sub] of client.data.localStreams) {
         if (!KEEP_OPEN_SUBSCRIPTIONS.has(sub.tag) || client.data.upstreamRequests.has(key)) continue;
+        if (sub.tag === "subscribeDiscoveredLocalServers" && this.portGateway) continue;
         this.forwardKeepOpenStream(bridge, client, sub.rawId, sub.tag, sub.payload ?? {}, []);
       }
     }
@@ -1466,6 +1504,7 @@ export class HubServer {
       projectCloneTracking: true,
     };
     delete caps.accessTokenRenewal;
+    if (this.config.hub?.preview?.mode === "desktop-proxy") delete caps.serverBrowser;
     return {
       ...base,
       environmentId: hub.environmentId,
@@ -1817,6 +1856,11 @@ export class HubServer {
       return withCors(new Response("Not Found", { status: 404 }));
     }
 
+    // 8b. Single-domain Edge Worker preview bootstrap (verifies __t3p on hub.host, lazily exposes port, redirects to Worker with __t3e)
+    if ((req.method === "GET" || req.method === "HEAD") && path === PREVIEW_BOOTSTRAP_PATH && this.portGateway) {
+      return this.portGateway.handleHubBootstrap(req);
+    }
+
     // 9. Media routes (preview stream, device hub): piped to the chat's VM, sockets and HTTP alike
     const isUpgrade = req.headers.get("upgrade")?.toLowerCase() === "websocket";
     if (isMediaPath(path)) {
@@ -1832,7 +1876,7 @@ export class HubServer {
       }
       if (!isUpgrade) return this.proxyMediaHttp(req, url);
       // Upgrade first: past auth, every failure is a close code the preview client knows how to read
-      const upgraded = server.upgrade(req, { data: newMediaWsData(clientId, url) });
+      const upgraded = server.upgrade(req, { data: newMediaWsData(clientId, url, this.previewStreamTuneOptions()) });
       if (!upgraded) return withCors(new Response("WebSocket upgrade failed", { status: 400 }));
       return undefined;
     }
@@ -1895,6 +1939,8 @@ export class HubServer {
     this.removeWorktreeSetupSubsForWs(ws);
     for (const key of Array.from(this.fanoutStreams.get(ws)?.keys() ?? [])) this.closeFanoutStream(ws, key);
     this.fanoutStreams.delete(ws);
+    for (const key of Array.from(this.discoveredServersSubs.get(ws)?.keys() ?? [])) this.closeDiscoveredServersStream(ws, key);
+    this.discoveredServersSubs.delete(ws);
     ws.data.upstreamRequests.clear();
     ws.data.localStreams.clear();
   }
@@ -1914,6 +1960,17 @@ export class HubServer {
   /** Open media sockets piped to a VM (every VM when omitted). */
   mediaSocketCount(sandboxId?: string): number {
     return this.media.count(sandboxId);
+  }
+
+  private previewStreamTuneOptions(): PreviewStreamTuneOptions | undefined {
+    const preview = this.config.hub?.preview;
+    if (!preview) return undefined;
+    const tune: PreviewStreamTuneOptions = {};
+    if (preview.streamMaxWidth) tune.maxWidth = preview.streamMaxWidth;
+    if (preview.streamMaxHeight) tune.maxHeight = preview.streamMaxHeight;
+    if (preview.streamQuality) tune.quality = preview.streamQuality;
+    if (preview.coalesceInput === true) tune.coalesceInput = true;
+    return Object.keys(tune).length > 0 ? tune : undefined;
   }
 
   onWsMessage(ws: ServerWebSocket<HubWsData>, msg: string | Buffer): void {
@@ -1955,6 +2012,7 @@ export class HubServer {
       ws.data.localStreams.delete(reqKey);
       this.removeWorktreeSetupSub(ws, reqKey);
       this.closeFanoutStream(ws, reqKey);
+      this.closeDiscoveredServersStream(ws, reqKey);
       const ref = ws.data.upstreamRequests.get(reqKey);
       if (ref) {
         ws.data.upstreamRequests.delete(reqKey);
@@ -2111,6 +2169,10 @@ export class HubServer {
     }
     if (FANOUT_SUBSCRIPTIONS.has(tag)) {
       this.openFanoutStream(ws, reqId, tag, payload);
+      return;
+    }
+    if (tag === "subscribeDiscoveredLocalServers" && this.portGateway) {
+      this.openDiscoveredServersStream(ws, reqId, payload);
       return;
     }
     if (KEEP_OPEN_SUBSCRIPTIONS.has(tag)) {
@@ -3045,6 +3107,7 @@ export class HubServer {
       this.bridges.get(sandboxId)?.stop();
       this.bridges.delete(sandboxId);
       this.media.closeSandbox(sandboxId, MEDIA_GONE_CLOSE, "This chat's Boat VM no longer exists");
+      this.invalidateSandboxNetworking(sandboxId);
       this.settingsReplays.delete(sandboxId);
       this.replayedSettings.delete(sandboxId);
       this.wakeStatus.delete(sandboxId);
@@ -3357,7 +3420,20 @@ export class HubServer {
     try {
       const sb = await this.resolveSandboxForThread(threadId);
       const bridge = await this.ensureBridgeOpen(sb);
-      bridge.forwardToClient(ws, reqId, tag, payload, headers);
+      let forwardedPayload = payload;
+      if (tag === "preview.open" && this.portGateway && payload && typeof payload === "object") {
+        const url = (payload as { url?: unknown }).url;
+        if (typeof url === "string") {
+          const refreshed = this.portGateway.refreshPreviewUrl(url, sb.sandboxId);
+          if (refreshed) {
+            forwardedPayload = {
+              ...(payload as Record<string, unknown>),
+              url: refreshed,
+            };
+          }
+        }
+      }
+      bridge.forwardToClient(ws, reqId, tag, forwardedPayload, headers);
     } catch (err) {
       // Waking or reaching the VM failed: transient, so untyped, and still never another VM
       sendRpcExitFailure(ws, reqId, err instanceof Error ? err.message : String(err));
@@ -4141,6 +4217,7 @@ export class HubServer {
     this.bridges.get(sandboxId)?.stop();
     this.bridges.delete(sandboxId);
     this.media.closeSandbox(sandboxId, MEDIA_RETRY_CLOSE, "The chat's VM could not wake");
+    this.invalidateSandboxNetworking(sandboxId);
 
     if (ctx.newKlavSandbox && this.klav) {
       await releaseVmForwarder(this.boat, sandboxId, { termTimeoutSecs: this.forwarderTermTimeoutSecs }).catch(() => {});
@@ -4277,6 +4354,7 @@ export class HubServer {
     this.bridges.delete(sandboxId);
     // A paused VM sends no close: end its media sockets here; the preview reconnects once it wakes
     this.media.closeSandbox(sandboxId, MEDIA_RETRY_CLOSE, "The chat's VM is asleep");
+    this.invalidateSandboxNetworking(sandboxId);
 
     // No live credentials in a sleeping VM: stop the forwarder while its control socket still answers,
     // then end the Klav sandbox on the issuer side. The wake provisions a fresh one.
@@ -4338,6 +4416,7 @@ export class HubServer {
     this.bridges.get(sandboxId)?.stop();
     this.bridges.delete(sandboxId);
     this.media.closeSandbox(sandboxId, MEDIA_GONE_CLOSE, "This chat's Boat VM no longer exists");
+    this.invalidateSandboxNetworking(sandboxId);
     this.settingsReplays.delete(sandboxId);
     this.replayedSettings.delete(sandboxId);
     this.wakeStatus.delete(sandboxId);
@@ -4425,6 +4504,7 @@ export class HubServer {
         this.adoptLocalProviderStreams(sandboxId);
         this.adoptKeepOpenStreams(sandboxId);
         this.adoptFanoutStreams(sandboxId);
+        this.adoptDiscoveredServersStreams(sandboxId);
         if (this.lastPreviewProfiles !== undefined) {
           void this.bridges.get(sandboxId)?.callUnary("preview.reportProfiles", this.lastPreviewProfiles, 10_000);
         }
@@ -5416,6 +5496,121 @@ export class HubServer {
     const sb = this.state.getHubSandbox(target.sandbox.sandboxId);
     if (!sb) return withCors(new Response("Not Found", { status: 404 }));
     return this.proxyHttpToSandbox(sb, req, withoutHubTicket(url), false);
+  }
+
+  /** Opens a merged local-server discovery stream (desktop-proxy mode) backed by one upstream subscription per VM. */
+  private openDiscoveredServersStream(ws: ServerWebSocket<HubWsData>, reqId: string | number, payload: unknown): void {
+    const key = String(reqId);
+    this.closeDiscoveredServersStream(ws, key);
+    let streams = this.discoveredServersSubs.get(ws);
+    if (!streams) this.discoveredServersSubs.set(ws, (streams = new Map()));
+    const stream: DiscoveredServersStream = { rawId: reqId, payload: payload ?? {}, upstream: new Map() };
+    streams.set(key, stream);
+    ws.data.localStreams.set(key, { rawId: reqId, tag: "subscribeDiscoveredLocalServers", payload });
+    for (const [sandboxId, bridge] of this.bridges) {
+      if (bridge.isOpen()) this.ensureDiscoveredServersUpstream(sandboxId, bridge);
+    }
+    this.pushDiscoveredServersSnapshot(ws, stream);
+  }
+
+  private ensureDiscoveredServersUpstream(sandboxId: string, bridge: HubVmBridge): void {
+    if (!this.portGateway || this.discoveredServersSubs.size === 0) return;
+    if (this.discoveredServersUpstream.has(sandboxId) || !bridge.isOpen()) return;
+    let upReqId = "";
+    upReqId = bridge.openStream(
+      "subscribeDiscoveredLocalServers",
+      {},
+      (values) => this.handleDiscoveredServersChunk(sandboxId, values),
+      () => {
+        if (this.discoveredServersUpstream.get(sandboxId) === upReqId) {
+          this.discoveredServersUpstream.delete(sandboxId);
+          if (this.discoveredServersBySandbox.delete(sandboxId)) this.broadcastDiscoveredServersSnapshot();
+        }
+      },
+    );
+    this.discoveredServersUpstream.set(sandboxId, upReqId);
+  }
+
+  private adoptDiscoveredServersStreams(sandboxId: string): void {
+    if (!this.portGateway || this.discoveredServersSubs.size === 0) return;
+    const bridge = this.bridges.get(sandboxId);
+    if (!bridge?.isOpen()) return;
+    this.ensureDiscoveredServersUpstream(sandboxId, bridge);
+  }
+
+  private closeDiscoveredServersStream(ws: ServerWebSocket<HubWsData>, key: string): void {
+    const streams = this.discoveredServersSubs.get(ws);
+    const stream = streams?.get(key);
+    if (!streams || !stream) return;
+    streams.delete(key);
+    if (streams.size === 0) this.discoveredServersSubs.delete(ws);
+    if (this.discoveredServersSubs.size === 0) {
+      for (const [sandboxId, upReqId] of Array.from(this.discoveredServersUpstream)) {
+        this.discoveredServersUpstream.delete(sandboxId);
+        this.bridges.get(sandboxId)?.sendInterrupt(upReqId);
+      }
+      this.discoveredServersBySandbox.clear();
+    }
+  }
+
+  private handleDiscoveredServersChunk(sandboxId: string, values: unknown[]): void {
+    let latest: { servers: Record<string, unknown>[]; configuredUrlProbing?: true } | null = null;
+    for (const raw of values) {
+      if (!raw || typeof raw !== "object") continue;
+      const obj = raw as { servers?: unknown; configuredUrlProbing?: unknown };
+      if (Array.isArray(obj.servers)) {
+        latest = {
+          servers: obj.servers.filter((server): server is Record<string, unknown> => !!server && typeof server === "object"),
+          ...(obj.configuredUrlProbing === true ? { configuredUrlProbing: true as const } : {}),
+        };
+      }
+    }
+    if (!latest) return;
+    this.discoveredServersBySandbox.set(sandboxId, latest);
+    this.broadcastDiscoveredServersSnapshot();
+  }
+
+  private rewriteDiscoveredServer(sandboxId: string, server: Record<string, unknown>): Record<string, unknown> {
+    if (!this.portGateway || typeof server.url !== "string") return server;
+    const parsed = parseLoopbackPreviewUrl(server.url);
+    if (!parsed) return server;
+    return { ...server, url: this.portGateway.buildPreviewUrl(sandboxId, parsed.port, parsed.pathAndQuery) };
+  }
+
+  private mergedDiscoveredServersSnapshot(): Record<string, unknown> {
+    const servers: Record<string, unknown>[] = [];
+    let configuredUrlProbing = false;
+    for (const [sandboxId, discovered] of this.discoveredServersBySandbox) {
+      if (discovered.configuredUrlProbing) configuredUrlProbing = true;
+      for (const server of discovered.servers) servers.push(this.rewriteDiscoveredServer(sandboxId, server));
+    }
+    return {
+      servers,
+      scannedAt: new Date().toISOString(),
+      ...(configuredUrlProbing ? { configuredUrlProbing: true } : {}),
+    };
+  }
+
+  private pushDiscoveredServersSnapshot(ws: ServerWebSocket<HubWsData>, stream: DiscoveredServersStream): void {
+    if (!this.clients.has(ws)) return;
+    sendRpcFrame(ws, { _tag: "Chunk", requestId: stream.rawId, values: [this.mergedDiscoveredServersSnapshot()] });
+  }
+
+  private broadcastDiscoveredServersSnapshot(): void {
+    for (const [ws, streams] of this.discoveredServersSubs) {
+      for (const stream of streams.values()) this.pushDiscoveredServersSnapshot(ws, stream);
+    }
+  }
+
+  /** Drops every lazy preview endpoint and discovered server of a VM that is asleep, gone, or being destroyed. */
+  private invalidateSandboxNetworking(sandboxId: string): void {
+    this.portGateway?.invalidateSandbox(sandboxId);
+    const upReqId = this.discoveredServersUpstream.get(sandboxId);
+    if (upReqId) {
+      this.discoveredServersUpstream.delete(sandboxId);
+      this.bridges.get(sandboxId)?.sendInterrupt(upReqId);
+    }
+    if (this.discoveredServersBySandbox.delete(sandboxId)) this.broadcastDiscoveredServersSnapshot();
   }
 
   /** Opens a merged event stream for a client on every open VM bridge (more join as they open). */

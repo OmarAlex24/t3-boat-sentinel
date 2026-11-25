@@ -35,6 +35,23 @@ const UPSTREAM_PING_MS = 25_000;
 export const PREVIEW_ACK = JSON.stringify({ type: "ack" });
 /** Longer than any ack: such a client message is never parsed, only forwarded. */
 const MAX_ACK_BYTES = 256;
+const DEFAULT_MOUSE_MOVE_INTERVAL_MS = 50;
+const DEFAULT_WHEEL_INTERVAL_MS = 35;
+
+export interface PreviewStreamTuneOptions {
+  /** Cap upstream screencast maxWidth (preserving aspect ratio with maxHeight). */
+  maxWidth?: number;
+  /** Cap upstream screencast maxHeight (preserving aspect ratio with maxWidth). */
+  maxHeight?: number;
+  /** JPEG quality 1..100 injected/capped on upstream `/api/preview-stream/ws` URL. */
+  quality?: number;
+  /** Enable leading+trailing coalescing for hover mouse moves and wheel events. */
+  coalesceInput?: boolean;
+  /** Minimum ms between hover mouse move sends (default 50ms -> 20Hz). */
+  mouseMoveIntervalMs?: number;
+  /** Minimum ms between wheel sends; deltas accumulate in between (default 35ms). */
+  wheelIntervalMs?: number;
+}
 
 /** One preview stream's frame flow toward the app: one frame out, the newest one held. */
 export interface PreviewFrameFlow {
@@ -42,6 +59,31 @@ export interface PreviewFrameFlow {
   inFlight: boolean;
   /** The newest frame the app has not been sent yet; a newer one replaces it. */
   held: Uint8Array | null;
+}
+
+type ClientInputMessage = string | Uint8Array;
+
+interface PendingMoveInput {
+  data: ClientInputMessage;
+  seq: number;
+  timer: ReturnType<typeof setTimeout> | null;
+}
+
+interface PendingWheelInput {
+  data: Record<string, unknown>;
+  modifiers: number;
+  seq: number;
+  timer: ReturnType<typeof setTimeout> | null;
+}
+
+interface PreviewInputCoalescerState {
+  mouseMoveIntervalMs: number;
+  wheelIntervalMs: number;
+  lastMoveSentAt: number | null;
+  lastWheelSentAt: number | null;
+  pendingMove: PendingMoveInput | null;
+  pendingWheel: PendingWheelInput | null;
+  nextSeq: number;
 }
 
 export interface HubMediaWsData {
@@ -58,6 +100,8 @@ export interface HubMediaWsData {
   pendingBytes: number;
   /** Frame flow toward the app; null for the device hub, which passes through as is. */
   frames: PreviewFrameFlow | null;
+  /** Hover/wheel input coalescing; null for the device hub and for untuned preview streams. */
+  inputCoalescer: PreviewInputCoalescerState | null;
   closed: boolean;
   pingTimer: ReturnType<typeof setInterval> | null;
 }
@@ -105,8 +149,64 @@ export function withoutHubTicket(url: URL): URL {
   return out;
 }
 
-export function newMediaWsData(clientId: string, url: URL): HubMediaWsData {
-  const upstream = withoutHubTicket(url);
+function positiveNumber(value: unknown): number | null {
+  const n = typeof value === "number" ? value : typeof value === "string" && value.trim() !== "" ? Number(value) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/**
+ * The media URL to send the VM, with optional caps applied. Width and height scale down together:
+ * the smaller scale of the two caps wins, so a Retina client keeps its aspect ratio and a client
+ * already under the caps is never scaled up.
+ */
+export function tunePreviewStreamUrl(url: URL, tune?: PreviewStreamTuneOptions): URL {
+  const out = withoutHubTicket(url);
+  if (!tune || !isPreviewStreamSocket(out.pathname)) return out;
+
+  const maxW = positiveNumber(tune.maxWidth);
+  const maxH = positiveNumber(tune.maxHeight);
+  if (maxW !== null || maxH !== null) {
+    const w = positiveNumber(out.searchParams.get("maxWidth"));
+    const h = positiveNumber(out.searchParams.get("maxHeight"));
+    if (w !== null && h !== null) {
+      const scale = Math.min(1, maxW !== null ? maxW / w : 1, maxH !== null ? maxH / h : 1);
+      if (scale < 1) {
+        out.searchParams.set("maxWidth", String(Math.max(1, Math.round(w * scale))));
+        out.searchParams.set("maxHeight", String(Math.max(1, Math.round(h * scale))));
+      }
+    } else {
+      // With no complete client aspect ratio, cap each dimension independently.
+      if (maxW !== null) out.searchParams.set("maxWidth", String(Math.max(1, Math.round(w === null ? maxW : Math.min(w, maxW)))));
+      if (maxH !== null) out.searchParams.set("maxHeight", String(Math.max(1, Math.round(h === null ? maxH : Math.min(h, maxH)))));
+    }
+  }
+
+  if (tune.quality !== undefined && Number.isFinite(tune.quality)) {
+    const cap = Math.min(100, Math.max(1, tune.quality));
+    const clientQuality = positiveNumber(out.searchParams.get("quality"));
+    out.searchParams.set("quality", String(clientQuality === null ? cap : Math.min(clientQuality, cap)));
+  }
+  return out;
+}
+
+function positiveIntervalMs(value: number | undefined, fallback: number): number {
+  return value !== undefined && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function newInputCoalescer(tune: PreviewStreamTuneOptions): PreviewInputCoalescerState {
+  return {
+    mouseMoveIntervalMs: positiveIntervalMs(tune.mouseMoveIntervalMs, DEFAULT_MOUSE_MOVE_INTERVAL_MS),
+    wheelIntervalMs: positiveIntervalMs(tune.wheelIntervalMs, DEFAULT_WHEEL_INTERVAL_MS),
+    lastMoveSentAt: null,
+    lastWheelSentAt: null,
+    pendingMove: null,
+    pendingWheel: null,
+    nextSeq: 1,
+  };
+}
+
+export function newMediaWsData(clientId: string, url: URL, tune?: PreviewStreamTuneOptions): HubMediaWsData {
+  const upstream = tunePreviewStreamUrl(url, tune);
   return {
     kind: "hub-media",
     clientId,
@@ -117,6 +217,7 @@ export function newMediaWsData(clientId: string, url: URL): HubMediaWsData {
     pending: [],
     pendingBytes: 0,
     frames: isPreviewStreamSocket(url.pathname) ? { inFlight: false, held: null } : null,
+    inputCoalescer: isPreviewStreamSocket(url.pathname) && tune?.coalesceInput === true ? newInputCoalescer(tune) : null,
     closed: false,
     pingTimer: null,
   };
@@ -133,6 +234,32 @@ function closeClient(ws: ServerWebSocket<HubMediaWsData>, code: number, reason: 
   } catch {
     // already closed
   }
+}
+
+function parseInputObject(msg: string | Buffer): Record<string, unknown> | null {
+  try {
+    const parsed: unknown = JSON.parse(typeof msg === "string" ? msg : new TextDecoder().decode(msg));
+    return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+function isHoverMouseMove(input: Record<string, unknown>): boolean {
+  return input.type === "mouse" && input.action === "move" && input.button === "none" && input.buttons === 0;
+}
+
+function finiteInputNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function inputModifiers(input: Record<string, unknown>): number {
+  const value = finiteInputNumber(input.modifiers);
+  return Number.isInteger(value) && value >= 0 && value < 16 ? value : 0;
+}
+
+function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
+  (timer as { unref?: () => void }).unref?.();
 }
 
 /**
@@ -159,24 +286,16 @@ export class HubMediaProxy {
       if (next) this.sendFrame(ws, frames, next);
       return;
     }
-    const upstream = ws.data.upstream;
-    if (upstream && upstream.readyState === WebSocket.OPEN) {
-      upstream.send(msg);
-      return;
-    }
-    const chunk = typeof msg === "string" ? msg : new Uint8Array(msg);
-    ws.data.pendingBytes += typeof chunk === "string" ? chunk.length : chunk.byteLength;
-    if (ws.data.pendingBytes > MAX_PENDING_BYTES) {
-      closeClient(ws, MEDIA_RETRY_CLOSE, "The chat's VM did not answer in time");
-      return;
-    }
-    ws.data.pending.push(chunk);
+    const coalescer = ws.data.inputCoalescer;
+    if (coalescer && this.handleCoalescedInput(ws, coalescer, msg)) return;
+    this.forwardClientMessage(ws, msg);
   }
 
   close(ws: ServerWebSocket<HubMediaWsData>, code?: number, reason?: string): void {
     ws.data.closed = true;
     this.untrack(ws);
     this.stopPing(ws);
+    this.clearInputCoalescing(ws);
     const upstream = ws.data.upstream;
     ws.data.upstream = null;
     ws.data.pending = [];
@@ -208,6 +327,163 @@ export class HubMediaProxy {
     let n = 0;
     for (const set of this.bySandbox.values()) n += set.size;
     return n;
+  }
+
+  private forwardClientMessage(ws: ServerWebSocket<HubMediaWsData>, msg: string | Buffer | Uint8Array): void {
+    if (ws.data.closed) return;
+    const upstream = ws.data.upstream;
+    if (upstream && upstream.readyState === WebSocket.OPEN) {
+      upstream.send(msg);
+      return;
+    }
+    const chunk = typeof msg === "string" ? msg : new Uint8Array(msg);
+    ws.data.pendingBytes += typeof chunk === "string" ? chunk.length : chunk.byteLength;
+    if (ws.data.pendingBytes > MAX_PENDING_BYTES) {
+      closeClient(ws, MEDIA_RETRY_CLOSE, "The chat's VM did not answer in time");
+      return;
+    }
+    ws.data.pending.push(chunk);
+  }
+
+  /**
+   * Handles the two high-frequency input streams. It returns false for every other message after
+   * flushing pending input first, so a click or keypress can never overtake the pointer position or
+   * wheel amount that preceded it.
+   */
+  private handleCoalescedInput(
+    ws: ServerWebSocket<HubMediaWsData>,
+    coalescer: PreviewInputCoalescerState,
+    msg: string | Buffer,
+  ): boolean {
+    const input = parseInputObject(msg);
+    if (input && isHoverMouseMove(input)) {
+      this.handleHoverMove(ws, coalescer, msg);
+      return true;
+    }
+    if (input?.type === "wheel") {
+      this.handleWheel(ws, coalescer, msg, input);
+      return true;
+    }
+    this.flushCoalescedInputs(ws, coalescer);
+    return false;
+  }
+
+  private handleHoverMove(ws: ServerWebSocket<HubMediaWsData>, coalescer: PreviewInputCoalescerState, msg: string | Buffer): void {
+    const data: ClientInputMessage = typeof msg === "string" ? msg : new Uint8Array(msg);
+    let now = Date.now();
+    if (
+      coalescer.pendingMove &&
+      coalescer.lastMoveSentAt !== null &&
+      now - coalescer.lastMoveSentAt >= coalescer.mouseMoveIntervalMs
+    ) {
+      // A due trailing send must not be overtaken just because its timer ran after this message.
+      this.flushPendingMove(ws, coalescer);
+      now = Date.now();
+    }
+    const pending = coalescer.pendingMove;
+    if (pending) {
+      pending.data = data;
+      return;
+    }
+    if (coalescer.lastMoveSentAt === null || now - coalescer.lastMoveSentAt >= coalescer.mouseMoveIntervalMs) {
+      if (coalescer.pendingWheel) this.flushPendingWheel(ws, coalescer);
+      coalescer.lastMoveSentAt = Date.now();
+      this.forwardClientMessage(ws, data);
+      return;
+    }
+    const next: PendingMoveInput = { data, seq: coalescer.nextSeq++, timer: null };
+    coalescer.pendingMove = next;
+    const remaining = Math.max(1, coalescer.lastMoveSentAt + coalescer.mouseMoveIntervalMs - now);
+    next.timer = setTimeout(() => {
+      if (coalescer.pendingMove !== next) return;
+      this.flushPendingMove(ws, coalescer);
+    }, remaining);
+    unrefTimer(next.timer);
+  }
+
+  private handleWheel(
+    ws: ServerWebSocket<HubMediaWsData>,
+    coalescer: PreviewInputCoalescerState,
+    msg: string | Buffer,
+    input: Record<string, unknown>,
+  ): void {
+    let now = Date.now();
+    if (
+      coalescer.pendingWheel &&
+      coalescer.lastWheelSentAt !== null &&
+      now - coalescer.lastWheelSentAt >= coalescer.wheelIntervalMs
+    ) {
+      // A due trailing send must not be overtaken just because its timer ran after this message.
+      this.flushPendingWheel(ws, coalescer);
+      now = Date.now();
+    }
+    if (!coalescer.pendingWheel && (coalescer.lastWheelSentAt === null || now - coalescer.lastWheelSentAt >= coalescer.wheelIntervalMs)) {
+      if (coalescer.pendingMove) this.flushPendingMove(ws, coalescer);
+      coalescer.lastWheelSentAt = Date.now();
+      this.forwardClientMessage(ws, msg);
+      return;
+    }
+
+    const modifiers = inputModifiers(input);
+    if (coalescer.pendingWheel && coalescer.pendingWheel.modifiers !== modifiers) this.flushPendingWheel(ws, coalescer);
+    let pending = coalescer.pendingWheel;
+    if (!pending) {
+      pending = { data: { ...input }, modifiers, seq: coalescer.nextSeq++, timer: null };
+      coalescer.pendingWheel = pending;
+      const sentAt = coalescer.lastWheelSentAt ?? now;
+      const remaining = Math.max(1, sentAt + coalescer.wheelIntervalMs - Date.now());
+      pending.timer = setTimeout(() => {
+        if (coalescer.pendingWheel !== pending) return;
+        this.flushPendingWheel(ws, coalescer);
+      }, remaining);
+      unrefTimer(pending.timer);
+      return;
+    }
+
+    pending.data = {
+      ...input,
+      deltaX: finiteInputNumber(pending.data.deltaX) + finiteInputNumber(input.deltaX),
+      deltaY: finiteInputNumber(pending.data.deltaY) + finiteInputNumber(input.deltaY),
+    };
+  }
+
+  private flushPendingMove(ws: ServerWebSocket<HubMediaWsData>, coalescer: PreviewInputCoalescerState): void {
+    const pending = coalescer.pendingMove;
+    if (!pending) return;
+    coalescer.pendingMove = null;
+    if (pending.timer) clearTimeout(pending.timer);
+    coalescer.lastMoveSentAt = Date.now();
+    this.forwardClientMessage(ws, pending.data);
+  }
+
+  private flushPendingWheel(ws: ServerWebSocket<HubMediaWsData>, coalescer: PreviewInputCoalescerState): void {
+    const pending = coalescer.pendingWheel;
+    if (!pending) return;
+    coalescer.pendingWheel = null;
+    if (pending.timer) clearTimeout(pending.timer);
+    coalescer.lastWheelSentAt = Date.now();
+    this.forwardClientMessage(ws, JSON.stringify(pending.data));
+  }
+
+  private flushCoalescedInputs(ws: ServerWebSocket<HubMediaWsData>, coalescer: PreviewInputCoalescerState): void {
+    const moveSeq = coalescer.pendingMove?.seq ?? Number.POSITIVE_INFINITY;
+    const wheelSeq = coalescer.pendingWheel?.seq ?? Number.POSITIVE_INFINITY;
+    if (moveSeq <= wheelSeq) {
+      this.flushPendingMove(ws, coalescer);
+      this.flushPendingWheel(ws, coalescer);
+    } else {
+      this.flushPendingWheel(ws, coalescer);
+      this.flushPendingMove(ws, coalescer);
+    }
+  }
+
+  private clearInputCoalescing(ws: ServerWebSocket<HubMediaWsData>): void {
+    const coalescer = ws.data.inputCoalescer;
+    if (!coalescer) return;
+    if (coalescer.pendingMove?.timer) clearTimeout(coalescer.pendingMove.timer);
+    if (coalescer.pendingWheel?.timer) clearTimeout(coalescer.pendingWheel.timer);
+    coalescer.pendingMove = null;
+    coalescer.pendingWheel = null;
   }
 
   private async connect(ws: ServerWebSocket<HubMediaWsData>): Promise<void> {
@@ -280,6 +556,7 @@ export class HubMediaProxy {
       ws.data.upstream = null;
       if (ws.data.frames) ws.data.frames.held = null;
       this.stopPing(ws);
+      this.clearInputCoalescing(ws);
       this.untrack(ws);
       if (ws.data.closed) return;
       // The VM's own code passes through (4404 tab gone, 4503 host setup, 1012 reconnect...)

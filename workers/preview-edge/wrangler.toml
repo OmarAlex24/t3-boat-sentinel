@@ -1,0 +1,38 @@
+name = "t3-preview-edge"
+main = "src/index.ts"
+compatibility_date = "2025-05-08"
+
+# One stateless Worker serves every sandbox and every dev-server port.
+# Replace example.com with a zone in your Cloudflare account.
+#
+# Cloudflare Workers Routes only allow a leading wildcard (`*.example.com/*`),
+# NOT a mid-label wildcard like `p*-*.example.com/*`.
+#
+# Recommended setups:
+#   Option A (Dedicated preview zone — simplest, strongest SameSite isolation):
+#     routes = [{ pattern = "*.preview-example.net/*", zone_name = "preview-example.net" }]
+#   Option B (Same domain as Sentinel):
+#     Keep `*.example.com/*` below AND add "Worker: None" exclusion routes in
+#     Cloudflare Dashboard -> Workers Routes for your Sentinel hosts
+#     (`boat.example.com/*`, `boat-ctrl.example.com/*`, `boat-llm.example.com/*`)
+#     so Hub RPC/API traffic bypasses the Worker directly. As a safety net, the
+#     Worker also passes non-preview hostnames straight through to the origin.
+routes = [
+  { pattern = "*.example.com/*", zone_name = "example.com" },
+]
+
+# Setup:
+#   1. bun install
+#   2. wrangler login
+#   3. wrangler deploy
+#   4. wrangler secret put PREVIEW_EDGE_SECRET
+#      Use the same high-entropy secret configured in Sentinel. Sentinel never
+#      needs a Cloudflare API token; only the machine deploying this Worker does.
+#   5. wrangler deploy
+#
+# The PREVIEW_EDGE_SECRET value is a shared symmetric token-sealing secret, not a
+# Cloudflare API key. Never commit it to this repository.
+#
+# Local plaintext-upstream testing only (never enable in production):
+# [vars]
+# ALLOW_HTTP_UPSTREAM = "1"

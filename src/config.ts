@@ -102,6 +102,23 @@ export interface LlmProxyConfig {
   upstreamApiKey: string;
 }
 
+export interface HubPreviewConfig {
+  /** "desktop-proxy": native Electron <webview> via lazy port gateway. "server": VM JPEG stream (default when omitted for backwards compatibility). */
+  mode: "desktop-proxy" | "server";
+  /** Optional Cloudflare Edge Worker base host (single-level zone such as "example.com" or "preview-example.net", never a nested subdomain) */
+  edgeWorkerHost?: string;
+  /** Shared secret with workers/preview-edge (NEVER a Cloudflare API key). */
+  edgeWorkerSecret?: string;
+  /** Cap upstream server-browser screencast maxWidth (0 or omitted = no cap). */
+  streamMaxWidth?: number;
+  /** Cap upstream server-browser screencast maxHeight (0 or omitted = no cap). */
+  streamMaxHeight?: number;
+  /** Cap/inject upstream server-browser JPEG quality 1..100 (0 or omitted = T3 default). */
+  streamQuality?: number;
+  /** Enable hover mouse-move and wheel coalescing on server-browser streams. */
+  coalesceInput?: boolean;
+}
+
 export interface HubConfig {
   /** Public hostname for the single unified T3 Environment multiplexer (e.g. "boat.example.com"). */
   host: string;
@@ -109,6 +126,8 @@ export interface HubConfig {
   label: string;
   /** Maximum concurrent live Boat VMs managed by the Hub (default 10). */
   maxSandboxes: number;
+  /** Optional preview routing and server-browser stream tuning. */
+  preview?: HubPreviewConfig;
 }
 
 export type SandboxProviderConfig =
@@ -171,6 +190,8 @@ export interface SentinelConfig {
     prepareAcpAgents?: string[];
     /** Optional managed provider instance IDs to pre-install into `baseSnapshot` during `bake base` (e.g. ["antigravity"]); every bake verifies them. */
     installProviders?: string[];
+    /** Pre-install T3's pinned server browser into `baseSnapshot` during `bake base` (default false). */
+    preinstallBrowser?: boolean;
     /**
      * Optional provider instance IDs whose sign-in is kept across chat VMs (e.g. ["antigravity", "acpRegistry_devin"]).
      * The credential file is captured from a signed-in VM into `<stateDir>/credentials/<instanceId>/`
@@ -260,6 +281,7 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
     settingsFile: parsed.t3?.settingsFile ? resolve(parsed.t3.settingsFile) : undefined,
     prepareAcpAgents: Array.isArray(parsed.t3?.prepareAcpAgents) ? parsed.t3.prepareAcpAgents.map(String) : undefined,
     installProviders: Array.isArray(parsed.t3?.installProviders) ? parsed.t3.installProviders.map(String) : undefined,
+    preinstallBrowser: parsed.t3?.preinstallBrowser === true,
     persistProviderSessions: Array.isArray(parsed.t3?.persistProviderSessions)
       ? parsed.t3.persistProviderSessions.map((id) => {
           const s = String(id).trim();
@@ -349,10 +371,44 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
 
   let hub: HubConfig | undefined;
   if (parsed.hub) {
+    let preview: HubPreviewConfig | undefined;
+    if (parsed.hub.preview !== undefined) {
+      if (!parsed.hub.preview || typeof parsed.hub.preview !== "object") {
+        throw new Error(`Config "hub.preview" must be an object`);
+      }
+      const raw = parsed.hub.preview as Partial<HubPreviewConfig>;
+      if (raw.mode !== undefined && raw.mode !== "server" && raw.mode !== "desktop-proxy") {
+        throw new Error(`Invalid hub.preview.mode ${JSON.stringify(raw.mode)}: expected "server" or "desktop-proxy"`);
+      }
+
+      const hostSet = raw.edgeWorkerHost !== undefined && raw.edgeWorkerHost !== null && String(raw.edgeWorkerHost).trim() !== "";
+      const secretSet = raw.edgeWorkerSecret !== undefined && raw.edgeWorkerSecret !== null && String(raw.edgeWorkerSecret).trim() !== "";
+      if (hostSet !== secretSet) {
+        throw new Error(`Config hub.preview.edgeWorkerHost and hub.preview.edgeWorkerSecret must be set together`);
+      }
+      const edgeWorkerHost = hostSet
+        ? requireString(raw.edgeWorkerHost, "hub.preview.edgeWorkerHost").replace(/^https?:\/\//i, "").replace(/\/+$/, "").toLowerCase()
+        : undefined;
+      const edgeWorkerSecret = secretSet ? requireSecret(raw.edgeWorkerSecret, "hub.preview.edgeWorkerSecret") : undefined;
+      const streamMaxWidth = optionalPositiveInteger(raw.streamMaxWidth, "hub.preview.streamMaxWidth");
+      const streamMaxHeight = optionalPositiveInteger(raw.streamMaxHeight, "hub.preview.streamMaxHeight");
+      const streamQuality = optionalStreamQuality(raw.streamQuality);
+
+      preview = {
+        mode: raw.mode === "desktop-proxy" ? "desktop-proxy" : "server",
+        ...(edgeWorkerHost ? { edgeWorkerHost } : {}),
+        ...(edgeWorkerSecret ? { edgeWorkerSecret } : {}),
+        ...(streamMaxWidth !== undefined ? { streamMaxWidth } : {}),
+        ...(streamMaxHeight !== undefined ? { streamMaxHeight } : {}),
+        ...(streamQuality !== undefined ? { streamQuality } : {}),
+        ...(raw.coalesceInput === true ? { coalesceInput: true } : {}),
+      };
+    }
     hub = {
       host: requireString(parsed.hub.host, "hub.host").replace(/^https?:\/\//, "").replace(/\/+$/, "").toLowerCase(),
       label: parsed.hub.label ? String(parsed.hub.label).trim() : "Boat",
       maxSandboxes: Math.max(1, Number(parsed.hub.maxSandboxes ?? 10)),
+      ...(preview ? { preview } : {}),
     };
   }
 
@@ -416,9 +472,13 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
     throw new Error("Config must define at least one slot in `slots` or configure `hub`");
   }
   const seen = new Set<string>();
+  const desktopProxyEnabled = hub?.preview?.mode === "desktop-proxy";
   for (const s of slots) {
     if (!s?.name || !SLOT_NAME_RE.test(s.name)) {
       throw new Error(`Invalid slot name "${s?.name}". Use lowercase alphanumeric + hyphens.`);
+    }
+    if (desktopProxyEnabled && /^p\d+-/.test(s.name)) {
+      throw new Error(`Slot name "${s.name}" conflicts with hub.preview desktop-proxy hostnames (p<port>-<slug>).`);
     }
     if (seen.has(s.name)) {
       throw new Error(`Duplicate slot name "${s.name}"`);
@@ -461,6 +521,24 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
     slots,
     projects,
   };
+}
+
+function optionalPositiveInteger(val: unknown, name: string): number | undefined {
+  if (val === undefined || val === null) return undefined;
+  const n = typeof val === "number" ? val : typeof val === "string" && val.trim() !== "" ? Number(val) : NaN;
+  if (!Number.isInteger(n) || n < 0) {
+    throw new Error(`Config "${name}" must be a positive integer (0 disables the cap)`);
+  }
+  return n === 0 ? undefined : n;
+}
+
+function optionalStreamQuality(val: unknown): number | undefined {
+  if (val === undefined || val === null) return undefined;
+  const n = typeof val === "number" ? val : typeof val === "string" && val.trim() !== "" ? Number(val) : NaN;
+  if (!Number.isInteger(n) || n < 0 || n > 100) {
+    throw new Error(`Config "hub.preview.streamQuality" must be an integer from 1 to 100 (0 uses the T3 default)`);
+  }
+  return n === 0 ? undefined : n;
 }
 
 function requireString(val: unknown, name: string): string {
