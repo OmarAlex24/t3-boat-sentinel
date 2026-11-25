@@ -15,7 +15,7 @@
 | **Environment UX** | Pair 1 environment per VM/slot | **1 single `Boat` Environment** — spawns up to `N` (e.g. 20) parallel Boat VMs on demand |
 | **Sandbox isolation** | 1 persistent VM shared across chats | **1 chat = 1 fresh disposable VM** from an immutable golden snapshot (`env-<project>`) |
 | **Golden snapshots** | Overwritten on sleep (accumulates worktrees & bloat) | **Strictly immutable** — chats never mutate snapshots; only clean `bake` updates them |
-| **Settle / Archive a chat** | Keeps VM & disk around | **Auto-destroys only that chat's Boat VM ($0)** + revokes its ephemeral tokens & Klav sandbox |
+| **Settle / Archive a chat** | Keeps VM & disk around | **Archive destroys only that chat's Boat VM ($0)**; **settle parks it** (stopped, chat kept, not counted toward the limit) + revokes its ephemeral tokens & Klav sandbox |
 | **Adding new repos** | Hand-edit YAML & restart | **Automatic** via T3 Code's native Clone UI, the web Dashboard (`+ Add GitHub Repo`), API, or MCP |
 | **Live boot feedback** | Blind spinner or extra Mac CLI | **Native progress inside T3 Code UI** via `subscribeWorktreeSetup` (zero extra client install) |
 | **Secrets & LLM keys** | Plaintext API keys inside VMs | **Zero-trust**: per-sandbox ephemeral `LlmProxy` tokens + optional [Klav](https://klav.dev) (`klav-proxy` + ephemeral Tailnet) |
@@ -39,7 +39,7 @@ Sentinel host (Proxmox LXC / Docker — ~40MB RAM, zero project code runs here)
    │     ├── Streams live VM boot progress directly into T3 UI (`subscribeWorktreeSetup`)
    │     ├── Spawns 1 fresh isolated Boat VM per new chat (`orchestration.launchThread`)
    │     ├── Rewrites projectIds & routes every thread/terminal/VCS/attachment RPC to its owning VM
-   │     └── Auto-reaps each VM independently when its chat is settled or archived
+   │     └── Deletes each VM independently when its chat is archived; parks (stops) it when settled
    ├── Zero-Trust LLM Proxy (`boat-llm.example.com`)
    │     └── Per-VM ephemeral `t3llm_...` token valid ONLY while `phase === "running"` (401 on sleep/delete)
    └── Reaper (reconciles `boat list --all` every 5m so zero orphan VMs bill)
@@ -48,7 +48,7 @@ Disposable Boat VMs (`boat new --type large --from env-<project>`)
    ├── t3code.service (official `t3 serve`, auto-pinned to your Desktop/Mobile version)
    ├── Optional Klav ephemeral sandbox (`klav-forward` over `tag:klav-sandbox` Tailnet — real API keys never enter VM)
    └── watchdog.mjs (0 npm deps)
-         ├── Chat settled / archived -> notifies sentinel -> destroys ONLY that VM ($0) + revokes tokens
+         ├── Chat archived -> notifies sentinel -> destroys ONLY that VM ($0) + revokes tokens; settled -> parks it
          └── Idle (no agents, no CPU builds) -> pauses VM (never mutates golden snapshots)
 ```
 
@@ -58,7 +58,7 @@ Disposable Boat VMs (`boat new --type large --from env-<project>`)
 
 ## Features
 
-- **1-Environment Hub Multiplexer (`hub:`):** Pair `https://boat.example.com` **once** on T3 Desktop and **once** on T3 Mobile. Every new chat automatically spawns its own isolated Boat VM (`defaultSize: large` / `default` / `medium`, configurable globally or per-project), runs completely in parallel (up to `hub.maxSandboxes`), and is destroyed independently when you **Settle** or **Archive** the thread.
+- **1-Environment Hub Multiplexer (`hub:`):** Pair `https://boat.example.com` **once** on T3 Desktop and **once** on T3 Mobile. Every new chat automatically spawns its own isolated Boat VM (`defaultSize: large` / `default` / `medium`, configurable globally or per-project), runs completely in parallel (up to `hub.maxSandboxes`), and is destroyed independently when you **Archive** the thread. A **Settled** thread's VM is parked instead: stopped, the chat stays in the sidebar, and it wakes as it was when you unsettle it or send a message.
 - **Zero-YAML Repo Onboarding:** Add new repositories without touching `sentinel.yaml`:
   1. Directly in **T3 Code UI** (Clone repository → Hub intercepts `projectClone.start`, registers the repo, and bakes `env-<repo>` in the background with live clone progress!).
   2. From the **Dashboard** (`https://boat-ctrl.example.com` → `+ Add GitHub Repo` → enter `owner/repo`).
@@ -70,7 +70,7 @@ Disposable Boat VMs (`boat new --type large --from env-<project>`)
 - **Provider Sign-ins That Follow You (`t3.persistProviderSessions`):** Sign in to Antigravity or Devin once in any Hub chat and every later chat VM starts signed in. Sentinel captures the credential file from the signed-in VM into `<stateDir>/credentials/<instanceId>/` (dir 0700, file 0600, atomic, newer `expiry` wins), copies it into each new VM before T3 starts, pulls the CLI's refreshed copy before a VM is destroyed, and never bakes it into a snapshot. Signing out in T3 (or `sentinel forget-session <instanceId>`) deletes the stored copy. Setup steps: [Devin and Antigravity](#devin-and-antigravity).
 - **Zero-Trust LLM Proxy (`llmProxy:`):** Forward Claude/OpenAI requests to a private LAN/Tailscale gateway (e.g., `cliproxy`) without ever letting Boat VMs join your LAN or see your real API key. Each running VM receives a unique `t3llm_...` token that immediately returns `401` the moment the VM sleeps or is destroyed.
 - **Zero-Knowledge Secrets with [Klav](https://klav.dev) (`klav:`):** Supports Klav ADR 0036/0042 (`mode: proxy` with `klav-proxy` + ephemeral `tag:klav-sandbox` Tailscale + `klav-forward`) so agents can call external APIs (e.g. Northflank, GitHub, Cloudflare) without plaintext secrets ever entering the sandbox, revoking access automatically when the chat ends.
-- **Auto-Delete on Settle or Archive:** Configure `deleteWhen: archived-or-settled` (or `archived`) and `archiveAction: delete` (or `stop`). After `archiveGraceSecs` (default 20s), the VM is permanently deleted ($0/hr idle, no standby pool required).
+- **Auto-Delete on Settle or Archive:** Configure `deleteWhen: archived-or-settled` (or `archived`) and `archiveAction: delete` (or `stop`). After `archiveGraceSecs` (default 20s), the VM is permanently deleted ($0/hr idle, no standby pool required). In the Hub, `settleAction: park` (default) keeps a VM whose chats are all settled (none archived or deleted) stopped instead: reading the chat never wakes it, it does not count toward `hub.maxSandboxes`, and after 14 days (Boat drops a stopped VM's disk) the chat stays listed read only. `settleAction: delete` deletes it as before.
 - **Modular Sandbox Providers (`src/providers/`):** Built around a capability-gated `SandboxProvider` contract inspired by [`@opencoredev/sandbox-sdk`](https://sandbox-sdk.app/docs) (`pause`, `snapshots`, `private-preview` with `{ url, headers }`). Ships with native `BoatProvider` by default AND a drop-in `SandboxSdkProvider` adapter so Daytona, E2B, Docker, Vercel Sandbox, Upstash Box, Railway, Freestyle, or `boxd` can plug in via `provider:` in `sentinel.yaml`.
 - **Link Security Hardening (`src/security.ts`):** Built-in sliding-window auth rate limiting (`429` on `/oauth/token` and API brute force), optional zero-dependency origin-side **Cloudflare Access RS256 JWT verification** (`security.cloudflareAccess`), `robots.txt` + `X-Robots-Tag: noindex`, strict CSP & `X-Frame-Options: DENY` on the Dashboard, and `boat.hostVisibility: private` support for cookie/token-gated upstream VM URLs.
 - **Built-in stdio MCP Server + Agent Skill:** Run `bun run sentinel mcp` and install [`skills/t3-boat-sentinel/SKILL.md`](skills/t3-boat-sentinel/SKILL.md) so personal assistants and coding agents can check status, add repos, bake snapshots, and manage sandboxes.
@@ -163,7 +163,7 @@ Follow the agent-ready blueprint in [**`docs/AGENT-DEPLOY.md`**](docs/AGENT-DEPL
    Paste the link in **T3 Code → Settings → Environments → Add environment**.
    *(Generate a fresh pairing link for each device — each code is single-use and multiple concurrent pairing codes are supported.)*
 
-4. **Code away:** Open your `Boat` environment in T3 Desktop or T3 Mobile, pick any repo, and send a message. Sentinel spawns a fresh Boat VM for that thread, streams live boot progress right inside T3, and destroys the VM automatically when you **Settle** or **Archive** the chat.
+4. **Code away:** Open your `Boat` environment in T3 Desktop or T3 Mobile, pick any repo, and send a message. Sentinel spawns a fresh Boat VM for that thread, streams live boot progress right inside T3, destroys the VM automatically when you **Archive** the chat, and parks it when you **Settle** it.
 
 ---
 

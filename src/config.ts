@@ -196,6 +196,13 @@ export interface SentinelConfig {
     deleteWhen: "archived" | "archived-or-settled";
     /** Action on archive: `delete` immediately (after grace) or `stop` (keeps disk up to 14d). */
     archiveAction: "delete" | "stop";
+    /**
+     * Hub only, with `deleteWhen: archived-or-settled`: what happens to a chat VM whose chats are all
+     * settled but not all archived or deleted. `park` (default) stops it like an idle sleep and keeps
+     * the chat in the sidebar; it does not count toward `hub.maxSandboxes` and wakes only when the chat
+     * is continued (Boat keeps a stopped VM 14 days, then the chat stays read only). `delete` deletes it.
+     */
+    settleAction: "park" | "delete";
     reaperIntervalSecs: number;
     /** Safety cap in hours for sleeping sandboxes (0 = disabled, default 0 to prevent surprise data loss). */
     maxSleepingHours: number;
@@ -278,6 +285,7 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
       | "archived"
       | "archived-or-settled",
     archiveAction: (parsed.boat?.archiveAction === "stop" ? "stop" : "delete") as "delete" | "stop",
+    settleAction: (parsed.boat?.settleAction === "delete" ? "delete" : "park") as "park" | "delete",
     reaperIntervalSecs: Number(parsed.boat?.reaperIntervalSecs ?? 300),
     maxSleepingHours: Number(parsed.boat?.maxSleepingHours ?? 0),
     sandboxPrefix: parsed.boat?.sandboxPrefix ?? "t3s-",
