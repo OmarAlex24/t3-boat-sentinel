@@ -148,9 +148,9 @@ export interface SentinelConfig {
     autoUpdateOnWake: boolean;
     /** Optional JSON file on sentinel merged into `~/.t3/userdata/settings.json` on every VM boot (inherits providers & preferences). */
     settingsFile?: string;
-    /** Optional ACP Registry agent IDs to pre-prepare into `baseSnapshot` during `bake base` (e.g. ["devin"]). */
+    /** Optional ACP Registry agent IDs to pre-prepare into `baseSnapshot` during `bake base` (e.g. ["devin"]); every bake verifies them. */
     prepareAcpAgents?: string[];
-    /** Optional managed provider instance IDs to pre-install into `baseSnapshot` during `bake base` (e.g. ["antigravity"]). */
+    /** Optional managed provider instance IDs to pre-install into `baseSnapshot` during `bake base` (e.g. ["antigravity"]); every bake verifies them. */
     installProviders?: string[];
   };
   boat: {

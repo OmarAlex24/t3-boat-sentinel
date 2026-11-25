@@ -640,8 +640,10 @@ export class LifecycleManager {
         await this.boat.execOk(tempId, project.bakeCmd, 900);
       }
 
-      // Upload settings template during `bake base` so `prepareAcpAgents` / `installProviders` see enabled providerInstances
-      if (isBase && this.config.t3.settingsFile && existsSync(this.config.t3.settingsFile)) {
+      // Upload the settings template for every bake so T3 runs with the real providerInstances: base bakes need it
+      // for `prepareAcpAgents` / `installProviders`, and project bakes would otherwise re-probe without those
+      // instances and leave the provider status caches inherited from base-t3 stale in the new snapshot.
+      if (this.config.t3.settingsFile && existsSync(this.config.t3.settingsFile)) {
         await this.boat.upload(tempId, this.config.t3.settingsFile, "~/.t3-sentinel/t3-settings.json");
       }
 
@@ -654,13 +656,21 @@ export class LifecycleManager {
         `T3_CHANNEL=${shellQuote(effectiveT3Channel)}`,
         `BAKE_CLEAN=1`,
       ];
-      if (isBase && this.config.t3.prepareAcpAgents && this.config.t3.prepareAcpAgents.length > 0) {
-        bakeEnv.push(`T3_PREPARE_ACP_AGENTS=${shellQuote(this.config.t3.prepareAcpAgents.join(","))}`);
+      // Base bakes install the runtimes; project bakes (built from base-t3) only verify them. Either way the
+      // script waits until the provider status caches report installed before the snapshot is taken.
+      const acpAgents = this.config.t3.prepareAcpAgents ?? [];
+      const providers = this.config.t3.installProviders ?? [];
+      if (acpAgents.length > 0) {
+        const name = isBase ? "T3_PREPARE_ACP_AGENTS" : "T3_VERIFY_ACP_AGENTS";
+        bakeEnv.push(`${name}=${shellQuote(acpAgents.join(","))}`);
       }
-      if (isBase && this.config.t3.installProviders && this.config.t3.installProviders.length > 0) {
-        bakeEnv.push(`T3_INSTALL_PROVIDERS=${shellQuote(this.config.t3.installProviders.join(","))}`);
+      if (providers.length > 0) {
+        const name = isBase ? "T3_INSTALL_PROVIDERS" : "T3_VERIFY_PROVIDERS";
+        bakeEnv.push(`${name}=${shellQuote(providers.join(","))}`);
       }
-      const bakeProvisionTimeout = isBase && (this.config.t3.prepareAcpAgents?.length || this.config.t3.installProviders?.length) ? 900 : 300;
+      const hasProviderWork = acpAgents.length > 0 || providers.length > 0;
+      // Verification itself can take up to ~180s (Antigravity validation alone up to 90s)
+      const bakeProvisionTimeout = hasProviderWork ? (isBase ? 1200 : 600) : 300;
       const out = await this.boat.execOk(
         tempId,
         `${bakeEnv.join(" ")} bash ~/.t3-sentinel/provision-base.sh`,

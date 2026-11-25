@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
@@ -250,6 +250,35 @@ describe("LifecycleManager hardening", () => {
     expect(boat.created[1].from).toBe("base-t3");
     expect(boat.created[2].from).toBe("base-t3");
     expect(state.getTemplates().descriptor).not.toBeNull();
+  });
+
+  test("base bakes install and verify provider runtimes; project bakes upload settings and verify only", async () => {
+    const config = makeTestConfig();
+    const settingsFile = join(config.stateDir, "t3-settings.json");
+    writeFileSync(settingsFile, JSON.stringify({ providerInstances: {} }));
+    config.t3 = { ...config.t3, settingsFile, prepareAcpAgents: ["devin"], installProviders: ["antigravity"] };
+    const state = new StateStore(config.stateDir, config);
+    const boat = new MockBoat();
+    const uploads: Array<{ local: string; remote: string }> = [];
+    boat.upload = async (...args: unknown[]) => {
+      uploads.push({ local: String(args[1]), remote: String(args[2]) });
+    };
+    const lifecycle = new LifecycleManager(config, state, boat);
+    const bakeScript = () => boat.execScripts.filter((s) => s.includes("BAKE_CLEAN=1")).at(-1) ?? "";
+    const settingsUploads = () => uploads.filter((u) => u.remote === "~/.t3-sentinel/t3-settings.json");
+
+    await lifecycle.bake("base");
+    expect(bakeScript()).toContain("T3_PREPARE_ACP_AGENTS='devin'");
+    expect(bakeScript()).toContain("T3_INSTALL_PROVIDERS='antigravity'");
+    expect(bakeScript()).not.toContain("T3_VERIFY_");
+    expect(settingsUploads().map((u) => u.local)).toEqual([settingsFile]);
+
+    await lifecycle.bake("my-app");
+    expect(bakeScript()).toContain("T3_VERIFY_ACP_AGENTS='devin'");
+    expect(bakeScript()).toContain("T3_VERIFY_PROVIDERS='antigravity'");
+    expect(bakeScript()).not.toContain("T3_PREPARE_ACP_AGENTS");
+    expect(bakeScript()).not.toContain("T3_INSTALL_PROVIDERS");
+    expect(settingsUploads().map((u) => u.local)).toEqual([settingsFile, settingsFile]);
   });
 
   test("concurrent spawns reserve distinct slots and never clobber an occupied slot unless replace=true", async () => {
