@@ -42,6 +42,7 @@ import { StateStore } from "./state.ts";
 import { T3ReleaseResolver } from "./t3-release.ts";
 import { ATTACHMENT_UPLOAD_URL_TTL_MS, parseUploadRequest } from "./hub-attachments.ts";
 import { loadT3Contracts } from "./testing/t3-contracts.ts";
+import { HubMediaProxy, PREVIEW_ACK, newMediaWsData, type HubMediaWsData } from "./hub-media.ts";
 
 /**
  * The installed T3 app's own RPC schemas (`T3_APP_ASAR`, else the macOS Nightly app), or null when
@@ -4501,11 +4502,14 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       });
       expect(vm1.mediaConnections).toHaveLength(0);
       expect(hub.mediaSocketCount("sb-2")).toBe(1);
-      // The client's ack reaches vm2 as sent, and vm2's answer comes back
-      pane.ws.send(JSON.stringify({ type: "ack" }));
+      // The Hub acks vm2's frame itself, and vm2's answer comes back; the client's own ack stays at the Hub
       await until(() => pane.messages.length > 0);
       expect(vm2.mediaMessages).toEqual([JSON.stringify({ type: "ack" })]);
       expect(JSON.parse(pane.messages[0])).toEqual({ type: "control", acked: "vm-pv2" });
+      pane.ws.send(JSON.stringify({ type: "ack" }));
+      pane.ws.send(JSON.stringify({ type: "takeControl" }));
+      await until(() => vm2.mediaMessages.length > 1);
+      expect(vm2.mediaMessages).toEqual([JSON.stringify({ type: "ack" }), JSON.stringify({ type: "takeControl" })]);
 
       // A download from that tab goes to vm2 too, without the Hub's ticket
       const dl = await fetch(`${client.base}/api/preview-stream/download?threadId=thread-B&tabId=tab-1&id=d1&wsTicket=${ticket}`, { headers: { host: cfg.hub!.host } });
@@ -7067,4 +7071,269 @@ describe("repository identity of Boat projects (T3's RepositoryIdentityResolver)
       deletedAt: null,
     })).toEqual({ ok: true });
   });
+});
+
+describe("preview frame flow control at the Hub (hub-media)", () => {
+  const until = async (cond: () => boolean, timeoutMs = 3_000) => {
+    const start = Date.now();
+    while (!cond()) {
+      if (Date.now() - start > timeoutMs) throw new Error("condition not met in time");
+      await Bun.sleep(5);
+    }
+  };
+  const text = (data: unknown) => (typeof data === "string" ? data : new TextDecoder().decode(data as ArrayBuffer));
+  const frameBytes = (label: string) => new TextEncoder().encode(label);
+
+  /**
+   * A fake VM media server, a Hub running only `HubMediaProxy`, and a client socket on the Hub.
+   * `vmOneWayMs` delays everything the VM sends and receives (half the Hub<->VM round trip);
+   * `onVmOpen` / `onVmMessage` script the VM. `flowControl: false` is the old pass-through.
+   */
+  async function mediaRig(opts: {
+    path?: string;
+    vmOneWayMs?: number;
+    flowControl?: boolean;
+    onVmOpen?: (send: (data: string | Uint8Array) => void) => void;
+    onVmMessage?: (msg: string, send: (data: string | Uint8Array) => void) => void;
+  } = {}) {
+    const vmOneWay = opts.vmOneWayMs ?? 0;
+    const vmReceived: string[] = [];
+    let vmSocket: Bun.ServerWebSocket<unknown> | null = null;
+    const later = (fn: () => void) => (vmOneWay > 0 ? setTimeout(fn, vmOneWay) : fn());
+    const vmSend = (data: string | Uint8Array) =>
+      later(() => {
+        if (!vmSocket) return;
+        if (typeof data === "string") vmSocket.sendText(data);
+        else vmSocket.sendBinary(data);
+      });
+    const vm = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req, srv) {
+        return srv.upgrade(req) ? undefined : new Response("no", { status: 400 });
+      },
+      websocket: {
+        open(ws) {
+          vmSocket = ws;
+          opts.onVmOpen?.(vmSend);
+        },
+        message(_ws, raw) {
+          const msg = text(raw);
+          later(() => {
+            vmReceived.push(msg);
+            opts.onVmMessage?.(msg, vmSend);
+          });
+        },
+      },
+    });
+    cleanups.push(() => vm.stop(true));
+    const proxy = new HubMediaProxy(async () => ({
+      ok: true,
+      sandbox: { sandboxId: "sb-fc", upstreamUrl: `http://127.0.0.1:${vm.port}`, upstreamToken: "vm-token" },
+    }));
+    const hub = Bun.serve<HubMediaWsData, never>({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req, srv) {
+        const data = newMediaWsData("client-1", new URL(req.url));
+        if (opts.flowControl === false) data.frames = null;
+        return srv.upgrade(req, { data }) ? undefined : new Response("no", { status: 400 });
+      },
+      websocket: {
+        open: (ws) => proxy.open(ws),
+        message: (ws, msg) => proxy.message(ws, msg),
+        close: (ws, code, reason) => proxy.close(ws, code, reason),
+      },
+    });
+    cleanups.push(() => hub.stop(true));
+    const path = opts.path ?? "/api/preview-stream/ws?threadId=t1&tabId=tab-1&maxWidth=800&maxHeight=600&wsTicket=hub-ticket";
+    const client = new WebSocket(`ws://127.0.0.1:${hub.port}${path}`);
+    client.binaryType = "arraybuffer";
+    cleanups.push(() => client.close());
+    const received: Array<{ kind: "frame" | "text"; body: string }> = [];
+    client.addEventListener("message", (ev) => {
+      received.push({ kind: typeof ev.data === "string" ? "text" : "frame", body: text(ev.data) });
+    });
+    await new Promise<void>((resolve) => client.addEventListener("open", () => resolve()));
+    await until(() => vmSocket !== null && proxy.count("sb-fc") === 1);
+    await Bun.sleep(10);
+    const vmClose = (code: number, reason: string) => vmSocket?.close(code, reason);
+    return { vmSend, vmClose, vmReceived, client, received, proxy, frames: () => received.filter((m) => m.kind === "frame").map((m) => m.body) };
+  }
+
+  test("the VM gets an ack for each frame before the client has acked any", async () => {
+    let sent = 0;
+    const rig = await mediaRig({
+      onVmOpen: (send) => send(frameBytes(`f${++sent}`)),
+      // The VM's one-in-flight: the next frame goes out on the ack
+      onVmMessage: (msg, send) => {
+        if (msg === PREVIEW_ACK && sent < 3) send(frameBytes(`f${++sent}`));
+      },
+    });
+    await until(() => rig.vmReceived.length === 3);
+    expect(rig.vmReceived).toEqual([PREVIEW_ACK, PREVIEW_ACK, PREVIEW_ACK]);
+    // The client acked nothing, so it has the first frame only
+    await Bun.sleep(30);
+    expect(rig.frames()).toEqual(["f1"]);
+  });
+
+  test("a slow client gets the newest frame after its ack; the frames in between are dropped", async () => {
+    const rig = await mediaRig();
+    rig.vmSend(frameBytes("f1"));
+    await until(() => rig.frames().length === 1 && rig.vmReceived.length === 1);
+    for (const label of ["f2", "f3", "f4"]) rig.vmSend(frameBytes(label));
+    await until(() => rig.vmReceived.length === 4);
+    await Bun.sleep(30);
+    expect(rig.frames()).toEqual(["f1"]);
+    rig.client.send(PREVIEW_ACK);
+    await until(() => rig.frames().length === 2);
+    expect(rig.frames()).toEqual(["f1", "f4"]);
+    // Nothing is held any more: another ack sends nothing, and the next frame goes straight out
+    rig.client.send(PREVIEW_ACK);
+    await Bun.sleep(30);
+    expect(rig.frames()).toEqual(["f1", "f4"]);
+    rig.vmSend(frameBytes("f5"));
+    await until(() => rig.frames().length === 3);
+    expect(rig.frames()).toEqual(["f1", "f4", "f5"]);
+  });
+
+  test("client acks never reach the VM, double acks and binary acks included", async () => {
+    const rig = await mediaRig();
+    rig.client.send(PREVIEW_ACK);
+    rig.client.send(PREVIEW_ACK);
+    rig.client.send(new TextEncoder().encode(PREVIEW_ACK));
+    rig.client.send(JSON.stringify({ type: "mouse", action: "move" }));
+    await until(() => rig.vmReceived.length > 0);
+    await Bun.sleep(30);
+    expect(rig.vmReceived).toEqual([JSON.stringify({ type: "mouse", action: "move" })]);
+    // One frame, three client acks: the VM sees exactly the Hub's one ack
+    rig.vmSend(frameBytes("f1"));
+    await until(() => rig.frames().length === 1);
+    for (let i = 0; i < 3; i++) rig.client.send(PREVIEW_ACK);
+    await Bun.sleep(50);
+    expect(rig.vmReceived).toEqual([JSON.stringify({ type: "mouse", action: "move" }), PREVIEW_ACK]);
+  });
+
+  test("control and input pass through unchanged and in order, past a held frame", async () => {
+    const rig = await mediaRig();
+    const input1 = JSON.stringify({ type: "key", key: "a" });
+    const input2 = JSON.stringify({ type: "takeControl" });
+    rig.client.send(input1);
+    rig.client.send(PREVIEW_ACK);
+    rig.client.send(input2);
+    rig.client.send("not json");
+    await until(() => rig.vmReceived.length === 3);
+    expect(rig.vmReceived).toEqual([input1, input2, "not json"]);
+
+    const viewport = JSON.stringify({ type: "viewport", width: 800, height: 600 });
+    const control = JSON.stringify({ type: "control", canOperate: true, controller: "you", generation: 2, dialog: null });
+    rig.vmSend(frameBytes("f1"));
+    rig.vmSend(frameBytes("f2"));
+    rig.vmSend(viewport);
+    rig.vmSend(control);
+    await until(() => rig.received.length === 3);
+    await Bun.sleep(30);
+    // f2 waits for the client's ack; the control messages do not
+    expect(rig.received).toEqual([
+      { kind: "frame", body: "f1" },
+      { kind: "text", body: viewport },
+      { kind: "text", body: control },
+    ]);
+    rig.client.send(PREVIEW_ACK);
+    await until(() => rig.received.length === 4);
+    expect(rig.received[3]).toEqual({ kind: "frame", body: "f2" });
+    expect(rig.vmReceived.slice(3)).toEqual([PREVIEW_ACK, PREVIEW_ACK]);
+  });
+
+  test("the device hub stays a plain pipe: binary messages and acks pass through", async () => {
+    const rig = await mediaRig({ path: "/api/device-hub/ws?device=d1" });
+    rig.vmSend(frameBytes("d1"));
+    rig.vmSend(frameBytes("d2"));
+    await until(() => rig.frames().length === 2);
+    rig.client.send(PREVIEW_ACK);
+    await until(() => rig.vmReceived.length === 1);
+    expect(rig.vmReceived).toEqual([PREVIEW_ACK]);
+    expect(rig.frames()).toEqual(["d1", "d2"]);
+  });
+
+  test("a held frame is dropped when the VM closes, and the VM's close code reaches the client", async () => {
+    const rig = await mediaRig();
+    let closed = null as number | null;
+    rig.client.addEventListener("close", (ev) => (closed = ev.code));
+    rig.vmSend(frameBytes("f1"));
+    rig.vmSend(frameBytes("f2"));
+    await until(() => rig.vmReceived.length === 2);
+    rig.vmClose(4404, "tab closed");
+    await until(() => closed !== null);
+    expect(closed).toBe(4404);
+    expect(rig.frames()).toEqual(["f1"]);
+  });
+
+  /**
+   * Latency simulation: a VM with T3's real one-in-flight logic, a page that draws a new frame
+   * every 16 ms, 170 ms Hub<->VM and 100 ms client<->Hub round trips, and a client that acks each
+   * frame on arrival like the app. Before = the old pass-through, after = flow control at the Hub.
+   */
+  test("latency simulation: frames per second before and after", async () => {
+    const VM_ONE_WAY = 85;
+    const CLIENT_ONE_WAY = 50;
+    const WARMUP_MS = 600;
+    const WINDOW_MS = 3_000;
+    async function run(flowControl: boolean) {
+      // The VM: T3's one-in-flight with a newer frame superseding the pending one
+      let inFlight = false;
+      let pending: Uint8Array | null = null;
+      let seq = 0;
+      let send: (data: Uint8Array) => void = () => {};
+      const sendFrame = (frame: Uint8Array) => {
+        inFlight = true;
+        send(frame);
+      };
+      const timer = setInterval(() => {
+        const frame = frameBytes(`${++seq}:${Date.now()}`);
+        if (!inFlight) sendFrame(frame);
+        else pending = frame;
+      }, 16);
+      cleanups.push(() => clearInterval(timer));
+      const rig = await mediaRig({
+        flowControl,
+        vmOneWayMs: VM_ONE_WAY,
+        onVmOpen: (vmSend) => {
+          send = vmSend;
+        },
+        onVmMessage: (msg) => {
+          if (msg !== PREVIEW_ACK) return;
+          inFlight = false;
+          const next = pending;
+          pending = null;
+          if (next) sendFrame(next);
+        },
+      });
+      // The client: each frame lands CLIENT_ONE_WAY after the Hub sent it, and its ack takes as long back
+      const arrivals: Array<{ at: number; age: number }> = [];
+      rig.client.addEventListener("message", (ev) => {
+        if (typeof ev.data === "string") return;
+        const producedAt = Number(text(ev.data).split(":")[1]);
+        setTimeout(() => {
+          const at = Date.now();
+          arrivals.push({ at, age: at - producedAt });
+          setTimeout(() => rig.client.send(PREVIEW_ACK), CLIENT_ONE_WAY);
+        }, CLIENT_ONE_WAY);
+      });
+      const start = Date.now();
+      await Bun.sleep(WARMUP_MS + WINDOW_MS);
+      clearInterval(timer);
+      const window = arrivals.filter((a) => a.at >= start + WARMUP_MS && a.at < start + WARMUP_MS + WINDOW_MS);
+      const ages = window.map((a) => a.age).sort((x, y) => x - y);
+      rig.client.close();
+      return { fps: window.length / (WINDOW_MS / 1000), medianAgeMs: ages[Math.floor(ages.length / 2)] ?? NaN };
+    }
+    const before = await run(false);
+    const after = await run(true);
+    console.log(
+      `[preview flow sim] 170 ms Hub<->VM, 100 ms client<->Hub: before ${before.fps.toFixed(1)} fps (median frame age ${before.medianAgeMs} ms), after ${after.fps.toFixed(1)} fps (median frame age ${after.medianAgeMs} ms)`,
+    );
+    expect(before.fps).toBeLessThan(4.5);
+    expect(after.fps).toBeGreaterThan(before.fps * 1.25);
+  }, 20_000);
 });
