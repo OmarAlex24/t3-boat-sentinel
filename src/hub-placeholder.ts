@@ -421,3 +421,65 @@ export function failPlaceholderThread(
     ),
   };
 }
+
+/** Keys a restored row takes from a cached projection's `thread` (same meaning in both records). */
+const ROW_KEYS_FROM_PROJECTION = [
+  "createdBy",
+  "creationSource",
+  "title",
+  "providerInstanceId",
+  "modelSelection",
+  "runtimeMode",
+  "interactionMode",
+  "branch",
+  "worktreePath",
+  "lineage",
+  "forkedFrom",
+  "createdAt",
+  "updatedAt",
+] as const;
+
+/**
+ * A sidebar row for a chat the Hub has no stored row for (its VM went to sleep before the Hub kept
+ * rows), so a Hub restart does not drop it. Built from the chat's cached projection when there is
+ * one, else from what the Hub knows (project defaults, the sandbox's times). Its VM's own row
+ * replaces it once the VM runs again.
+ */
+export function restoredShellRow(input: {
+  threadId: string;
+  hubProjectId: string;
+  providerInstanceId: string;
+  model: string;
+  /** When the chat was last active (ISO). */
+  at: string;
+  projectionThread?: Record<string, unknown> | null;
+}): Record<string, unknown> {
+  const { shell } = buildPlaceholderThread({
+    threadId: input.threadId,
+    hubProjectId: input.hubProjectId,
+    title: "Sleeping chat",
+    modelSelection: { instanceId: input.providerInstanceId, model: input.model },
+    providerInstanceId: input.providerInstanceId,
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    creationSource: "web",
+    branch: null,
+    worktreePath: null,
+    message: null,
+    now: input.at,
+  });
+  const thread = input.projectionThread;
+  if (thread && typeof thread === "object") {
+    for (const key of ROW_KEYS_FROM_PROJECTION) {
+      const value = thread[key];
+      if (value === undefined) continue;
+      if (value === null && shell[key] !== null) continue;
+      if (value !== null && shell[key] !== null && typeof value !== typeof shell[key]) continue;
+      shell[key] = value;
+    }
+  }
+  shell.id = input.threadId;
+  shell.projectId = input.hubProjectId;
+  delete shell.lastVisitedAt;
+  return shell;
+}

@@ -27,6 +27,7 @@ import {
 } from "./security.ts";
 import type { ProjectConfig, ProjectKlavConfig, SentinelConfig } from "./config.ts";
 import { HubMcpHandler, formatRpcFailure, type HubSandboxPhase } from "./hub-mcp.ts";
+import { HubShellStore } from "./hub-shell-store.ts";
 import {
   ATTACHMENT_UPLOAD_ROUTE_PREFIX,
   ATTACHMENT_UPLOAD_URL_TTL_MS,
@@ -42,6 +43,7 @@ import {
   failPlaceholderThread,
   placeholderInputFrom,
   projectionFromShell,
+  restoredShellRow,
   withStatusNotice,
   type PlaceholderInput,
   type StatusNotice,
@@ -736,7 +738,9 @@ export class HubServer {
   private readonly clients = new Set<ServerWebSocket<HubWsData>>();
   private readonly threadToSandbox = new Map<string, string>();
   private readonly worktreeToSandbox = new Map<string, string>();
+  /** Each active chat's sidebar row; stored on disk (`shellStore`) while the chat has a sandbox. */
   private readonly threadShells = new Map<string, Record<string, unknown>>();
+  private readonly shellStore: HubShellStore;
   private readonly inFlightSpawns = new Map<string, Promise<HubSandboxRecord>>();
   private readonly inFlightWakes = new Map<string, Promise<HubSandboxRecord>>();
   private readonly inFlightSleeps = new Map<string, Promise<void>>();
@@ -801,6 +805,7 @@ export class HubServer {
     private readonly rateLimiter?: AuthRateLimiter,
   ) {
     this.boat = asSandboxProvider(provider);
+    this.shellStore = new HubShellStore(config.stateDir, (threadId) => this.keepsStoredShell(threadId));
     this.mcp = new HubMcpHandler(
       config,
       state,
@@ -872,13 +877,73 @@ export class HubServer {
     for (const sb of this.state.listHubSandboxes()) {
       for (const tid of sb.threadIds) this.threadToSandbox.set(tid, sb.sandboxId);
       for (const wt of sb.worktreePaths) this.worktreeToSandbox.set(wt, sb.sandboxId);
+    }
+    this.restoreThreadShells();
+    for (const sb of this.state.listHubSandboxes()) {
       if (sb.phase === "running") {
         this.attachBridge(sb);
       }
     }
   }
 
+  /**
+   * After a restart: every chat whose VM still exists (asleep, booting or running) keeps its sidebar
+   * row until its VM reports its own. A chat with no stored row (its VM slept before the Hub kept
+   * rows) gets one built from its cached projection, else from the project's defaults. Rows of
+   * chats whose sandbox is gone are deleted.
+   */
+  private restoreThreadShells(): void {
+    let restored = 0;
+    let rebuilt = 0;
+    for (const sb of this.state.listHubSandboxes()) {
+      if (sb.phase === "destroying") continue;
+      const project = this.state.getAllProjects(this.config)[sb.project];
+      for (const threadId of sb.threadIds) {
+        let row = this.shellStore.load(threadId);
+        if (row) {
+          restored++;
+        } else {
+          const cached = this.readProjectionCache(threadId);
+          row = restoredShellRow({
+            threadId,
+            hubProjectId: sb.hubProjectId,
+            providerInstanceId: project?.defaultProvider ?? "claudeAgent",
+            model: project?.defaultModel ?? "claude-opus-5-5",
+            at: sb.sleepingSince ?? sb.lastActiveAt ?? sb.createdAt,
+            projectionThread: (cached?.thread as Record<string, unknown> | undefined) ?? null,
+          });
+          this.shellStore.save(threadId, row);
+          rebuilt++;
+        }
+        this.threadShells.set(threadId, row);
+      }
+    }
+    for (const threadId of this.shellStore.storedThreadIds()) {
+      if (!this.keepsStoredShell(threadId)) this.shellStore.remove(threadId);
+    }
+    if (restored + rebuilt > 0) console.log(`[hub] restored ${restored} chat row(s) from disk, rebuilt ${rebuilt} without one`);
+  }
+
+  /** A row is kept on disk only while its chat is bound to a sandbox that still exists. */
+  private keepsStoredShell(threadId: string): boolean {
+    if (!this.threadShells.has(threadId)) return false;
+    const sandboxId = this.threadToSandbox.get(threadId);
+    const sb = sandboxId ? this.state.getHubSandbox(sandboxId) : undefined;
+    return !!sb && sb.phase !== "destroying" && sb.threadIds.includes(threadId);
+  }
+
+  private setThreadShell(threadId: string, row: Record<string, unknown>): void {
+    this.threadShells.set(threadId, row);
+    this.shellStore.save(threadId, row);
+  }
+
+  private deleteThreadShell(threadId: string): void {
+    this.threadShells.delete(threadId);
+    this.shellStore.remove(threadId);
+  }
+
   stop(): void {
+    this.shellStore.flush();
     for (const timer of this.pauseRetries.values()) clearTimeout(timer);
     this.pauseRetries.clear();
     for (const bridge of this.bridges.values()) {
@@ -2022,7 +2087,7 @@ export class HubServer {
     const pending: PendingThreadLaunch = { record, seenOnVm: false, cancelled: false, ready, resolveReady, rejectReady };
     if (record.phase === "failed") rejectReady(new Error(record.error ?? "This chat's VM failed to start"));
     this.pendingThreads.set(record.threadId, pending);
-    this.threadShells.set(record.threadId, record.shell);
+    this.setThreadShell(record.threadId, record.shell);
     return pending;
   }
 
@@ -2128,7 +2193,7 @@ export class HubServer {
     pending.cancelled = true;
     for (const id of this.stagedIdsIn(pending.record.payload)) this.dropStagedAttachment(id);
     this.forgetPendingLaunch(threadId);
-    this.threadShells.delete(threadId);
+    this.deleteThreadShell(threadId);
     this.localThreadSubs.delete(threadId);
     pending.rejectReady(new Error("This chat was closed before its VM finished starting"));
     const sequence = this.state.nextHubSequence();
@@ -2154,7 +2219,7 @@ export class HubServer {
     this.persistPendingLaunch(pending.record);
     // Setup card first, while the client still follows it (it stops once the run is no longer preparing)
     this.markWorktreeSetupFailed(threadId, message);
-    this.threadShells.set(threadId, failed.shell);
+    this.setThreadShell(threadId, failed.shell);
     this.broadcastShellItem({
       kind: "thread.updated",
       sequence: this.state.nextHubSequence(),
@@ -3486,7 +3551,7 @@ export class HubServer {
     this.mcp.recordThreadsDestroyed(threadIds, reason);
     for (const tid of threadIds) {
       this.threadToSandbox.delete(tid);
-      this.threadShells.delete(tid);
+      this.deleteThreadShell(tid);
       this.localThreadSubs.delete(tid);
       this.dropProjectionCache(tid);
       this.broadcastShellItem({
@@ -3591,17 +3656,21 @@ export class HubServer {
             };
           });
         }
+        const listed = new Set<string>();
         for (const t of snap.threads ?? []) {
           const rewritten = rewriteProjectIds(t, sb.vmProjectId, sb.hubProjectId) as Record<string, unknown>;
           const tid = String(rewritten.id ?? "");
-          if (!tid || this.skipVmShellItem(tid)) continue;
-          const isNew = !this.threadShells.has(tid);
-          this.threadShells.set(tid, rewritten);
+          if (!tid) continue;
+          listed.add(tid);
+          if (this.skipVmShellItem(tid)) continue;
+          const previous = this.threadShells.get(tid);
           this.bindThreadToSandbox(tid, sandboxId);
+          this.setThreadShell(tid, rewritten);
           if (typeof rewritten.worktreePath === "string" && rewritten.worktreePath) {
             this.bindWorktreeToSandbox(rewritten.worktreePath, sandboxId);
           }
-          if (isNew) {
+          // New, or a row the Hub restored while the VM was down: the VM's live row wins
+          if (!previous || JSON.stringify(previous) !== JSON.stringify(rewritten)) {
             this.broadcastShellItem({
               kind: "thread.updated",
               sequence: this.state.nextHubSequence(),
@@ -3610,12 +3679,23 @@ export class HubServer {
             });
           }
         }
+        // The snapshot lists every active thread of this VM (the bridge asks without `omitOlderSettled`
+        // or `omitIdleSubagents`): a chat it no longer lists was archived or deleted while the Hub
+        // was not listening. A trimmed snapshot (`olderSettled` set) proves nothing, so it removes none.
+        const complete = !("olderSettled" in (item.snapshot as Record<string, unknown>));
+        for (const tid of complete ? (this.state.getHubSandbox(sandboxId)?.threadIds ?? []) : []) {
+          if (listed.has(tid) || this.pendingThreads.has(tid) || !this.threadShells.has(tid)) continue;
+          this.deleteThreadShell(tid);
+          this.broadcastShellItem({ kind: "thread.removed", sequence: this.state.nextHubSequence(), location: "active", threadId: tid });
+        }
       } else if (item.kind === "thread.updated" && item.thread && typeof item.thread === "object") {
         const rewritten = rewriteProjectIds(item.thread, sb.vmProjectId, sb.hubProjectId) as Record<string, unknown>;
         const tid = String(rewritten.id ?? "");
         if (!tid || this.skipVmShellItem(tid)) continue;
-        this.threadShells.set(tid, rewritten);
         this.bindThreadToSandbox(tid, sandboxId);
+        // An archived thread leaves the active list (the merged snapshot's `threads`)
+        if (item.location === "archive") this.deleteThreadShell(tid);
+        else this.setThreadShell(tid, rewritten);
         if (typeof rewritten.worktreePath === "string" && rewritten.worktreePath) {
           this.bindWorktreeToSandbox(rewritten.worktreePath, sandboxId);
         }
@@ -3626,7 +3706,7 @@ export class HubServer {
           thread: rewritten,
         });
       } else if (item.kind === "thread.removed" && typeof item.threadId === "string") {
-        this.threadShells.delete(item.threadId);
+        if (item.location !== "archive") this.deleteThreadShell(item.threadId);
         this.broadcastShellItem({
           kind: "thread.removed",
           sequence: this.state.nextHubSequence(),
@@ -4011,6 +4091,9 @@ export class HubServer {
     this.state.updateHubSandbox(sandboxId, (s) => {
       if (!s.threadIds.includes(threadId)) s.threadIds.push(threadId);
     });
+    // A row the Hub showed before the binding (a booting chat) is stored once the chat has its VM
+    const row = this.threadShells.get(threadId);
+    if (row) this.shellStore.save(threadId, row);
   }
 
   private bindWorktreeToSandbox(worktreePath: string, sandboxId: string): void {

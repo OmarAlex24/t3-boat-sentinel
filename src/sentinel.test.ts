@@ -951,6 +951,8 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     /** Upload URLs this VM issued, and the bytes clients (the Hub) posted to them. */
     const uploadUrls = new Map<string, { attachmentId: string; payload: Record<string, unknown> }>();
     const uploads: Array<{ attachmentId: string; payload: Record<string, unknown>; contentType: string | null; bytes: Uint8Array }> = [];
+    /** Active threads this VM holds, as rows its shell snapshot lists (like a real VM after a reconnect). */
+    const threads = new Map<string, Record<string, unknown>>();
     let vmSettings = (opts.configSnapshot?.settings ?? null) as Record<string, unknown> | null;
     const seenMethods: Array<{ tag: string; payload: unknown }> = [];
     const acks: string[] = [];
@@ -1058,7 +1060,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
                       schemaVersion: 2,
                       snapshotSequence: 1,
                       projects: [{ id: vmProjectId, title: "my-app", workspaceRoot: "/home/user/my-app" }],
-                      threads: [],
+                      threads: [...threads.values()],
                       archivedThreads: [],
                     },
                   },
@@ -1145,13 +1147,8 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
           if (frame.tag === "orchestration.launchThread") {
             const p = frame.payload ?? {};
             const threadId = String(p.threadId);
-            const threadShell = {
-              id: threadId,
-              projectId: vmProjectId,
-              title: String(p.title ?? "Chat"),
-              worktreePath: `/home/user/.t3/worktrees/my-app/${vmTag}-${threadId}`,
-              status: "running",
-            };
+            const threadShell = vmThreadRow(threadId, vmProjectId, String(p.title ?? "Chat"), `/home/user/.t3/worktrees/my-app/${vmTag}-${threadId}`);
+            threads.set(threadId, threadShell);
             ws.sendText(
               JSON.stringify({
                 _tag: "Exit",
@@ -1232,7 +1229,20 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       pushConfigItems,
       getSettings: () => vmSettings,
       uploads,
+      threads,
     };
+  }
+
+  /** A thread row as a T3 VM lists it (every key `OrchestrationV2ThreadShell` requires), running. */
+  function vmThreadRow(threadId: string, projectId: string, title: string, worktreePath: string | null): Record<string, unknown> {
+    const input = placeholderInputFrom(
+      "launch",
+      { title, modelSelection: { instanceId: "claudeAgent", model: "claude-opus-5-5" }, runtimeMode: "full-access", interactionMode: "default" },
+      threadId,
+      projectId,
+    )!;
+    const { lastVisitedAt: _visited, ...row } = buildPlaceholderThread(input).shell;
+    return { ...row, worktreePath, status: "running" };
   }
 
   /** Pairs with the Hub and opens one client WebSocket; returns helpers to send and await frames. */
@@ -2013,6 +2023,109 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       expect(hub.handle.state.getHubSandbox(sandboxId)!.phase).toBe("sleeping");
       return { vm, client, sandboxId, ...hub };
     }
+
+    test("a Hub restart keeps every chat whose VM still exists in the sidebar; the VM's live row wins once it runs", async () => {
+      // One fake VM per sandbox, as in production (each lists only its own threads)
+      const vms = ["vm-r1", "vm-r2", "vm-r3", "vm-r4"].map((tag) => startFakeVmT3Server(tag));
+      for (const vm of vms) cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat, dir } = await startHubWithVm(vms[0], "t3-sentinel-hub-sidebar-restart-");
+      boat.hostPublic = async (id: string) => vms[Number(id.slice("sb-".length)) - 1].url;
+      const client: HubClient = await connectHubClient(handle, cfg);
+      const hubProjectId = await subscribeHubShell(client);
+      const chats = ["thread-run", "thread-sleep", "thread-cached", "thread-legacy"];
+      for (const threadId of chats) {
+        client.request(`launch-${threadId}`, "orchestration.launchThread", clientLaunchPayload(threadId, hubProjectId, "Hi", `Chat ${threadId}`));
+        await client.waitForFrame(shellThreadUpdate(threadId, (t) => t.status === "running"));
+      }
+      const sandboxOf = (threadId: string) => handle.state.listHubSandboxes().find((sb) => sb.threadIds.includes(threadId))!.sandboxId;
+      for (const threadId of ["thread-sleep", "thread-cached", "thread-legacy"]) await handle.hub!.sleepHubSandbox(sandboxOf(threadId));
+      handle.stop();
+
+      const rows = join(dir, "hub-thread-shells");
+      expect(readdirSync(rows).sort()).toEqual(chats.map((t) => `${t}.json`).sort());
+      // Two chats whose VMs slept before the Hub kept rows: one with a cached projection, one with nothing
+      rmSync(join(rows, "thread-cached.json"));
+      rmSync(join(rows, "thread-legacy.json"));
+      rmSync(join(dir, "hub-thread-cache", "thread-legacy.json"));
+      // A row left behind for a chat whose sandbox is gone
+      writeFileSync(join(rows, "thread-ghost.json"), JSON.stringify({ id: "thread-ghost", title: "Ghost" }));
+
+      const handle2 = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+      cleanups.push(() => handle2.stop());
+      const client2: HubClient = await connectHubClient(handle2, cfg);
+      client2.request("shell", "orchestration.subscribeShell", { requestCompletionMarker: true });
+      const shell = await client2.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "shell");
+      const listed = (shell.values as Array<{ snapshot?: { threads: Array<Record<string, unknown>> } }>)[0].snapshot!.threads;
+      // Each row decodes as the app's `OrchestrationV2ThreadShell` (a bad row breaks the whole sidebar)
+      if (t3Contracts) for (const row of listed) expect(t3Contracts.decodeWith("OrchestrationV2ThreadShell", row)).toEqual({ ok: true });
+      const byId = new Map(listed.map((t) => [String(t.id), t]));
+      expect([...byId.keys()].sort()).toEqual([...chats].sort());
+      expect(byId.get("thread-sleep")).toMatchObject({ title: "Chat thread-sleep", projectId: hubProjectId, status: "running" });
+      expect(byId.get("thread-cached")).toMatchObject({ title: "Cached chat", projectId: hubProjectId });
+      expect(byId.get("thread-legacy")).toMatchObject({ title: "Sleeping chat", projectId: hubProjectId, status: "idle" });
+      await until(() => !existsSync(join(rows, "thread-ghost.json")));
+      await until(() => existsSync(join(rows, "thread-legacy.json")));
+
+      // Opening a rebuilt chat works like before the restart: the Hub's view at once, and its VM wakes,
+      // whose live row then replaces the rebuilt one
+      client2.request("legacy-view", "orchestration.getThreadProjection", { threadId: "thread-legacy" });
+      const view = await client2.waitForFrame((f) => f._tag === "Exit" && f.requestId === "legacy-view");
+      expect((view.exit as { _tag: string })._tag).toBe("Success");
+      if (t3Contracts) expect(t3Contracts.decodeFrame("orchestration.getThreadProjection", view)).toEqual([{ ok: true }]);
+      await client2.waitForFrame(shellThreadUpdate("thread-legacy", (t) => t.title === "Chat thread-legacy"));
+
+      // The VM renamed the chat while the Hub was down: once it runs, its live row replaces the stored one
+      const sleepVm = vms[Number(sandboxOf("thread-sleep").slice(3)) - 1];
+      sleepVm.threads.set("thread-sleep", { ...sleepVm.threads.get("thread-sleep")!, title: "Renamed on the VM" });
+      await handle2.hub!.wakeHubSandbox(sandboxOf("thread-sleep"));
+      await client2.waitForFrame(shellThreadUpdate("thread-sleep", (t) => t.title === "Renamed on the VM"));
+      await until(() => readFileSync(join(rows, "thread-sleep.json"), "utf8").includes("Renamed on the VM"));
+
+      // A chat its VM no longer lists (archived while the Hub did not listen) leaves the sidebar on wake
+      const legacyVm = vms[Number(sandboxOf("thread-legacy").slice(3)) - 1];
+      await until(() => handle2.state.getHubSandbox(sandboxOf("thread-legacy"))?.phase === "running");
+      await handle2.hub!.sleepHubSandbox(sandboxOf("thread-legacy"));
+      legacyVm.threads.delete("thread-legacy");
+      await handle2.hub!.wakeHubSandbox(sandboxOf("thread-legacy"));
+      await client2.waitForFrame(
+        (f) =>
+          f._tag === "Chunk" &&
+          f.requestId === "shell" &&
+          (f.values as Array<{ kind?: string; threadId?: string }>).some((v) => v.kind === "thread.removed" && v.threadId === "thread-legacy"),
+      );
+      await until(() => !existsSync(join(rows, "thread-legacy.json")));
+
+      // A destroyed sandbox takes its chat's row with it
+      await handle2.hub!.destroyHubSandbox(sandboxOf("thread-cached"), "test");
+      await until(() => !existsSync(join(rows, "thread-cached.json")));
+      handle2.stop();
+      expect(readdirSync(rows).sort()).toEqual(["thread-run.json", "thread-sleep.json"]);
+    }, 20_000);
+
+    test("an archived chat leaves the active list and its stored row", async () => {
+      const { vm, handle, client, dir } = await (async () => {
+        const vm = startFakeVmT3Server("vm-archive");
+        cleanups.push(() => vm.server.stop(true));
+        const hub = await startHubWithVm(vm, "t3-sentinel-hub-archive-row-");
+        const client: HubClient = await connectHubClient(hub.handle, hub.cfg);
+        await launchThreadOnHub(client, "thread-arch");
+        return { vm, client, ...hub };
+      })();
+      await until(() => existsSync(join(dir, "hub-thread-shells", "thread-arch.json")));
+      const bridgeShell = (values: unknown[]) =>
+        (handle.hub as unknown as { handleVmShellItems(id: string, items: unknown[]): void }).handleVmShellItems("sb-1", values);
+      const row = { ...vm.threads.get("thread-arch")!, archivedAt: new Date().toISOString() };
+      bridgeShell([{ kind: "thread.removed", sequence: 5, location: "active", threadId: "thread-arch" }]);
+      bridgeShell([{ kind: "thread.updated", sequence: 6, location: "archive", thread: row }]);
+      const archived = await client.waitForFrame(
+        (f) => f._tag === "Chunk" && f.requestId === "shell" && (f.values as Array<{ location?: string }>).some((v) => v.location === "archive"),
+      );
+      if (t3Contracts) for (const r of t3Contracts.decodeFrame("orchestration.subscribeShell", archived)) expect(r).toEqual({ ok: true });
+      client.request("shell2", "orchestration.subscribeShell");
+      const shell = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "shell2");
+      expect((shell.values as Array<{ snapshot: { threads: unknown[] } }>)[0].snapshot.threads).toEqual([]);
+      await until(() => !existsSync(join(dir, "hub-thread-shells", "thread-arch.json")));
+    });
 
     test("opening a sleeping chat shows its history at once, says it is waking, then hands over to the VM", async () => {
       const { vm, client, boat, sandboxId, dir } = await sleepingChat("vm-sleep");
