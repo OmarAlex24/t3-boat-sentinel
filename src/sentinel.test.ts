@@ -1055,6 +1055,8 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       lateShellItemAfterReject?: boolean;
       /** Fail `orchestration.getThreadProjection` (the Hub then has no copy of a sleeping chat). */
       failProjection?: boolean;
+      /** `orchestration.dispatchCommand` of these command types fails, like a VM that refuses it. */
+      failCommands?: string[];
       /** Attachment ids this VM holds: `assets.createUrl` for any other attachment fails as T3 does. */
       attachments?: string[];
       /**
@@ -1318,6 +1320,16 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
           }
           if (frame.tag === "scheduledTasks.subscribe") {
             ws.sendText(JSON.stringify({ _tag: "Chunk", requestId: frame.id, values: [{ tasks: [] }] }));
+            return;
+          }
+          if (frame.tag === "orchestration.dispatchCommand" && opts.failCommands?.includes(String(frame.payload?.type))) {
+            ws.sendText(
+              JSON.stringify({
+                _tag: "Exit",
+                requestId: frame.id,
+                exit: { _tag: "Failure", cause: [{ _tag: "Die", defect: `refused ${String(frame.payload?.type)}` }] },
+              }),
+            );
             return;
           }
           if (frame.tag === "orchestration.getThreadProjection" && opts.failProjection) {
@@ -2865,6 +2877,113 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       expect(handle.state.getHubSandbox(sandboxId)).toBeUndefined();
       expect(handle.state.getHub()?.expiredThreads?.["thread-p"]).toMatchObject({ reason: "gone-remotely" });
       expect((await shellThreads(client, "shell2")).map((t) => t.id)).toEqual(["thread-p"]);
+    });
+  });
+
+  describe("closing a chat whose VM is gone or unreachable", () => {
+    type HubClient = Awaited<ReturnType<typeof connectHubClient>>;
+    const until = async (cond: () => boolean, timeoutMs = 5_000) => {
+      const start = Date.now();
+      while (!cond()) {
+        if (Date.now() - start > timeoutMs) throw new Error("condition not met in time");
+        await Bun.sleep(20);
+      }
+    };
+    type Exit = { _tag: string; cause?: Array<{ _tag: string; error?: { _tag: string; message?: string }; defect?: unknown }> };
+    const exitOf = (f: Record<string, unknown>) => f.exit as Exit;
+    const dispatch = (client: HubClient, reqId: string, threadId: string, type: string) =>
+      client.request(reqId, "orchestration.dispatchCommand", { type, commandId: `cmd-${reqId}`, threadId });
+    const exitFrame = (client: HubClient, reqId: string, timeoutMs?: number) =>
+      client.waitForFrame((f) => f._tag === "Exit" && f.requestId === reqId, timeoutMs);
+    const removedFrame = (threadId: string) => (f: Record<string, unknown>) =>
+      f._tag === "Chunk" &&
+      f.requestId === "shell" &&
+      (f.values as Array<{ kind?: string; threadId?: string }>).some((v) => v.kind === "thread.removed" && v.threadId === threadId);
+    const shellThreads = async (client: HubClient, reqId: string) => {
+      client.request(reqId, "orchestration.subscribeShell");
+      const shell = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === reqId);
+      return (shell.values as Array<{ snapshot: { threads: Array<Record<string, unknown>> } }>)[0].snapshot.threads;
+    };
+    const bridgesOf = (handle: SentinelServerHandle) => (handle.hub as unknown as { bridges: Map<string, unknown> }).bridges;
+
+    async function runningChat(prefix: string, vmOpts: Parameters<typeof startFakeVmT3Server>[1] = {}) {
+      const vm = startFakeVmT3Server(prefix, vmOpts);
+      cleanups.push(() => vm.server.stop(true));
+      const hub = await startHubWithVm(vm, `t3-sentinel-hub-${prefix}-`);
+      const client: HubClient = await connectHubClient(hub.handle, hub.cfg);
+      await launchThreadOnHub(client, "thread-c");
+      const sandboxId = hub.handle.state.listHubSandboxes()[0].sandboxId;
+      return { vm, client, sandboxId, ...hub };
+    }
+
+    for (const command of ["thread.archive", "thread.delete"]) {
+      test(`${command} of a chat whose sandbox record is gone succeeds and removes the row`, async () => {
+        const { handle, client, boat, sandboxId, dir } = await runningChat(`orphan-${command.slice(7)}`);
+        await until(() => existsSync(join(dir, "hub-thread-shells", "thread-c.json")));
+        // The record went (a reaper of an older Hub, a hand edit); the binding and the row stayed
+        handle.state.removeHubSandbox(sandboxId);
+        const started = Date.now();
+        dispatch(client, "close", "thread-c", command);
+        const exit = await exitFrame(client, "close");
+        expect(exitOf(exit)._tag).toBe("Success");
+        if (t3Contracts) expect(t3Contracts.decodeFrame("orchestration.dispatchCommand", exit)).toEqual([{ ok: true }]);
+        expect(Date.now() - started).toBeLessThan(1_000);
+        await client.waitForFrame(removedFrame("thread-c"));
+        expect(await shellThreads(client, "shell2")).toEqual([]);
+        await until(() => !existsSync(join(dir, "hub-thread-shells", "thread-c.json")));
+        expect(boat.deleted).toEqual([]);
+      });
+    }
+
+    test("the reaper removes the chats of a VM Boat no longer lists, stops its bridge and revokes nothing twice", async () => {
+      const { handle, client, boat, sandboxId, dir } = await runningChat("vanished");
+      await until(() => existsSync(join(dir, "hub-thread-shells", "thread-c.json")));
+      expect(bridgesOf(handle).has(sandboxId)).toBe(true);
+      // Deleted in Boat's UI
+      boat.sandboxes.delete(sandboxId);
+      await handle.lifecycle.reaperTick();
+      expect(handle.state.getHubSandbox(sandboxId)).toBeUndefined();
+      const removed = await client.waitForFrame(removedFrame("thread-c"));
+      if (t3Contracts) for (const r of t3Contracts.decodeFrame("orchestration.subscribeShell", removed)) expect(r).toEqual({ ok: true });
+      expect(bridgesOf(handle).has(sandboxId)).toBe(false);
+      expect(await shellThreads(client, "shell2")).toEqual([]);
+      await until(() => !existsSync(join(dir, "hub-thread-shells", "thread-c.json")));
+      // Nothing left in Boat to delete, and closing the chat afterwards is not an error
+      expect(boat.deleted).toEqual([]);
+      dispatch(client, "close", "thread-c", "thread.archive");
+      expect(exitOf(await exitFrame(client, "close"))._tag).toBe("Success");
+    });
+
+    for (const command of ["thread.archive", "thread.delete"]) {
+      test(`${command} of a chat whose VM cannot be reached deletes the VM and succeeds in bounded time`, async () => {
+        const { handle, client, boat, vm, sandboxId } = await runningChat(`unreachable-${command.slice(7)}`);
+        handle.hub!.closeBridgeTimeoutMs = 300;
+        // The VM's relay is gone: its bridge closes and cannot reopen
+        vm.server.stop(true);
+        await until(() => !(bridgesOf(handle).get(sandboxId) as { isOpen(): boolean }).isOpen());
+        const started = Date.now();
+        dispatch(client, "close", "thread-c", command);
+        const exit = await exitFrame(client, "close", 3_000);
+        expect(exitOf(exit)._tag).toBe("Success");
+        if (t3Contracts) expect(t3Contracts.decodeFrame("orchestration.dispatchCommand", exit)).toEqual([{ ok: true }]);
+        expect(Date.now() - started).toBeLessThan(1_500);
+        await client.waitForFrame(removedFrame("thread-c"));
+        expect(boat.deleted).toEqual([sandboxId]);
+        expect(handle.state.getHubSandbox(sandboxId)).toBeUndefined();
+        expect(bridgesOf(handle).has(sandboxId)).toBe(false);
+      });
+    }
+
+    test("a VM that answers a close with a failure is not deleted; the failure reaches the client", async () => {
+      const { handle, client, boat, sandboxId } = await runningChat("close-refused", { failCommands: ["thread.archive"] });
+      handle.hub!.closeBridgeTimeoutMs = 300;
+      dispatch(client, "close", "thread-c", "thread.archive");
+      const exit = await exitFrame(client, "close");
+      expect(exitOf(exit)._tag).toBe("Failure");
+      expect(String(exitOf(exit).cause?.[0]?.defect)).toContain("refused thread.archive");
+      await Bun.sleep(100);
+      expect(boat.deleted).toEqual([]);
+      expect(handle.state.getHubSandbox(sandboxId)?.phase).toBe("running");
     });
   });
 

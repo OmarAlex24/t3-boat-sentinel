@@ -109,6 +109,9 @@ export class LifecycleManager {
   /** Set by the Hub: a parked VM Boat no longer lists; its chats become read only instead of vanishing. */
   onParkedHubSandboxGone?: (sandboxId: string) => Promise<void>;
 
+  /** Set by the Hub: any other Hub VM Boat no longer lists; its chats leave the sidebar and the Hub forgets it. */
+  onHubSandboxGone?: (sandboxId: string) => Promise<void>;
+
   /** Protect a newly created Hub VM from orphan reaping while it is still provisioning. */
   trackInFlightSandbox(sandboxId: string): void {
     this.inFlightSpawns.add(sandboxId);
@@ -833,6 +836,8 @@ export class LifecycleManager {
 
   async reaperTick(): Promise<void> {
     let liveList;
+    // A Hub VM recorded after this moment may be missing from the list below without being gone
+    const listedAt = Date.now();
     try {
       liveList = await this.boat.list();
     } catch (err) {
@@ -867,12 +872,17 @@ export class LifecycleManager {
         // A parked VM Boat no longer lists (its disk expired): its settled chat stays, read only
         console.warn(`[reaper] parked hub sandbox ${hubSb.sandboxId} disappeared remotely -> its chat stays read only`);
         await this.onParkedHubSandboxGone(hubSb.sandboxId).catch((e) => console.warn("[reaper] parked expiry failed:", e));
-      } else if (!remote && hubSb.phase !== "provisioning") {
+      } else if (!remote && hubSb.phase !== "provisioning" && !(Date.parse(hubSb.createdAt) >= listedAt)) {
         console.warn(`[reaper] hub sandbox ${hubSb.sandboxId} disappeared remotely -> removing`);
-        if (hubSb.klavAgentName && this.klav) {
-          await this.klav.revokeForSandbox(hubSb.klavAgentName).catch(() => {});
+        if (this.onHubSandboxGone) {
+          // The Hub drops its bridge, routes and chat rows too, and revokes Klav
+          await this.onHubSandboxGone(hubSb.sandboxId).catch((e) => console.warn("[reaper] hub cleanup failed:", e));
+        } else {
+          if (hubSb.klavAgentName && this.klav) {
+            await this.klav.revokeForSandbox(hubSb.klavAgentName).catch(() => {});
+          }
+          this.state.removeHubSandbox(hubSb.sandboxId);
         }
-        this.state.removeHubSandbox(hubSb.sandboxId);
       } else if (remote && remote.state === "stopped" && hubSb.phase === "running") {
         // Stopped outside the Hub (watchdog backstop): end its Klav proxy sandbox too; the wake mints a new one
         // On failure the name stays, so the wake's revoke of a previous sandbox retries it
