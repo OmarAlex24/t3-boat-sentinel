@@ -13,6 +13,7 @@ import type { KlavClient } from "./klav.ts";
 import { LifecycleManager } from "./lifecycle.ts";
 import { formatRpcFailure } from "./hub-mcp.ts";
 import { chatThreadIdOf, threadGoneError } from "./hub.ts";
+import { REPO_SYNC_MARKER, buildRepoSyncScript, parseRepoSyncOutput } from "./repo-sync.ts";
 import {
   applySettingsOverlay,
   applySettingsUpdate,
@@ -39,6 +40,8 @@ class MockBoat implements BoatClient {
   execScripts: string[] = [];
   upstreamBaseUrl: string | null = null;
   onBeforeBakeStop?: (tempId: string) => Promise<void>;
+  /** Answers an exec before the defaults; return undefined to fall through. */
+  execHook?: (id: string, script: string) => Promise<BoatExecResult> | undefined;
   private seq = 1;
 
   async create(name: string, size: string, fromSnapshot?: string): Promise<string> {
@@ -96,6 +99,12 @@ class MockBoat implements BoatClient {
 
   async exec(id: string, script: string): Promise<BoatExecResult> {
     this.execScripts.push(script);
+    const hooked = this.execHook?.(id, script);
+    if (hooked) return hooked;
+    if (script.includes(REPO_SYNC_MARKER)) {
+      // A VM whose workdir is not a checkout, like most fixtures here
+      return { exitCode: 0, stdout: JSON.stringify({ status: "skipped", reason: "not-a-repository" }), stderr: "" };
+    }
     if (script.includes("BAKE_CLEAN=1")) {
       if (this.onBeforeBakeStop) await this.onBeforeBakeStop(id);
       return {
@@ -1178,7 +1187,11 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
   async function startHubWithVm(
     vm: ReturnType<typeof startFakeVmT3Server>,
     dirPrefix: string,
-    opts: { persistProviderSessions?: string[]; beforeStart?: (dir: string) => void } = {},
+    opts: {
+      persistProviderSessions?: string[];
+      beforeStart?: (dir: string) => void;
+      patchConfig?: (cfg: SentinelConfig) => SentinelConfig;
+    } = {},
   ) {
     const dir = mkdtempSync(join(tmpdir(), dirPrefix));
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
@@ -1187,12 +1200,13 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     boat.snapshots.add("env-my-app");
     boat.upstreamBaseUrl = vm.url;
     const base = makeTestConfig(0);
-    const cfg: SentinelConfig = {
+    const unpatched: SentinelConfig = {
       ...base,
       stateDir: dir,
       t3: { ...base.t3, ...(opts.persistProviderSessions ? { persistProviderSessions: opts.persistProviderSessions } : {}) },
       hub: { host: "boat.boat.example.com", label: "Boat", maxSandboxes: 5 },
     };
+    const cfg = opts.patchConfig ? opts.patchConfig(unpatched) : unpatched;
     opts.beforeStart?.(dir);
     const handle = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
     handle.lifecycle.providerSessions.debounceMs = 10;
@@ -2352,6 +2366,80 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       for (const rel of [CREDS_VM, FLAG_VM, agRel, legacyInstalled]) rmSync(join(home, rel));
       expect(check()).toEqual([]);
     });
+  });
+
+  test("a new chat VM syncs its repo before .env, bootCmd and T3; a resumed VM is never synced", async () => {
+    const vm = startFakeVmT3Server("vm-sync");
+    cleanups.push(() => vm.server.stop(true));
+    const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-sync-", {
+      // With the LLM proxy, waking a VM re-enters provisioning: the one wake path that could sync
+      patchConfig: (c) => ({ ...c, llmProxy: { host: "boat-llm.boat.example.com", upstreamUrl: "http://127.0.0.1:1", upstreamApiKey: "k" } }),
+    });
+    boat.execHook = (_id, script) =>
+      script.includes(REPO_SYNC_MARKER)
+        ? Promise.resolve({
+            exitCode: 0,
+            stdout: JSON.stringify({ status: "synced", reason: "", from: "a".repeat(40), to: "b".repeat(40), branch: "main", discarded: 2 }),
+            stderr: "",
+          })
+        : undefined;
+    const client = await connectHubClient(handle, cfg);
+    client.request("setup", "subscribeWorktreeSetup", { threadId: "thread-sync" });
+    await launchThreadOnHub(client, "thread-sync");
+
+    const syncAt = boat.execScripts.findIndex((s) => s.includes(REPO_SYNC_MARKER));
+    expect(syncAt).toBeGreaterThanOrEqual(0);
+    expect(boat.execScripts.filter((s) => s.includes(REPO_SYNC_MARKER)).length).toBe(1);
+    expect(syncAt).toBeLessThan(boat.execScripts.indexOf("git fetch origin")); // the project's bootCmd
+    expect(syncAt).toBeLessThan(boat.execScripts.findIndex((s) => s.includes("provision-base.sh")));
+    expect(boat.execScripts[syncAt]).toContain("'/home/user/my-app'");
+    // The chat's setup panel says which commit it starts on
+    const done = await client.waitForFrame(
+      (f) => f._tag === "Chunk" && f.requestId === "setup" && JSON.stringify(f.values).includes('"phase":"done"'),
+    );
+    expect(JSON.stringify(done.values)).toContain("ready on origin/main (bbbbbbb)");
+
+    await handle.hub!.sleepHubSandbox("sb-1");
+    expect(handle.state.getHubSandbox("sb-1")?.phase).toBe("sleeping");
+    const provisionsBefore = boat.execScripts.filter((s) => s.includes("provision-base.sh")).length;
+    await handle.hub!.wakeHubSandbox("sb-1");
+    expect(boat.execScripts.filter((s) => s.includes("provision-base.sh")).length).toBe(provisionsBefore + 1);
+    expect(boat.execScripts.filter((s) => s.includes(REPO_SYNC_MARKER)).length).toBe(1);
+  });
+
+  test("a sync that hangs past its timeout does not hold the chat: the VM boots on the snapshot's code", async () => {
+    const vm = startFakeVmT3Server("vm-sync-hang");
+    cleanups.push(() => vm.server.stop(true));
+    const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-sync-hang-");
+    handle.lifecycle.repoSyncTimeoutMs = 300;
+    boat.execHook = (_id, script) => (script.includes(REPO_SYNC_MARKER) ? new Promise<BoatExecResult>(() => {}) : undefined);
+    const client = await connectHubClient(handle, cfg);
+    client.request("setup", "subscribeWorktreeSetup", { threadId: "thread-hang" });
+    const started = Date.now();
+    await launchThreadOnHub(client, "thread-hang");
+    expect(Date.now() - started).toBeLessThan(4_000);
+    expect(handle.state.getHubSandbox("sb-1")?.phase).toBe("running");
+    expect(boat.execScripts.some((s) => s.includes("provision-base.sh"))).toBe(true);
+    const done = await client.waitForFrame(
+      (f) => f._tag === "Chunk" && f.requestId === "setup" && JSON.stringify(f.values).includes('"phase":"done"'),
+    );
+    expect(JSON.stringify(done.values)).toContain("could not be updated from origin (timeout)");
+  });
+
+  test("no sync when the project opts out, or when the VM clones the repo itself (no project snapshot)", async () => {
+    const vm = startFakeVmT3Server("vm-sync-off");
+    cleanups.push(() => vm.server.stop(true));
+    const off = await startHubWithVm(vm, "t3-sentinel-hub-sync-off-", {
+      patchConfig: (c) => ({ ...c, projects: { "my-app": { ...c.projects["my-app"], syncToRemoteOnStart: false } } }),
+    });
+    await off.handle.hub!.spawnSandboxForThread("my-app", "thread-off");
+    expect(off.boat.execScripts.some((s) => s.includes(REPO_SYNC_MARKER))).toBe(false);
+
+    const clone = await startHubWithVm(vm, "t3-sentinel-hub-sync-clone-");
+    clone.boat.snapshots.delete("env-my-app"); // falls back to base-t3 + bakeCmd at boot
+    await clone.handle.hub!.spawnSandboxForThread("my-app", "thread-clone");
+    expect(clone.boat.created[0].from).toBe("base-t3");
+    expect(clone.boat.execScripts.some((s) => s.includes(REPO_SYNC_MARKER))).toBe(false);
   });
 
   test("chat-scoped RPCs with no explicit route reach only their chat's VM; a gone VM gets a typed error, never another VM", async () => {
@@ -3658,6 +3746,123 @@ describe("chat routing helpers", () => {
     expect(threadGoneError("provider.uploadFeedback", { threadId: "t" })).toEqual({ _tag: "ProviderUploadFeedbackError", threadId: "t" });
     // No fitting member: the caller sends an untyped Die
     expect(threadGoneError("device.open", { threadId: "t" })).toBeNull();
+  });
+});
+
+describe("repo sync to remote (fresh chat VMs)", () => {
+  // Real git, isolated from the machine's config
+  const gitEnv = {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_AUTHOR_NAME: "t",
+    GIT_AUTHOR_EMAIL: "t@example.com",
+    GIT_COMMITTER_NAME: "t",
+    GIT_COMMITTER_EMAIL: "t@example.com",
+  };
+  const git = (cwd: string, ...args: string[]) => {
+    const r = Bun.spawnSync(["git", ...args], { cwd, env: gitEnv });
+    if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr.toString()}`);
+    return r.stdout.toString().trim();
+  };
+  const runSync = (workdir: string, keep: string[] = []) => {
+    const r = Bun.spawnSync(["bash", "-c", buildRepoSyncScript(workdir, 30, keep)], { env: gitEnv });
+    return { result: parseRepoSyncOutput(r.stdout.toString()), raw: r.stdout.toString() + r.stderr.toString() };
+  };
+
+  /** An origin with `main`, a pusher clone, and a "snapshot" checkout baked from it. */
+  function setupRepos() {
+    const root = mkdtempSync(join(tmpdir(), "t3-sentinel-sync-"));
+    tempDirs.push(root);
+    const origin = join(root, "origin.git");
+    git(root, "init", "-q", "--bare", "-b", "main", origin);
+    const pusher = join(root, "pusher");
+    git(root, "clone", "-q", origin, pusher);
+    git(pusher, "checkout", "-q", "-b", "main");
+    writeFileSync(join(pusher, "app.ts"), "v1\n");
+    writeFileSync(join(pusher, ".gitignore"), "node_modules/\n");
+    writeFileSync(join(pusher, "bun.lock"), "lock-v1\n");
+    git(pusher, "add", ".");
+    git(pusher, "commit", "-q", "-m", "v1");
+    git(pusher, "push", "-q", "origin", "main");
+    const work = join(root, "work");
+    git(root, "clone", "-q", origin, work);
+    const pushNew = (content: string) => {
+      writeFileSync(join(pusher, "app.ts"), content);
+      git(pusher, "commit", "-q", "-am", content.trim());
+      git(pusher, "push", "-q", "origin", "main");
+      return git(pusher, "rev-parse", "HEAD");
+    };
+    return { root, origin, work, pushNew };
+  }
+
+  test("a dirty snapshot is reset to origin's default branch; ignored caches and sentinel's files survive", () => {
+    const { work, pushNew } = setupRepos();
+    const baked = git(work, "rev-parse", "HEAD");
+    // What a bake leaves: a rewritten lockfile, a stray file, an installed cache
+    writeFileSync(join(work, "bun.lock"), "lock-rewritten-by-install\n");
+    writeFileSync(join(work, "stray.log"), "x\n");
+    mkdirSync(join(work, "node_modules", "pkg"), { recursive: true });
+    writeFileSync(join(work, "node_modules", "pkg", "index.js"), "cached\n");
+    writeFileSync(join(work, "sentinel-placed.json"), "{}\n");
+    const latest = pushNew("v2\n");
+
+    const { result, raw } = runSync(work, [join(work, "sentinel-placed.json")]);
+    // bun.lock and stray.log; the kept file is not counted
+    expect(result).toEqual({ status: "synced", from: baked, to: latest, branch: "main", discarded: 2 });
+    expect(readFileSync(join(work, "app.ts"), "utf8")).toBe("v2\n");
+    expect(readFileSync(join(work, "bun.lock"), "utf8")).toBe("lock-v1\n");
+    expect(existsSync(join(work, "stray.log"))).toBe(false);
+    expect(existsSync(join(work, "node_modules", "pkg", "index.js"))).toBe(true);
+    expect(existsSync(join(work, "sentinel-placed.json"))).toBe(true);
+    expect(git(work, "status", "--porcelain")).toBe("?? sentinel-placed.json");
+    // Only SHAs, a branch and a count: no paths, no remote URL
+    expect(raw).not.toContain(work);
+    expect(raw).not.toContain("origin.git");
+  });
+
+  test("a diverged snapshot on another branch ends on origin's default branch, tracking it", () => {
+    const { work, pushNew } = setupRepos();
+    git(work, "checkout", "-q", "-b", "bake-branch");
+    writeFileSync(join(work, "app.ts"), "local\n");
+    git(work, "commit", "-q", "-am", "local-only");
+    const local = git(work, "rev-parse", "HEAD");
+    const latest = pushNew("v3\n");
+
+    const { result } = runSync(work);
+    expect(result).toEqual({ status: "synced", from: local, to: latest, branch: "main", discarded: 0 });
+    expect(git(work, "rev-parse", "--abbrev-ref", "HEAD")).toBe("main");
+    expect(git(work, "rev-parse", "--abbrev-ref", "main@{upstream}")).toBe("origin/main");
+  });
+
+  test("skips what is not a fresh checkout of a remote, and reports a failed fetch without the URL", () => {
+    const { root, work } = setupRepos();
+    expect(runSync(join(root, "missing")).result).toEqual({ status: "skipped", reason: "no-workdir" });
+    const plain = join(root, "plain");
+    mkdirSync(plain);
+    expect(runSync(plain).result).toEqual({ status: "skipped", reason: "not-a-repository" });
+    mkdirSync(join(work, "sub"));
+    expect(runSync(join(work, "sub")).result).toEqual({ status: "skipped", reason: "not-repo-root" });
+    const local = join(root, "local-only");
+    git(root, "init", "-q", "-b", "main", local);
+    expect(runSync(local).result).toEqual({ status: "skipped", reason: "no-origin" });
+
+    git(work, "remote", "set-url", "origin", "https://x-access-token:ghs_secret@127.0.0.1:1/nope.git");
+    const before = git(work, "rev-parse", "HEAD");
+    writeFileSync(join(work, "stray.log"), "x\n");
+    const failed = runSync(work);
+    expect(failed.result).toEqual({ status: "failed", reason: "fetch-failed" });
+    expect(failed.raw).not.toContain("ghs_secret");
+    // Nothing was touched
+    expect(git(work, "rev-parse", "HEAD")).toBe(before);
+    expect(existsSync(join(work, "stray.log"))).toBe(true);
+  });
+
+  test("unexpected output is a failure, never a throw", () => {
+    expect(parseRepoSyncOutput("")).toEqual({ status: "failed", reason: "no-result" });
+    expect(parseRepoSyncOutput("{not json")).toEqual({ status: "failed", reason: "no-result" });
+    expect(parseRepoSyncOutput(JSON.stringify({ status: "synced", to: "zz", branch: "main" }))).toEqual({ status: "failed", reason: "no-result" });
   });
 });
 

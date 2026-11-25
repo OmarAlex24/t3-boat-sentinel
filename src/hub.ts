@@ -2223,6 +2223,8 @@ export class HubServer {
         mintToken: true,
         injectProviderSessions: true,
         installProviderRuntimes: !supportsSnapshots,
+        // A fallback clone is already fresh; a project snapshot is as old as its bake
+        syncRepoToRemote: !fallbackCloning && project.syncToRemoteOnStart !== false,
       });
 
       if (!provisioned.upstreamToken) {
@@ -2275,7 +2277,16 @@ export class HubServer {
       // T3 may still report the status it probed before the sign-in was placed; re-check in the background
       for (const instanceId of injected) this.refreshInjectedProvider(sandboxId, instanceId);
 
-      emitStage("done", `Boat VM ${sandboxId} (${size}) ready`, 100);
+      const sync = provisioned.repoSync;
+      emitStage(
+        "done",
+        sync?.status === "synced"
+          ? `Boat VM ${sandboxId} (${size}) ready on origin/${sync.branch} (${sync.to.slice(0, 7)})`
+          : sync?.status === "failed"
+            ? `Boat VM ${sandboxId} (${size}) ready, but the repo could not be updated from origin (${sync.reason}): this chat starts on the snapshot's code`
+            : `Boat VM ${sandboxId} (${size}) ready`,
+        100,
+      );
       console.log(`[hub] sandbox ${sandboxId} ready for thread=${threadId} (project=${projectKey})`);
       return record;
     } catch (err) {
