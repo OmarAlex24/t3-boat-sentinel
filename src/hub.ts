@@ -324,6 +324,8 @@ interface ProjectCloneSnapshotState {
 /** One background bake behind a clone snapshot; only the run in `projectCloneRuns` may write its snapshot. */
 interface ProjectCloneRun {
   projectKey: string;
+  /** Aborting it cancels the bake (see `LifecycleManager.bake`'s `signal`). */
+  controller: AbortController;
   ticker: ReturnType<typeof setInterval> | null;
   step: BakeStep | null;
   stepStartedAt: number;
@@ -913,6 +915,8 @@ export class HubServer {
   private readonly activeProjectClones = new Map<string, ProjectCloneSnapshotState>();
   /** The live bake run of each clone, by projectId. A replaced or finished run can no longer write. */
   private readonly projectCloneRuns = new Map<string, ProjectCloneRun>();
+  /** Clones (by projectId) whose `projectClone.start` registered a new dynamic project that has no bake yet. */
+  private readonly projectsRegisteredByClone = new Set<string>();
   /** Hub-wide, like T3's own clone tracker: a clone's `sequence` never goes back, across retries too. */
   private projectCloneSequence = 0;
   /** How often a running clone's elapsed time is refreshed in T3 (tests shorten it). */
@@ -2085,21 +2089,15 @@ export class HubServer {
     }
     if (tag === "projectClone.cancel") {
       const pid = String((payload as Record<string, unknown> | undefined)?.projectId ?? "");
-      const existing = this.activeProjectClones.get(pid);
-      if (existing) {
-        this.activeProjectClones.delete(pid);
-        this.broadcastProjectClones();
-        sendRpcExitSuccess(ws, reqId, { applied: true });
-      } else {
-        sendRpcExitSuccess(ws, reqId, { applied: false });
-      }
+      sendRpcExitSuccess(ws, reqId, { applied: this.cancelProjectClone(pid) });
       return;
     }
     if (tag === "projectClone.retry") {
       const pid = String((payload as Record<string, unknown> | undefined)?.projectId ?? "");
       const projKey = this.projectKeyFromHubId(pid);
       const existing = this.activeProjectClones.get(pid);
-      if (projKey && existing) {
+      // Like T3's own tracker: only a failed or cancelled clone is retried, never one still baking
+      if (projKey && existing && (existing.phase === "failed" || existing.phase === "cancelled")) {
         this.startBackgroundProjectBake(pid, projKey, existing.remoteUrl, existing.destinationPath);
         sendRpcExitSuccess(ws, reqId, { applied: true });
       } else {
@@ -5169,7 +5167,16 @@ export class HubServer {
         workdir: destinationPath || undefined,
       });
 
+      // The same clone sent again while it still bakes (a resent request): answer, don't bake twice
+      const running = this.activeProjectClones.get(projectId);
+      if (running?.phase === "running" && this.projectCloneRuns.get(projectId)?.projectKey === name) {
+        sendRpcExitSuccess(ws, reqId, { projectId, cwd: running.destinationPath, remoteUrl: running.remoteUrl, repository: null });
+        return;
+      }
+
+      const isNew = !this.state.getAllProjects(this.config)[name];
       this.state.addDynamicProject(name, project, projectId);
+      if (isNew && !this.state.getBake(name)) this.projectsRegisteredByClone.add(projectId);
       this.notifyProjectAdded(name);
       this.startBackgroundProjectBake(projectId, name, project.repo ?? repoInput, project.workdir);
 
@@ -5185,6 +5192,48 @@ export class HubServer {
     }
   }
 
+  /**
+   * `projectClone.cancel`: stops a clone's bake before its snapshot is saved (the temp VM is deleted right
+   * away). Once saving has started the bake is left to finish and nothing is applied. A project this clone
+   * registered, with no snapshot and nothing using it, is unregistered and its clone dropped from the list
+   * (T3 then stops waiting on it); otherwise the clone stays as `cancelled`, ready for Retry.
+   */
+  private cancelProjectClone(projectId: string): boolean {
+    const run = this.projectCloneRuns.get(projectId);
+    const snapshot = this.activeProjectClones.get(projectId);
+    if (!run || snapshot?.phase !== "running" || run.step === "save") return false;
+
+    this.projectCloneRuns.delete(projectId);
+    this.stopProjectCloneTicker(run);
+    run.controller.abort();
+    const key = run.projectKey;
+    console.log(`[hub] clone of "${key}" cancelled at ${run.step ?? "start"}; stopping its bake`);
+
+    const inUse =
+      this.state.listHubSandboxes().some((sb) => sb.project === key) ||
+      Array.from(this.pendingThreads.values()).some((p) => p.record.projectKey === key) ||
+      Array.from(this.threadShells.values()).some((t) => t.projectId === projectId);
+    const removedHubId =
+      this.projectsRegisteredByClone.has(projectId) && !this.state.getBake(key) && !inUse
+        ? this.state.removeDynamicProject(key)
+        : null;
+    if (removedHubId) {
+      this.projectsRegisteredByClone.delete(projectId);
+      this.activeProjectClones.delete(projectId);
+      this.notifyProjectRemoved(removedHubId);
+    } else {
+      this.activeProjectClones.set(projectId, {
+        ...snapshot,
+        phase: "cancelled",
+        error: null,
+        endedAt: new Date().toISOString(),
+        sequence: ++this.projectCloneSequence,
+      });
+    }
+    this.broadcastProjectClones();
+    return true;
+  }
+
   private stopProjectCloneTicker(run: ProjectCloneRun): void {
     if (run.ticker) clearInterval(run.ticker);
     run.ticker = null;
@@ -5198,7 +5247,15 @@ export class HubServer {
   ): void {
     const previous = this.projectCloneRuns.get(projectId);
     if (previous) this.stopProjectCloneTicker(previous);
-    const run: ProjectCloneRun = { projectKey, ticker: null, step: null, stepStartedAt: 0, stage: "connecting", percent: 0 };
+    const run: ProjectCloneRun = {
+      projectKey,
+      controller: new AbortController(),
+      ticker: null,
+      step: null,
+      stepStartedAt: 0,
+      stage: "connecting",
+      percent: 0,
+    };
     this.projectCloneRuns.set(projectId, run);
     const startedAt = new Date().toISOString();
     const write = (
@@ -5237,6 +5294,7 @@ export class HubServer {
 
     void this.lifecycle
       .bake(projectKey, {
+        signal: run.controller.signal,
         onProgress: (step) => {
           run.step = step;
           run.stepStartedAt = Date.now();
@@ -5246,6 +5304,8 @@ export class HubServer {
       .then(
         (res) => {
           this.stopProjectCloneTicker(run);
+          // Baked: the project now has a snapshot, so a later cancel never unregisters it
+          if (this.projectCloneRuns.get(projectId) === run) this.projectsRegisteredByClone.delete(projectId);
           write({
             phase: "done",
             stage: "checkout",
@@ -5265,6 +5325,8 @@ export class HubServer {
         },
         (err) => {
           this.stopProjectCloneTicker(run);
+          // A cancelled run was already replaced in `projectCloneRuns`: it must not bring the bar back as failed
+          if (this.projectCloneRuns.get(projectId) !== run) return;
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`[hub] background bake failed for "${projectKey}":`, msg);
           write({

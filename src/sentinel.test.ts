@@ -123,7 +123,11 @@ class MockBoat implements BoatClient {
     this.sandboxes.delete(id);
   }
 
+  /** While set, `saveSnapshot` waits on it (a snapshot still being written). */
+  saveGate: Promise<void> | null = null;
+
   async saveSnapshot(id: string, name: string): Promise<void> {
+    if (this.saveGate) await this.saveGate;
     this.savedSnapshots.push({ id, name });
     this.snapshots.add(name);
   }
@@ -4776,6 +4780,136 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       expect(boat.snapshots.has("env-widget")).toBe(true);
     }, 15_000);
 
+    test("Cancel mid-bake deletes the temp VM at once, unregisters the new project, never shows failed; a new start works", async () => {
+      const vm = startFakeVmT3Server("vm-clone-cancel");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-clone-cancel-");
+      handle.hub!.projectCloneTickMs = 15;
+      const client = await connectHubClient(handle, cfg);
+      await subscribeHubShell(client);
+      client.request("clones", "subscribeProjectClones", {});
+      await until(() => cloneLists(client).length > 0);
+
+      let release!: () => void;
+      boat.onBeforeBakeStop = () => new Promise<void>((r) => (release = r));
+      cleanups.push(() => release?.());
+      const projectId = "55555555-2222-4333-8444-555555555555";
+      startClone(client, "start", projectId, "gizmo");
+      await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "start");
+      await until(() => lastOf(client, projectId)?.detail?.startsWith("Verifying T3 and providers") === true);
+      const tempId = boat.created.findIndex((c) => c.name.includes("bake-gizmo"));
+      expect(tempId).toBeGreaterThanOrEqual(0);
+      expect(boat.sandboxes.size).toBe(1);
+
+      // Retry is refused while it still bakes
+      client.request("retry-running", "projectClone.retry", { projectId });
+      const retryRunning = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "retry-running");
+      expect((retryRunning.exit as { value: unknown }).value).toEqual({ applied: false });
+
+      client.request("cancel", "projectClone.cancel", { projectId });
+      const cancelExit = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "cancel");
+      expect((cancelExit.exit as { value: unknown }).value).toEqual({ applied: true });
+      // The temp VM goes while provision-base.sh is still "running" on it
+      await until(() => boat.sandboxes.size === 0);
+      expect(boat.deleted.length).toBe(1);
+      // The project this clone registered is gone, live, and its clone leaves the list (T3 stops waiting)
+      await client.waitForFrame(
+        (f) => f._tag === "Chunk" && f.requestId === "shell" && (f.values as Array<{ kind?: string; projectId?: string }>)?.some((v) => v.kind === "project.removed" && v.projectId === projectId),
+      );
+      expect(handle.state.getAllProjects(cfg).gizmo).toBeUndefined();
+      expect(lastOf(client, projectId)).toBeNull();
+
+      // The abandoned step finishing later writes nothing: no "failed", no snapshot, no comeback
+      const pushed = cloneLists(client).length;
+      release();
+      await Bun.sleep(100);
+      expect(cloneLists(client).length).toBe(pushed);
+      expect(snapsOf(client, projectId).some((c) => c.phase === "failed")).toBe(false);
+      expect(boat.snapshots.has("env-gizmo")).toBe(false);
+      expect(handle.state.getBake("gizmo")).toBeNull();
+
+      // Starting the same clone again bakes it from scratch, and its sequence keeps rising
+      const lastSeq = Math.max(...snapsOf(client, projectId).map((c) => c.sequence));
+      boat.onBeforeBakeStop = undefined;
+      startClone(client, "start-again", projectId, "gizmo");
+      await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "start-again");
+      await until(() => lastOf(client, projectId)?.phase === "done");
+      expect(boat.snapshots.has("env-gizmo")).toBe(true);
+      const again = snapsOf(client, projectId).filter((c) => c.sequence > lastSeq);
+      expect(again.length).toBeGreaterThan(1);
+      expect(Math.min(...again.map((c) => c.sequence))).toBeGreaterThan(lastSeq);
+      expect(boat.sandboxes.size).toBe(0);
+    }, 15_000);
+
+    test("Cancel of a project that already has a snapshot keeps it as cancelled; Retry bakes it again", async () => {
+      const vm = startFakeVmT3Server("vm-clone-cancel-keep");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-clone-keep-");
+      handle.hub!.projectCloneTickMs = 15;
+      const client = await connectHubClient(handle, cfg);
+      client.request("clones", "subscribeProjectClones", {});
+      await until(() => cloneLists(client).length > 0);
+      const projectId = "66666666-2222-4333-8444-555555555555";
+      startClone(client, "first", projectId, "sprocket");
+      await until(() => lastOf(client, projectId)?.phase === "done");
+      const bakedAt = handle.state.getBake("sprocket")!.bakedAt;
+
+      let release!: () => void;
+      boat.onBeforeBakeStop = () => new Promise<void>((r) => (release = r));
+      cleanups.push(() => release?.());
+      startClone(client, "rebake", projectId, "sprocket");
+      await until(() => lastOf(client, projectId)?.phase === "running" && lastOf(client, projectId)?.detail?.startsWith("Verifying") === true);
+      client.request("cancel", "projectClone.cancel", { projectId });
+      const cancelExit = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "cancel");
+      expect((cancelExit.exit as { value: unknown }).value).toEqual({ applied: true });
+      expect(lastOf(client, projectId)).toMatchObject({ phase: "cancelled", error: null });
+      await until(() => boat.sandboxes.size === 0);
+      // The project and its existing snapshot stay
+      expect(handle.state.getAllProjects(cfg).sprocket).toBeDefined();
+      expect(boat.snapshots.has("env-sprocket")).toBe(true);
+      expect(handle.state.getBake("sprocket")!.bakedAt).toBe(bakedAt);
+      release();
+      await Bun.sleep(50);
+      expect(lastOf(client, projectId)?.phase).toBe("cancelled");
+      // A second cancel has nothing to stop
+      client.request("cancel-2", "projectClone.cancel", { projectId });
+      const cancel2 = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "cancel-2");
+      expect((cancel2.exit as { value: unknown }).value).toEqual({ applied: false });
+
+      boat.onBeforeBakeStop = undefined;
+      client.request("retry", "projectClone.retry", { projectId });
+      const retryExit = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "retry");
+      expect((retryExit.exit as { value: unknown }).value).toEqual({ applied: true });
+      await until(() => lastOf(client, projectId)?.phase === "done");
+      expect(handle.state.getBake("sprocket")!.bakedAt).not.toBe(bakedAt);
+      const seqs = snapsOf(client, projectId).map((c) => c.sequence);
+      expect(seqs.every((q, i) => i === 0 || q > seqs[i - 1])).toBe(true);
+    }, 15_000);
+
+    test("Cancel once the snapshot is being saved applies nothing and the bake completes", async () => {
+      const vm = startFakeVmT3Server("vm-clone-cancel-save");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-clone-save-");
+      const client = await connectHubClient(handle, cfg);
+      client.request("clones", "subscribeProjectClones", {});
+      await until(() => cloneLists(client).length > 0);
+      let release!: () => void;
+      boat.saveGate = new Promise<void>((r) => (release = r));
+      cleanups.push(() => release());
+      const projectId = "77777777-2222-4333-8444-555555555555";
+      startClone(client, "start", projectId, "flange");
+      await until(() => lastOf(client, projectId)?.detail?.startsWith("Saving the Boat snapshot") === true);
+      client.request("cancel", "projectClone.cancel", { projectId });
+      const cancelExit = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "cancel");
+      expect((cancelExit.exit as { value: unknown }).value).toEqual({ applied: false });
+      expect(boat.sandboxes.size).toBe(1);
+      release();
+      await until(() => lastOf(client, projectId)?.phase === "done");
+      expect(boat.snapshots.has("env-flange")).toBe(true);
+      expect(handle.state.getAllProjects(cfg).flange).toBeDefined();
+      expect(boat.sandboxes.size).toBe(0);
+    }, 15_000);
+
     test("a failed bake shows the step it failed on and stops refreshing", async () => {
       const vm = startFakeVmT3Server("vm-clone-fail");
       cleanups.push(() => vm.server.stop(true));
@@ -5570,6 +5704,48 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     });
     expect(locked.status).toBe(429);
     expect(locked.headers.get("retry-after")).toBeTruthy();
+  });
+
+  test("BoatProvider: an aborted exec or upload kills its local boat process at once", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-boat-abort-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const pidFile = join(dir, "pid");
+    const bin = join(dir, "boat");
+    // A `boat` that never answers, like an exec stuck on a slow install
+    writeFileSync(bin, `#!/bin/sh\necho $$ > ${pidFile}\nexec sleep 60\n`, { mode: 0o755 });
+    const { BoatProvider } = await import("./providers/boat.ts");
+    const bp = new BoatProvider(bin);
+
+    for (const call of [
+      (signal: AbortSignal) => bp.execOk("sb-x", "pnpm install", 900, { signal }),
+      (signal: AbortSignal) => bp.upload("sb-x", "/etc/hosts", "~/hosts", { signal }),
+    ]) {
+      rmSync(pidFile, { force: true });
+      const ctrl = new AbortController();
+      const started = Date.now();
+      const pending = call(ctrl.signal);
+      pending.catch(() => {});
+      for (let i = 0; i < 200 && !existsSync(pidFile); i++) await Bun.sleep(10);
+      const pid = Number(readFileSync(pidFile, "utf8").trim());
+      ctrl.abort();
+      await expect(pending).rejects.toThrow(/aborted/);
+      expect(Date.now() - started).toBeLessThan(3_000);
+      // The process is gone, not left to run out its timeout
+      let alive = true;
+      for (let i = 0; i < 100 && alive; i++) {
+        try {
+          process.kill(pid, 0);
+          await Bun.sleep(10);
+        } catch {
+          alive = false;
+        }
+      }
+      expect(alive).toBe(false);
+    }
+    // Already aborted: never spawned
+    const pre = new AbortController();
+    pre.abort();
+    await expect(bp.execOk("sb-x", "true", 30, { signal: pre.signal })).rejects.toThrow(/aborted/);
   });
 
   test("BoatProvider private preview exchanges ?_token=... into clean base URL + _port_auth Cookie header", async () => {

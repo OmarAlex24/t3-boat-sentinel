@@ -628,6 +628,12 @@ export class LifecycleManager {
       t3Channel?: "stable" | "nightly";
       /** Called as each step starts; a throwing listener never fails the bake. */
       onProgress?: (step: BakeStep) => void;
+      /**
+       * Cancels the bake before its snapshot is saved: the running step is abandoned (and its `boat` process
+       * killed), the bake rejects with `BakeCancelledError` and the temp VM is deleted at once. Once the
+       * "save" step has started the signal is ignored, so a half-written snapshot is never left behind.
+       */
+      signal?: AbortSignal;
     },
   ): Promise<{ snapshot: string; t3Version: string }> {
     if (!hasCapability(this.boat, "snapshots") || !this.boat.saveSnapshot || !this.boat.listSnapshots) {
@@ -642,6 +648,7 @@ export class LifecycleManager {
       throw new Error(`Unknown bake target "${target}". Use "base" or one of: ${Object.keys(allProjects).join(", ")}`);
     }
 
+    const signal = opts?.signal;
     const existingSnapshots = await this.boat.listSnapshots();
     const snapshotName = isBase ? this.config.boat.baseSnapshot : project!.snapshot;
     const size = project?.size ?? this.config.boat.defaultSize;
@@ -661,7 +668,7 @@ export class LifecycleManager {
     // One `[bake]` line per finished step, with its duration and the bake's total so far
     const bakeStartedAt = Date.now();
     let current: { step: BakeStep; at: number } | null = null;
-    const endStep = (outcome: "done" | "failed") => {
+    const endStep = (outcome: "done" | "failed" | "cancelled") => {
       if (!current) return;
       const now = Date.now();
       console.log(
@@ -682,48 +689,56 @@ export class LifecycleManager {
 
     const tempName = `${this.config.boat.sandboxPrefix}bake-${target}-${Date.now().toString(36)}`;
     console.log(`[bake] creating temp VM ${tempName} (from=${fromSnapshot ?? "fresh-ubuntu"}) -> target snapshot "${snapshotName}"`);
+    throwIfBakeCancelled(signal);
     beginStep("create");
     let tempId: string;
     try {
+      // Never raced against the signal: losing the id would leak the VM. A cancel lands right after.
       tempId = await this.boat.create({ name: tempName, size, fromSnapshot });
     } catch (err) {
       endStep("failed");
       throw err;
     }
     this.inFlightBakes.add(tempId);
+    let saving = false;
+    const execOk = (script: string, timeoutSecs: number) =>
+      abortable(this.boat.execOk(tempId, script, timeoutSecs, { signal }), signal);
+    const upload = (localPath: string, remotePath: string) =>
+      abortable(this.boat.upload(tempId, localPath, remotePath, { signal }), signal);
 
     try {
+      throwIfBakeCancelled(signal);
       beginStep("upload");
-      await this.boat.execOk(tempId, "mkdir -p ~/.t3-sentinel && chmod 700 ~/.t3-sentinel", 30);
-      await this.boat.upload(tempId, PROVISION_SCRIPT, "~/.t3-sentinel/provision-base.sh");
-      await this.boat.upload(tempId, WATCHDOG_SCRIPT, "~/.t3-sentinel/watchdog.mjs");
+      await execOk("mkdir -p ~/.t3-sentinel && chmod 700 ~/.t3-sentinel", 30);
+      await upload(PROVISION_SCRIPT, "~/.t3-sentinel/provision-base.sh");
+      await upload(WATCHDOG_SCRIPT, "~/.t3-sentinel/watchdog.mjs");
 
       if (isBase && this.config.klav?.forwardBinaryPath && existsSync(this.config.klav.forwardBinaryPath)) {
-        await this.boat.upload(tempId, this.config.klav.forwardBinaryPath, "/tmp/klav-forward-bin");
-        await this.boat.execOk(tempId, "sudo install -m 755 -o root -g root /tmp/klav-forward-bin /usr/local/bin/klav-forward && rm -f /tmp/klav-forward-bin", 30);
+        await upload(this.config.klav.forwardBinaryPath, "/tmp/klav-forward-bin");
+        await execOk("sudo install -m 755 -o root -g root /tmp/klav-forward-bin /usr/local/bin/klav-forward && rm -f /tmp/klav-forward-bin", 30);
       }
       if (isBase && this.config.klav?.tailnetUpScriptPath && existsSync(this.config.klav.tailnetUpScriptPath)) {
-        await this.boat.upload(tempId, this.config.klav.tailnetUpScriptPath, "/tmp/klav-tailnet-up");
-        await this.boat.execOk(tempId, "sudo install -m 755 -o root -g root /tmp/klav-tailnet-up /usr/local/sbin/klav-tailnet-up && rm -f /tmp/klav-tailnet-up", 30);
+        await upload(this.config.klav.tailnetUpScriptPath, "/tmp/klav-tailnet-up");
+        await execOk("sudo install -m 755 -o root -g root /tmp/klav-tailnet-up /usr/local/sbin/klav-tailnet-up && rm -f /tmp/klav-tailnet-up", 30);
       }
       if (isBase && this.config.klav?.linuxBinaryPath && existsSync(this.config.klav.linuxBinaryPath)) {
-        await this.boat.upload(tempId, this.config.klav.linuxBinaryPath, "/tmp/klav-bin");
-        await this.boat.execOk(tempId, "sudo install -m 755 /tmp/klav-bin /usr/local/bin/klav && rm -f /tmp/klav-bin", 30);
+        await upload(this.config.klav.linuxBinaryPath, "/tmp/klav-bin");
+        await execOk("sudo install -m 755 /tmp/klav-bin /usr/local/bin/klav && rm -f /tmp/klav-bin", 30);
       }
       if (isBase && this.config.klav?.skillPath && existsSync(this.config.klav.skillPath)) {
-        await this.boat.execOk(tempId, "mkdir -p ~/.claude/skills/klav", 30);
-        await this.boat.upload(tempId, this.config.klav.skillPath, "~/.claude/skills/klav/SKILL.md");
+        await execOk("mkdir -p ~/.claude/skills/klav", 30);
+        await upload(this.config.klav.skillPath, "~/.claude/skills/klav/SKILL.md");
       }
 
       if ((isBase && this.config.boat.baseBakeCmd) || project?.bakeCmd) beginStep("install");
       if (isBase && this.config.boat.baseBakeCmd) {
         console.log(`[bake] running baseBakeCmd...`);
-        await this.boat.execOk(tempId, this.config.boat.baseBakeCmd, 600);
+        await execOk(this.config.boat.baseBakeCmd, 600);
       }
 
       if (project?.bakeCmd) {
         console.log(`[bake] running bakeCmd for ${target}...`);
-        await this.boat.execOk(tempId, project.bakeCmd, 900);
+        await execOk(project.bakeCmd, 900);
       }
 
       beginStep("verify");
@@ -731,11 +746,11 @@ export class LifecycleManager {
       // for `prepareAcpAgents` / `installProviders`, and project bakes would otherwise re-probe without those
       // instances and leave the provider status caches inherited from base-t3 stale in the new snapshot.
       if (this.config.t3.settingsFile && existsSync(this.config.t3.settingsFile)) {
-        await this.boat.upload(tempId, this.config.t3.settingsFile, "~/.t3-sentinel/t3-settings.json");
+        await upload(this.config.t3.settingsFile, "~/.t3-sentinel/t3-settings.json");
       }
 
       // Ensure zero ephemeral Klav keys ever leak into a golden snapshot
-      await this.boat.execOk(tempId, "rm -rf ~/.config/klav/agents", 30);
+      await execOk("rm -rf ~/.config/klav/agents", 30);
 
       // Update t3, smoke-test t3 serve, optionally pre-prepare ACP agents & provider runtimes, capture templates, then wipe per-VM userdata
       const bakeEnv = [
@@ -760,8 +775,7 @@ export class LifecycleManager {
       const hasProviderWork = acpAgents.length > 0 || providers.length > 0;
       // Verification itself can take up to ~180s (Antigravity validation alone up to 90s)
       const bakeProvisionTimeout = hasProviderWork ? (isBase ? 1200 : 600) : 300;
-      const out = await this.boat.execOk(
-        tempId,
+      const out = await execOk(
         `${bakeEnv.join(" ")} bash ~/.t3-sentinel/provision-base.sh`,
         bakeProvisionTimeout,
       );
@@ -791,11 +805,14 @@ export class LifecycleManager {
 
       if (hasCapability(this.boat, "pause") && this.boat.pause) {
         beginStep("stop");
-        await this.boat.pause(tempId);
+        await abortable(this.boat.pause(tempId), signal);
         // `boat stop` transitions through `archiving` before reaching `stopped`; wait until snapshotable.
-        await this.waitUntilStopped(tempId, 180_000);
+        await this.waitUntilStopped(tempId, 180_000, signal);
       }
+      // Last point a cancel can land: from "save" on (no await in between) the snapshot is finished, not abandoned
+      throwIfBakeCancelled(signal);
       console.log(`[bake] saving immutable snapshot "${snapshotName}"...`);
+      saving = true;
       beginStep("save");
       await this.boat.saveSnapshot(tempId, snapshotName);
       endStep("done");
@@ -805,7 +822,7 @@ export class LifecycleManager {
       console.log(`[bake] snapshot "${snapshotName}" ready (${t3Version})`);
       return { snapshot: snapshotName, t3Version };
     } finally {
-      endStep("failed");
+      endStep(signal?.aborted && !saving ? "cancelled" : "failed");
       this.inFlightBakes.delete(tempId);
       this.state.queueDelete(tempId, `bake-temp:${target}`);
       console.log(`[bake] deleting temporary VM ${tempId}`);
@@ -1343,12 +1360,12 @@ export class LifecycleManager {
     });
   }
 
-  private async waitUntilStopped(sandboxId: string, timeoutMs: number): Promise<void> {
+  private async waitUntilStopped(sandboxId: string, timeoutMs: number, signal?: AbortSignal): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      const info = await this.boat.info(sandboxId);
+      const info = await abortable(this.boat.info(sandboxId), signal);
       if (info.state === "stopped" || info.state === "archived") return;
-      await Bun.sleep(2_000);
+      await abortable(Bun.sleep(2_000), signal);
     }
     throw new Error(`Timed out waiting for sandbox ${sandboxId} to finish stopping before snapshot`);
   }
@@ -1365,6 +1382,38 @@ export class LifecycleManager {
     } catch {
       // non-fatal
     }
+  }
+}
+
+/** A bake's `signal` fired: the bake stopped before saving its snapshot and deleted its temp VM. */
+export class BakeCancelledError extends Error {
+  constructor() {
+    super("Bake cancelled");
+    this.name = "BakeCancelledError";
+  }
+}
+
+function throwIfBakeCancelled(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new BakeCancelledError();
+}
+
+/**
+ * Settles with `promise`, or rejects with `BakeCancelledError` as soon as `signal` fires. The abandoned
+ * promise keeps running (providers that honor the signal stop it) and its rejection is swallowed.
+ */
+async function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return promise;
+  promise.catch(() => {});
+  throwIfBakeCancelled(signal);
+  let onAbort!: () => void;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(new BakeCancelledError());
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([promise, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
   }
 }
 
