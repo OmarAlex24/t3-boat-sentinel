@@ -2808,6 +2808,51 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       expect(existsSync(parkedAssets)).toBe(false);
     });
 
+    test("many file reads never push out the git panel; a two-phase diff is cached whole; the copy outlives a Hub restart", async () => {
+      const { vm, client, boat, handle, cfg, sandboxId, worktree } = await awakeChatWithPanels("vm-panels-restart");
+      // The app reads many files and starts a two-phase diff (tracked files first) while the VM is up
+      vm.readAnswers.set("projects.readFile", { relativePath: "README.md", contents: "# app", byteLength: 5, truncated: false });
+      for (let i = 0; i < 40; i++) client.request(`read-${i}`, "projects.readFile", { cwd: worktree, relativePath: `src/f${i}.ts` });
+      for (let i = 0; i < 40; i++) await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === `read-${i}`);
+      client.request("diff-tracked", "review.getDiffPreview", { cwd: worktree, trackedOnly: true });
+      await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "diff-tracked");
+      vm.readAnswers.set("subscribeVcsStatus", vcsStatus(2, 10, 2));
+      vm.readAnswers.set("review.getDiffPreview", diffPreview(worktree, "whole diff"));
+      vm.projectionAttachments.push({ type: "image", id: "img-1", name: "shot.png", mimeType: "image/png", sizeBytes: 64 });
+      vm.assetFiles.set("img-1", { bytes: PNG(64), mimeType: "image/png" });
+      const seenBefore = vm.seenMethods.length;
+      await handle.hub!.sleepHubSandbox(sandboxId);
+      // At sleep the tracked-only diff is read whole, so the cached answer needs no second read
+      const replayed = vm.seenMethods
+        .slice(seenBefore)
+        .filter((m) => m.tag === "review.getDiffPreview")
+        .map((m) => m.payload as Record<string, unknown>);
+      expect(replayed.some((p) => !("trackedOnly" in p) && !("completionToken" in p) && Object.keys(p).length === 1)).toBe(true);
+      expect(vm.seenMethods.slice(seenBefore).filter((m) => m.tag === "projects.readFile").length).toBe(16);
+
+      // The Hub restarts while the VM sleeps
+      handle.stop();
+      const handle2 = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+      cleanups.push(() => handle2.stop());
+      expect(handle2.state.getHubSandbox(sandboxId)!.phase).toBe("sleeping");
+      const client2: HubClient = await connectHubClient(handle2, cfg);
+      client2.request("vcs", "subscribeVcsStatus", { cwd: worktree });
+      client2.request("branch", "subscribeVcsBranch", { cwd: worktree });
+      client2.request("diff", "review.getDiffPreview", { trackedOnly: true, cwd: worktree });
+      client2.request("img", "assets.createUrl", { resource: { _tag: "attachment", attachmentId: "img-1" } });
+      expect((await client2.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "vcs")).values).toEqual([vcsStatus(2, 10, 2)]);
+      expect((await client2.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "branch")).values).toEqual([vcsBranch("t3/feature")]);
+      const diff = await client2.waitForFrame((f) => f._tag === "Exit" && f.requestId === "diff");
+      expect(diff.exit).toEqual({ _tag: "Success", value: diffPreview(worktree, "whole diff") });
+      if (t3Contracts) expect(t3Contracts.decodeFrame("review.getDiffPreview", diff)).toEqual([{ ok: true }]);
+      const img = await client2.waitForFrame((f) => f._tag === "Exit" && f.requestId === "img");
+      const got = await fetch(`${client2.base}${(img.exit as { value: { relativeUrl: string } }).value.relativeUrl}`, {
+        headers: { host: cfg.hub!.host },
+      });
+      expect(new Uint8Array(await got.arrayBuffer())).toEqual(PNG(64));
+      expect(boat.resumed).toEqual([]);
+    });
+
     test("with no Hub copy, a client's own cached history is kept, not replaced by an empty view", async () => {
       const { client, boat, dir, handle, sandboxId } = await sleepingChat("vm-nocache", { failProjection: true });
       expect(existsSync(join(dir, "hub-thread-cache", "thread-zz.json"))).toBe(false);

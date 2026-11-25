@@ -32,12 +32,13 @@ import {
   CACHED_READ_TAGS,
   DEFAULT_MAX_CACHED_ASSET_BYTES,
   DEFAULT_MAX_CACHED_READ_BYTES,
-  MAX_RECORDED_READS,
+  MAX_RECORDED_READS_PER_TAG,
   ThreadReadStore,
   attachmentsIn,
   fetchCapped,
   isStandaloneStreamValue,
   readKey,
+  recordedPayload,
   remainingMs,
   replayPayload,
   type CachedAsset,
@@ -3513,8 +3514,9 @@ export class HubServer {
     }
     const key = readKey(tag, payload);
     reads.delete(key);
-    reads.set(key, { tag, payload: replayPayload(tag, payload) });
-    while (reads.size > MAX_RECORDED_READS) reads.delete(reads.keys().next().value!);
+    reads.set(key, { tag, payload: recordedPayload(tag, payload) });
+    const sameTag = [...reads].filter(([, r]) => r.tag === tag).map(([k]) => k);
+    for (const old of sameTag.slice(0, Math.max(0, sameTag.length - MAX_RECORDED_READS_PER_TAG))) reads.delete(old);
   }
 
   /** True while a chat is answered from its cache: its VM sleeps or is parked (not waking), or the chat is read only. */
@@ -3575,7 +3577,7 @@ export class HubServer {
     payload: Record<string, unknown>,
     deadline: number,
   ): Promise<unknown> {
-    const vmPayload = rewriteProjectIds(payload, sb.hubProjectId, sb.vmProjectId);
+    const vmPayload = rewriteProjectIds(replayPayload(tag, payload), sb.hubProjectId, sb.vmProjectId);
     const toHub = (value: unknown) => rewriteProjectIds(value, sb.vmProjectId, sb.hubProjectId);
     if (!CACHED_READ_STREAMS.has(tag)) {
       return bridge

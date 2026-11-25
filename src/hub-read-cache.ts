@@ -30,18 +30,32 @@ export const CACHED_READ_TAGS = new Set([
 ]);
 /** Of those, the streams: the cache holds their latest value. */
 export const CACHED_READ_STREAMS = new Set(["subscribeVcsStatus", "subscribeVcsBranch"]);
-/** Distinct requests remembered per chat (a diff per file, a file read); the least recently asked go first. */
-export const MAX_RECORDED_READS = 32;
+/**
+ * Distinct requests remembered per chat and RPC (a diff per file, a file read, a refs search); the least
+ * recently asked of that RPC go first, so many file reads never push out the git panel's streams.
+ */
+export const MAX_RECORDED_READS_PER_TAG = 16;
 
 /** Default cap on one cached answer, in bytes of JSON. */
 export const DEFAULT_MAX_CACHED_READ_BYTES = 1024 * 1024;
 /** Default cap on one chat's cached attachments, in bytes. */
 export const DEFAULT_MAX_CACHED_ASSET_BYTES = 25 * 1024 * 1024;
 
-/** The request a cached read is replayed with. A completion token is a past read's: the replay reads all of it. */
-export function replayPayload(tag: string, payload: unknown): Record<string, unknown> {
+/** A request as it is recorded and keyed. A diff's completion token belongs to one past read, so it is left out. */
+export function recordedPayload(tag: string, payload: unknown): Record<string, unknown> {
   const obj = { ...((payload && typeof payload === "object" ? payload : {}) as Record<string, unknown>) };
   if (tag === "review.getDiffPreview") delete obj.completionToken;
+  return obj;
+}
+
+/**
+ * The request a recorded read is replayed with at sleep. A diff preview is read whole (no `trackedOnly`):
+ * the cached answer is then complete and carries no completion token, so a sleeping chat's app never
+ * needs a second read the VM would have to answer.
+ */
+export function replayPayload(tag: string, payload: unknown): Record<string, unknown> {
+  const obj = recordedPayload(tag, payload);
+  if (tag === "review.getDiffPreview") delete obj.trackedOnly;
   return obj;
 }
 
@@ -57,9 +71,9 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value) ?? "null";
 }
 
-/** The cache key of a request: its tag and its replay payload, key order aside. */
+/** The cache key of a request: its tag and its recorded payload, key order aside. */
 export function readKey(tag: string, payload: unknown): string {
-  return `${tag} ${stableJson(replayPayload(tag, payload))}`;
+  return `${tag} ${stableJson(recordedPayload(tag, payload))}`;
 }
 
 /** A stream value the app can be served on its own: any branch status, a status snapshot. */
