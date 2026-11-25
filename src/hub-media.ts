@@ -11,6 +11,13 @@ import { safeCloseCode } from "./proxy.ts";
  * The preview client reads close codes: 4404 is "tab gone" and stops for good; 1008, 4401 and a
  * failed handshake are "unauthorized" and also stop; anything else reconnects with backoff. So
  * only a bad ticket is refused before the upgrade, and every other failure is a close code.
+ *
+ * Preview frame flow control is split at the Hub. The VM sends one screencast frame and waits for
+ * an ack (`{"type":"ack"}`, carrying no frame id) before the next; a newer frame meanwhile
+ * supersedes the older one. Passing acks through made every frame cost a full app<->VM round
+ * trip. Instead the Hub acks each frame to the VM as it arrives, so the VM paces on the Hub<->VM
+ * round trip only, and keeps the same one-in-flight discipline toward the app: one frame out,
+ * the newest one held, the app's acks consumed here.
  */
 
 export const PREVIEW_STREAM_PREFIX = "/api/preview-stream/";
@@ -24,6 +31,18 @@ export const MEDIA_RETRY_CLOSE = 1013;
 const MAX_PENDING_BYTES = 1024 * 1024;
 /** A static page sends no frames: ping the VM socket so proxies on the way keep it open. */
 const UPSTREAM_PING_MS = 25_000;
+/** The preview's frame ack, as the app sends it (`JSON.stringify({ type: "ack" })`). */
+export const PREVIEW_ACK = JSON.stringify({ type: "ack" });
+/** Longer than any ack: such a client message is never parsed, only forwarded. */
+const MAX_ACK_BYTES = 256;
+
+/** One preview stream's frame flow toward the app: one frame out, the newest one held. */
+export interface PreviewFrameFlow {
+  /** A frame was sent to the app and its ack has not come back. */
+  inFlight: boolean;
+  /** The newest frame the app has not been sent yet; a newer one replaces it. */
+  held: Uint8Array | null;
+}
 
 export interface HubMediaWsData {
   kind: "hub-media";
@@ -34,8 +53,11 @@ export interface HubMediaWsData {
   threadId: string | null;
   sandboxId: string | null;
   upstream: WebSocket | null;
+  /** Client messages (input) waiting for the VM socket to open. */
   pending: Array<string | Uint8Array>;
   pendingBytes: number;
+  /** Frame flow toward the app; null for the device hub, which passes through as is. */
+  frames: PreviewFrameFlow | null;
   closed: boolean;
   pingTimer: ReturnType<typeof setInterval> | null;
 }
@@ -59,6 +81,23 @@ export function mediaThreadId(url: URL): string | null {
   return url.searchParams.get("threadId") || null;
 }
 
+/** Only the preview stream's socket carries frames and acks. */
+export function isPreviewStreamSocket(pathname: string): boolean {
+  return pathname === `${PREVIEW_STREAM_PREFIX}ws`;
+}
+
+/** The VM's `isAck`: a JSON message, text or binary, whose `type` is "ack". */
+export function isPreviewAck(msg: string | Uint8Array): boolean {
+  const size = typeof msg === "string" ? msg.length : msg.byteLength;
+  if (size > MAX_ACK_BYTES) return false;
+  try {
+    const parsed: unknown = JSON.parse(typeof msg === "string" ? msg : new TextDecoder().decode(msg));
+    return typeof parsed === "object" && parsed !== null && (parsed as { type?: unknown }).type === "ack";
+  } catch {
+    return false;
+  }
+}
+
 /** The URL to send the VM: the Hub's `wsTicket` removed, everything else as the client sent it. */
 export function withoutHubTicket(url: URL): URL {
   const out = new URL(url.toString());
@@ -77,6 +116,7 @@ export function newMediaWsData(clientId: string, url: URL): HubMediaWsData {
     upstream: null,
     pending: [],
     pendingBytes: 0,
+    frames: isPreviewStreamSocket(url.pathname) ? { inFlight: false, held: null } : null,
     closed: false,
     pingTimer: null,
   };
@@ -96,9 +136,9 @@ function closeClient(ws: ServerWebSocket<HubMediaWsData>, code: number, reason: 
 }
 
 /**
- * Pipes media sockets to their VM, message for message: frames are not re-encoded, and the
- * preview's ack (one frame in flight per viewer) passes through untouched, so the VM's own flow
- * control spans the Hub.
+ * Pipes media sockets to their VM, message for message: frames are not re-encoded, and everything
+ * but preview frames and acks passes through in order. Preview frames are acked to the VM on
+ * arrival and paced toward the app one at a time (see the top of this file).
  */
 export class HubMediaProxy {
   private readonly bySandbox = new Map<string, Set<ServerWebSocket<HubMediaWsData>>>();
@@ -110,6 +150,15 @@ export class HubMediaProxy {
   }
 
   message(ws: ServerWebSocket<HubMediaWsData>, msg: string | Buffer): void {
+    const frames = ws.data.frames;
+    if (frames && isPreviewAck(msg)) {
+      // The app's ack is for the Hub's frame, never the VM's: the VM already had the Hub's ack
+      frames.inFlight = false;
+      const next = frames.held;
+      frames.held = null;
+      if (next) this.sendFrame(ws, frames, next);
+      return;
+    }
     const upstream = ws.data.upstream;
     if (upstream && upstream.readyState === WebSocket.OPEN) {
       upstream.send(msg);
@@ -131,6 +180,7 @@ export class HubMediaProxy {
     const upstream = ws.data.upstream;
     ws.data.upstream = null;
     ws.data.pending = [];
+    if (ws.data.frames) ws.data.frames.held = null;
     if (upstream && (upstream.readyState === WebSocket.OPEN || upstream.readyState === WebSocket.CONNECTING)) {
       try {
         upstream.close(safeCloseCode(code ?? 1000), (reason ?? "").slice(0, 120));
@@ -199,11 +249,27 @@ export class HubMediaProxy {
 
     upstream.addEventListener("message", (ev) => {
       if (ws.data.upstream !== upstream) return;
+      const data: unknown = ev.data;
+      const bytes =
+        data instanceof ArrayBuffer
+          ? new Uint8Array(data)
+          : ArrayBuffer.isView(data)
+            ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+            : null;
+      const frames = ws.data.frames;
+      if (frames && bytes) {
+        // A preview frame (JPEG, binary; control is JSON text): ack it to the VM now, so it
+        // captures the next one while this one travels to the app
+        if (upstream.readyState === WebSocket.OPEN) upstream.send(PREVIEW_ACK);
+        if (frames.inFlight) frames.held = bytes;
+        else this.sendFrame(ws, frames, bytes);
+        return;
+      }
+      // Control (viewport, pointer, dialogs...) goes out at once, even past a held frame, as the
+      // VM itself writes it past its own pending frame
       try {
-        const data: unknown = ev.data;
         if (typeof data === "string") ws.sendText(data);
-        else if (data instanceof ArrayBuffer) ws.sendBinary(new Uint8Array(data));
-        else if (ArrayBuffer.isView(data)) ws.sendBinary(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+        else if (bytes) ws.sendBinary(bytes);
       } catch {
         // client already closed
       }
@@ -212,6 +278,7 @@ export class HubMediaProxy {
     upstream.addEventListener("close", (ev) => {
       if (ws.data.upstream !== upstream) return;
       ws.data.upstream = null;
+      if (ws.data.frames) ws.data.frames.held = null;
       this.stopPing(ws);
       this.untrack(ws);
       if (ws.data.closed) return;
@@ -223,6 +290,16 @@ export class HubMediaProxy {
     upstream.addEventListener("error", () => {
       // the close handler follows
     });
+  }
+
+  private sendFrame(ws: ServerWebSocket<HubMediaWsData>, frames: PreviewFrameFlow, frame: Uint8Array): void {
+    if (ws.data.closed) return;
+    frames.inFlight = true;
+    try {
+      ws.sendBinary(frame);
+    } catch {
+      // client already closed
+    }
   }
 
   private untrack(ws: ServerWebSocket<HubMediaWsData>): void {
