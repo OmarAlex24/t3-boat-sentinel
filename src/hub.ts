@@ -27,11 +27,25 @@ import {
 } from "./security.ts";
 import type { ProjectConfig, ProjectKlavConfig, SentinelConfig } from "./config.ts";
 import { HubMcpHandler, formatRpcFailure, type HubSandboxPhase } from "./hub-mcp.ts";
+import { HubShellStore } from "./hub-shell-store.ts";
+import { repositoryIdentityFor } from "./repository-identity.ts";
+import { defaultBranchOfRefs, fallbackVcsRefs, isVcsRefsResult, templateVcsRefs } from "./vcs-refs.ts";
+import {
+  ATTACHMENT_UPLOAD_ROUTE_PREFIX,
+  ATTACHMENT_UPLOAD_URL_TTL_MS,
+  STAGED_ATTACHMENT_MAX_AGE_MS,
+  parseUploadRequest,
+  replayUploadRequest,
+  stagedAssetHeaders,
+  stagedAttachmentId,
+  type StagedAttachment,
+} from "./hub-attachments.ts";
 import {
   buildPlaceholderThread,
   failPlaceholderThread,
   placeholderInputFrom,
   projectionFromShell,
+  restoredShellRow,
   withStatusNotice,
   type PlaceholderInput,
   type StatusNotice,
@@ -156,15 +170,6 @@ const BOOKKEEPING_COMMANDS = new Set([
   "thread.active.reorder",
   "thread.tag.set",
 ]);
-
-interface StagedAttachment {
-  id: string;
-  name: string;
-  mimeType: string;
-  sizeBytes: number;
-  bytes: Uint8Array | null;
-  createdAt: number;
-}
 
 const HOP_BY_HOP = new Set([
   "connection",
@@ -735,7 +740,9 @@ export class HubServer {
   private readonly clients = new Set<ServerWebSocket<HubWsData>>();
   private readonly threadToSandbox = new Map<string, string>();
   private readonly worktreeToSandbox = new Map<string, string>();
+  /** Each active chat's sidebar row; stored on disk (`shellStore`) while the chat has a sandbox. */
   private readonly threadShells = new Map<string, Record<string, unknown>>();
+  private readonly shellStore: HubShellStore;
   private readonly inFlightSpawns = new Map<string, Promise<HubSandboxRecord>>();
   private readonly inFlightWakes = new Map<string, Promise<HubSandboxRecord>>();
   private readonly inFlightSleeps = new Map<string, Promise<void>>();
@@ -761,6 +768,13 @@ export class HubServer {
   private readonly urlTokenToSandbox = new Map<string, string>();
   private readonly stagedAttachments = new Map<string, StagedAttachment>();
   private readonly stagedUploadTokens = new Map<string, string>(); // uploadToken -> attachmentId
+  /** Asset URL tokens the Hub signed for a staged upload (the client checks an upload before sending) -> attachment id. */
+  private readonly stagedAssetTokens = new Map<string, string>();
+  /**
+   * Staged uploads a chat answered before its VM is up still has to send. The app deletes its uploads
+   * right after a send succeeds, which for such a chat is before the Hub replays them into the VM.
+   */
+  private readonly pinnedStagedAttachments = new Set<string>();
   /** Attachment ids a VM issued when the Hub replayed a staged upload into it -> that VM. */
   private readonly attachmentToSandbox = new Map<string, string>();
   private readonly worktreeSetupSnapshots = new Map<string, WorktreeSetupSnapshotState>();
@@ -793,6 +807,7 @@ export class HubServer {
     private readonly rateLimiter?: AuthRateLimiter,
   ) {
     this.boat = asSandboxProvider(provider);
+    this.shellStore = new HubShellStore(config.stateDir, (threadId) => this.keepsStoredShell(threadId));
     this.mcp = new HubMcpHandler(
       config,
       state,
@@ -864,13 +879,73 @@ export class HubServer {
     for (const sb of this.state.listHubSandboxes()) {
       for (const tid of sb.threadIds) this.threadToSandbox.set(tid, sb.sandboxId);
       for (const wt of sb.worktreePaths) this.worktreeToSandbox.set(wt, sb.sandboxId);
+    }
+    this.restoreThreadShells();
+    for (const sb of this.state.listHubSandboxes()) {
       if (sb.phase === "running") {
         this.attachBridge(sb);
       }
     }
   }
 
+  /**
+   * After a restart: every chat whose VM still exists (asleep, booting or running) keeps its sidebar
+   * row until its VM reports its own. A chat with no stored row (its VM slept before the Hub kept
+   * rows) gets one built from its cached projection, else from the project's defaults. Rows of
+   * chats whose sandbox is gone are deleted.
+   */
+  private restoreThreadShells(): void {
+    let restored = 0;
+    let rebuilt = 0;
+    for (const sb of this.state.listHubSandboxes()) {
+      if (sb.phase === "destroying") continue;
+      const project = this.state.getAllProjects(this.config)[sb.project];
+      for (const threadId of sb.threadIds) {
+        let row = this.shellStore.load(threadId);
+        if (row) {
+          restored++;
+        } else {
+          const cached = this.readProjectionCache(threadId);
+          row = restoredShellRow({
+            threadId,
+            hubProjectId: sb.hubProjectId,
+            providerInstanceId: project?.defaultProvider ?? "claudeAgent",
+            model: project?.defaultModel ?? "claude-opus-5-5",
+            at: sb.sleepingSince ?? sb.lastActiveAt ?? sb.createdAt,
+            projectionThread: (cached?.thread as Record<string, unknown> | undefined) ?? null,
+          });
+          this.shellStore.save(threadId, row);
+          rebuilt++;
+        }
+        this.threadShells.set(threadId, row);
+      }
+    }
+    for (const threadId of this.shellStore.storedThreadIds()) {
+      if (!this.keepsStoredShell(threadId)) this.shellStore.remove(threadId);
+    }
+    if (restored + rebuilt > 0) console.log(`[hub] restored ${restored} chat row(s) from disk, rebuilt ${rebuilt} without one`);
+  }
+
+  /** A row is kept on disk only while its chat is bound to a sandbox that still exists. */
+  private keepsStoredShell(threadId: string): boolean {
+    if (!this.threadShells.has(threadId)) return false;
+    const sandboxId = this.threadToSandbox.get(threadId);
+    const sb = sandboxId ? this.state.getHubSandbox(sandboxId) : undefined;
+    return !!sb && sb.phase !== "destroying" && sb.threadIds.includes(threadId);
+  }
+
+  private setThreadShell(threadId: string, row: Record<string, unknown>): void {
+    this.threadShells.set(threadId, row);
+    this.shellStore.save(threadId, row);
+  }
+
+  private deleteThreadShell(threadId: string): void {
+    this.threadShells.delete(threadId);
+    this.shellStore.remove(threadId);
+  }
+
   stop(): void {
+    this.shellStore.flush();
     for (const timer of this.pauseRetries.values()) clearTimeout(timer);
     this.pauseRetries.clear();
     for (const bridge of this.bridges.values()) {
@@ -1051,6 +1126,34 @@ export class HubServer {
     };
   }
 
+  /** `subscribeAuthAccess` snapshot: the Hub's paired clients as bearer-token sessions; no pairing links. */
+  private buildAuthAccessSnapshot(currentClientId: string): Record<string, unknown> {
+    const hub = this.state.getHub();
+    const connectedIds = new Set(Array.from(this.clients, (c) => c.data.clientId));
+    const session = this.buildAuthSession();
+    return {
+      version: 1,
+      revision: hub?.clients.length ?? 0,
+      type: "snapshot",
+      payload: {
+        pairingLinks: [],
+        clientSessions: (hub?.clients ?? []).map((c) => ({
+          sessionId: c.id,
+          subject: c.label,
+          scopes: session.scopes,
+          permissions: session.permissions,
+          method: "bearer-access-token",
+          client: { label: c.label, deviceType: "unknown" },
+          issuedAt: c.pairedAt,
+          expiresAt: session.expiresAt, // rolling, as `/api/auth/session` reports it
+          lastConnectedAt: null,
+          connected: connectedIds.has(c.id),
+          current: c.id === currentClientId,
+        })),
+      },
+    };
+  }
+
   private buildAuthSession(): Record<string, unknown> {
     const expiresAt = new Date(Date.now() + CLIENT_TOKEN_TTL_SECS * 1000).toISOString();
     const base = this.state.getTemplates().authSession ?? {
@@ -1144,6 +1247,15 @@ export class HubServer {
         },
       ],
       availableEditors: [],
+      // Required by the client's ServerConfig; the Hub exports no telemetry
+      observability: {
+        logsDirectoryPath: "/home/user/.t3/userdata/logs",
+        localTracingEnabled: false,
+        otlpTracesEnabled: false,
+        otlpMetricsEnabled: false,
+        otlpLogsEnabled: false,
+      },
+      // Every ServerSettings key has a decoding default; a VM's real settings replace these
       settings: {},
     };
   }
@@ -1157,19 +1269,25 @@ export class HubServer {
         h.projectIds[key] = projectId;
       });
     }
+    // The app offers "Run on Boat" for a local project whose repository identity matches; a VM's
+    // captured identity wins, else it is derived from the project's repo like a T3 server does
+    const derivedIdentity = proj.repo ? repositoryIdentityFor(proj.repo, proj.workdir) : null;
     const cached = hub.projectTemplates[key]?.shell;
     if (cached && typeof cached === "object") {
+      const captured = (cached as { repositoryIdentity?: unknown }).repositoryIdentity;
       return {
         ...cached,
         id: projectId,
         title: key,
         workspaceRoot: proj.workdir,
+        ...(!captured && derivedIdentity ? { repositoryIdentity: derivedIdentity } : {}),
       };
     }
     return {
       id: projectId,
       title: key,
       workspaceRoot: proj.workdir,
+      ...(derivedIdentity ? { repositoryIdentity: derivedIdentity } : {}),
       defaultModelSelection: null,
       scripts: [],
       createdAt: now,
@@ -1321,16 +1439,10 @@ export class HubServer {
     }
 
     // 7. Attachment upload route (staged locally if pre-spawn, else proxied to owning VM)
-    if (req.method === "POST" && path.startsWith("/api/attachments/upload/")) {
-      const uploadToken = path.slice("/api/attachments/upload/".length);
+    if (req.method === "POST" && path.startsWith(ATTACHMENT_UPLOAD_ROUTE_PREFIX)) {
+      const uploadToken = path.slice(ATTACHMENT_UPLOAD_ROUTE_PREFIX.length);
       const stagedId = this.stagedUploadTokens.get(uploadToken);
-      if (stagedId) {
-        const entry = this.stagedAttachments.get(stagedId);
-        if (!entry) return withCors(new Response("Not Found", { status: 404 }));
-        entry.bytes = new Uint8Array(await req.arrayBuffer());
-        this.stagedUploadTokens.delete(uploadToken);
-        return withCors(new Response(null, { status: 204 }));
-      }
+      if (stagedId) return withCors(await this.receiveStagedUpload(req, uploadToken, stagedId));
       const sandboxId = this.urlTokenToSandbox.get(uploadToken);
       const sb = sandboxId ? this.state.getHubSandbox(sandboxId) : undefined;
       if (sb && sb.phase === "running") {
@@ -1343,6 +1455,12 @@ export class HubServer {
     if ((req.method === "GET" || req.method === "HEAD") && path.startsWith("/api/assets/")) {
       const suffix = path.slice("/api/assets/".length);
       const token = suffix.split("/")[0] ?? "";
+      const stagedAssetId = this.stagedAssetTokens.get(token);
+      if (stagedAssetId) {
+        const staged = this.stagedAttachments.get(stagedAssetId);
+        if (!staged?.bytes) return withCors(new Response("Not Found", { status: 404 }));
+        return withCors(new Response(req.method === "HEAD" ? null : Buffer.from(staged.bytes), { headers: stagedAssetHeaders(staged) }));
+      }
       const sandboxId = this.urlTokenToSandbox.get(token);
       const sb = sandboxId ? this.state.getHubSandbox(sandboxId) : this.anyRunningSandbox();
       if (sb && sb.phase === "running") {
@@ -1515,23 +1633,7 @@ export class HubServer {
     }
     if (tag === "subscribeAuthAccess") {
       ws.data.localStreams.set(reqKey, { rawId: reqId, tag });
-      const hub = this.state.getHub();
-      sendRpcFrame(ws, {
-        _tag: "Chunk",
-        requestId: reqId,
-        values: [
-          {
-            revision: 1,
-            sessions: (hub?.clients ?? []).map((c) => ({
-              sessionId: c.id,
-              subject: c.label,
-              method: "bearer-access-token",
-              connected: true,
-              createdAt: c.pairedAt,
-            })),
-          },
-        ],
-      });
+      sendRpcFrame(ws, { _tag: "Chunk", requestId: reqId, values: [this.buildAuthAccessSnapshot(ws.data.clientId)] });
       return;
     }
     if (tag === "orchestration.subscribeShell") {
@@ -1555,12 +1657,13 @@ export class HubServer {
       return;
     }
     if (tag === "orchestration.getOlderSettledThreads") {
-      sendRpcExitSuccess(ws, reqId, { threads: [], nextCursor: null });
+      // The merged snapshot already lists every thread (VM shells are read without `omitOlderSettled`)
+      sendRpcExitSuccess(ws, reqId, { snapshotSequence: this.state.ensureHub().sequence, threads: [], counts: [] });
       return;
     }
     if (tag === "subscribeTerminalMetadata") {
       ws.data.localStreams.set(reqKey, { rawId: reqId, tag });
-      sendRpcFrame(ws, { _tag: "Chunk", requestId: reqId, values: [{ kind: "snapshot", threads: [] }] });
+      sendRpcFrame(ws, { _tag: "Chunk", requestId: reqId, values: [{ type: "snapshot", terminals: [] }] });
       return;
     }
     if (tag === "subscribeWorktreeSetup") {
@@ -1678,25 +1781,31 @@ export class HubServer {
 
     // 2. Attachment upload URL creation (stage locally if no VM is targeted yet)
     if (tag === "attachments.createUploadUrl") {
-      const p = (payload ?? {}) as { name?: string; mimeType?: string; sizeBytes?: number };
-      const id = `att_${randomUUID().replace(/-/g, "")}`;
+      const upload = parseUploadRequest(payload);
+      if (!upload) {
+        // A T3 server rejects a payload its schema does not accept with a defect
+        sendRpcExitFailure(ws, reqId, "Invalid attachments.createUploadUrl payload");
+        return;
+      }
+      this.sweepStagedAttachments();
+      const now = Date.now();
+      const id = stagedAttachmentId(upload.type, upload.name);
       const uploadToken = randomToken(24);
-      this.stagedAttachments.set(id, {
-        id,
-        name: p.name ?? "attachment",
-        mimeType: p.mimeType ?? "application/octet-stream",
-        sizeBytes: Number(p.sizeBytes ?? 0),
-        bytes: null,
-        createdAt: Date.now(),
-      });
+      const expiresAt = now + ATTACHMENT_UPLOAD_URL_TTL_MS;
+      this.stagedAttachments.set(id, { id, ...upload, bytes: null, createdAt: now, expiresAt });
       this.stagedUploadTokens.set(uploadToken, id);
-      const relativeUrl = `/api/attachments/upload/${uploadToken}`;
-      sendRpcExitSuccess(ws, reqId, {
-        attachmentId: id,
-        relativeUrl,
-        uploadUrl: `https://${this.config.hub!.host}${relativeUrl}`,
-      });
+      sendRpcExitSuccess(ws, reqId, { attachmentId: id, relativeUrl: `${ATTACHMENT_UPLOAD_ROUTE_PREFIX}${uploadToken}`, expiresAt });
       return;
+    }
+    if (tag === "attachments.delete") {
+      // A staged upload is the Hub's own: drop it here (the client discards drafts this way)
+      const attachmentId = String((payload as { attachmentId?: unknown } | null)?.attachmentId ?? "");
+      if (this.stagedAttachments.has(attachmentId)) {
+        // One a booting chat still has to send is kept until it reaches the VM (or the chat closes)
+        if (!this.pinnedStagedAttachments.has(attachmentId)) this.dropStagedAttachment(attachmentId);
+        sendRpcExitSuccess(ws, reqId, null);
+        return;
+      }
     }
 
     // 3. Thread launch -> SPAWN A FRESH BOAT VM PER CHAT!
@@ -1795,8 +1904,9 @@ export class HubServer {
         return;
       }
     }
-    if (tag.startsWith("pullRequests.") || tag.startsWith("peerLinks.") || tag.startsWith("sourceControl.")) {
-      sendRpcExitSuccess(ws, reqId, {});
+    if (tag === "peerLinks.list" || tag === "peerLinks.names") {
+      // No VM: no linked environments to list
+      sendRpcExitSuccess(ws, reqId, { links: [] });
       return;
     }
     sendRpcExitFailure(ws, reqId, `No active Boat sandbox to handle ${tag}; start a thread first.`);
@@ -1913,7 +2023,11 @@ export class HubServer {
         }
         const sb = await this.spawnSandboxForThread(projectKey, threadId);
         const bridge = await this.ensureBridgeOpen(sb);
-        const forwarded = rewriteProjectIds(payload, sb.hubProjectId, sb.vmProjectId);
+        const forwarded = await this.replayStagedAttachmentsInPayload(
+          sb,
+          bridge,
+          rewriteProjectIds(payload, sb.hubProjectId, sb.vmProjectId) as Record<string, unknown>,
+        );
         const exit = await bridge.callUnary("orchestration.dispatchCommand", forwarded, 60_000);
         if (exit._tag === "Success") {
           sendRpcExitSuccess(ws, reqId, { sequence: this.state.nextHubSequence() });
@@ -1985,6 +2099,7 @@ export class HubServer {
       createdAt: input.now,
     });
     this.persistPendingLaunch(pending.record);
+    for (const id of this.stagedIdsIn(payload)) this.pinnedStagedAttachments.add(id);
     const sequence = this.state.nextHubSequence();
     this.broadcastShellItem({ kind: "thread.updated", sequence, location: "active", thread: placeholder.shell });
     console.log(`[hub] chat ${input.threadId} answered at once; booting its VM in the background (project=${projectKey})`);
@@ -2003,7 +2118,7 @@ export class HubServer {
     const pending: PendingThreadLaunch = { record, seenOnVm: false, cancelled: false, ready, resolveReady, rejectReady };
     if (record.phase === "failed") rejectReady(new Error(record.error ?? "This chat's VM failed to start"));
     this.pendingThreads.set(record.threadId, pending);
-    this.threadShells.set(record.threadId, record.shell);
+    this.setThreadShell(record.threadId, record.shell);
     return pending;
   }
 
@@ -2073,7 +2188,11 @@ export class HubServer {
         });
         exit = await bridge.callUnary("orchestration.launchThread", payload, 120_000);
       } else {
-        const payload = rewriteProjectIds({ ...pending.record.payload, threadId }, sb.hubProjectId, sb.vmProjectId);
+        const payload = await this.replayStagedAttachmentsInPayload(
+          sb,
+          bridge,
+          rewriteProjectIds({ ...pending.record.payload, threadId }, sb.hubProjectId, sb.vmProjectId) as Record<string, unknown>,
+        );
         exit = await bridge.callUnary("orchestration.dispatchCommand", payload, 60_000);
       }
       if (exit._tag !== "Success") throw new Error(`The chat's VM could not start it: ${formatRpcFailure(exit.cause)}`);
@@ -2103,8 +2222,9 @@ export class HubServer {
   private cancelPendingLaunch(pending: PendingThreadLaunch, command: string): number {
     const { threadId } = pending.record;
     pending.cancelled = true;
+    for (const id of this.stagedIdsIn(pending.record.payload)) this.dropStagedAttachment(id);
     this.forgetPendingLaunch(threadId);
-    this.threadShells.delete(threadId);
+    this.deleteThreadShell(threadId);
     this.localThreadSubs.delete(threadId);
     pending.rejectReady(new Error("This chat was closed before its VM finished starting"));
     const sequence = this.state.nextHubSequence();
@@ -2124,12 +2244,13 @@ export class HubServer {
   private failPendingLaunch(pending: PendingThreadLaunch, message: string, sb: HubSandboxRecord | null): void {
     const { threadId } = pending.record;
     console.error(`[hub] chat ${threadId} failed to start: ${message}`);
+    for (const id of this.stagedIdsIn(pending.record.payload)) this.dropStagedAttachment(id);
     const failed = failPlaceholderThread({ shell: pending.record.shell, projection: pending.record.projection }, message);
     pending.record = { ...pending.record, ...failed, phase: "failed", error: message };
     this.persistPendingLaunch(pending.record);
     // Setup card first, while the client still follows it (it stops once the run is no longer preparing)
     this.markWorktreeSetupFailed(threadId, message);
-    this.threadShells.set(threadId, failed.shell);
+    this.setThreadShell(threadId, failed.shell);
     this.broadcastShellItem({
       kind: "thread.updated",
       sequence: this.state.nextHubSequence(),
@@ -2472,20 +2593,14 @@ export class HubServer {
       (cwd ? this.projectKeyFromWorkdir(cwd) : null);
 
     if (tag === "vcs.listRefs") {
-      const cached = projKey ? this.state.getHub()?.projectTemplates[projKey]?.vcsRefs : undefined;
-      if (cached) {
-        sendRpcExitSuccess(ws, reqId, cached);
+      const template = projKey ? this.state.getHub()?.projectTemplates[projKey] : undefined;
+      // A template stored by an older Hub may no longer have the shape the app decodes
+      if (isVcsRefsResult(template?.vcsRefs)) {
+        sendRpcExitSuccess(ws, reqId, template.vcsRefs);
         return;
       }
-      sendRpcExitSuccess(ws, reqId, {
-        isRepo: true,
-        hasOriginRemote: true,
-        nextCursor: null,
-        branches: [
-          { name: "main", current: true, isDefault: true, isRemote: false, worktreePath: null },
-          { name: "origin/main", current: false, isDefault: true, isRemote: true, remoteName: "origin", worktreePath: null },
-        ],
-      });
+      const project = projKey ? this.state.getAllProjects(this.config)[projKey] : undefined;
+      sendRpcExitSuccess(ws, reqId, fallbackVcsRefs(template?.defaultBranch ?? null, !!project?.repo));
       return;
     }
 
@@ -2494,7 +2609,7 @@ export class HubServer {
       return;
     }
     if (tag === "projects.listIgnoredFiles") {
-      sendRpcExitSuccess(ws, reqId, { paths: [] });
+      sendRpcExitSuccess(ws, reqId, { files: [], truncated: false });
       return;
     }
     if (tag === "subscribeVcsStatus" || tag === "subscribeVcsBranch") {
@@ -2599,6 +2714,21 @@ export class HubServer {
     attachmentId: string,
   ): Promise<void> {
     const notFound = { _tag: "AssetAttachmentNotFoundError", resource };
+    const staged = this.stagedAttachments.get(attachmentId);
+    if (staged) {
+      // The client checks a finished upload before sending it; one still staged lives on the Hub
+      if (!staged.bytes) {
+        sendRpcExitFail(ws, reqId, notFound);
+        return;
+      }
+      const token = randomToken(24);
+      this.stagedAssetTokens.set(token, attachmentId);
+      sendRpcExitSuccess(ws, reqId, {
+        relativeUrl: `/api/assets/${token}/${encodeURIComponent(staged.name)}`,
+        expiresAt: Date.now() + ATTACHMENT_UPLOAD_URL_TTL_MS,
+      });
+      return;
+    }
     const ownerId = this.attachmentToSandbox.get(attachmentId);
     const owner = ownerId ? this.state.getHubSandbox(ownerId) : undefined;
     if (owner?.phase === "sleeping") {
@@ -2642,6 +2772,54 @@ export class HubServer {
     sendRpcExitFail(ws, reqId, notFound);
   }
 
+  /** The client's `POST` of a staged upload's bytes; answered like T3's upload route. */
+  private async receiveStagedUpload(req: Request, uploadToken: string, stagedId: string): Promise<Response> {
+    const entry = this.stagedAttachments.get(stagedId);
+    if (!entry || entry.expiresAt <= Date.now()) {
+      this.stagedUploadTokens.delete(uploadToken);
+      return new Response("Not Found", { status: 404 });
+    }
+    const contentLength = req.headers.get("content-length");
+    if (contentLength !== null && Number(contentLength) !== entry.sizeBytes) {
+      return new Response("Content-Length must match the upload size.", { status: 400 });
+    }
+    const bytes = new Uint8Array(await req.arrayBuffer());
+    if (bytes.byteLength !== entry.sizeBytes) {
+      return new Response(`Body was ${bytes.byteLength} bytes, expected ${entry.sizeBytes}.`, { status: 400 });
+    }
+    entry.bytes = bytes;
+    this.stagedUploadTokens.delete(uploadToken);
+    return new Response(null, { status: 204 });
+  }
+
+  /** Staged uploads a send payload (launch, `thread.create`, `message.dispatch`) refers to. */
+  private stagedIdsIn(payload: Record<string, unknown>): string[] {
+    const message = payload.initialMessage as { attachments?: unknown } | undefined;
+    const lists = [message?.attachments, payload.attachments].filter(Array.isArray) as unknown[][];
+    return lists
+      .flat()
+      .map((att) => (att && typeof att === "object" ? (att as { id?: unknown }).id : undefined))
+      .filter((id): id is string => typeof id === "string" && this.stagedAttachments.has(id));
+  }
+
+  private dropStagedAttachment(attachmentId: string): void {
+    this.pinnedStagedAttachments.delete(attachmentId);
+    this.stagedAttachments.delete(attachmentId);
+    for (const map of [this.stagedUploadTokens, this.stagedAssetTokens]) {
+      for (const [token, id] of map) if (id === attachmentId) map.delete(token);
+    }
+  }
+
+  /** Forgets staged uploads never sent, after a day as T3 does (and unfinished ones once their URL expired). */
+  private sweepStagedAttachments(): void {
+    const now = Date.now();
+    for (const staged of this.stagedAttachments.values()) {
+      if (this.pinnedStagedAttachments.has(staged.id)) continue;
+      const stale = staged.bytes ? now - staged.createdAt > STAGED_ATTACHMENT_MAX_AGE_MS : staged.expiresAt <= now;
+      if (stale) this.dropStagedAttachment(staged.id);
+    }
+  }
+
   private async replayStagedAttachmentsInPayload(
     sb: HubSandboxRecord,
     bridge: HubVmBridge,
@@ -2667,31 +2845,30 @@ export class HubServer {
         nextAttachments.push(att);
         continue;
       }
-      const created = await bridge.callUnary("attachments.createUploadUrl", {
-        name: staged.name,
-        mimeType: staged.mimeType,
-        sizeBytes: staged.bytes.byteLength,
-      });
-      if (created._tag === "Success" && created.value && typeof created.value === "object") {
-        const res = created.value as { attachmentId?: string; relativeUrl?: string };
-        if (res.attachmentId && res.relativeUrl) {
-          await fetch(`${sb.upstreamUrl}${res.relativeUrl}`, {
-            method: "POST",
-            headers: {
-              ...(sb.upstreamHeaders ?? {}),
-              "content-type": staged.mimeType,
-              "content-length": String(staged.bytes.byteLength),
-            },
-            body: Buffer.from(staged.bytes),
-          });
-          remapped.set(id, res.attachmentId);
-          this.attachmentToSandbox.set(res.attachmentId, sb.sandboxId);
-          this.stagedAttachments.delete(id);
-          nextAttachments.push({ ...att, id: res.attachmentId });
-          continue;
-        }
+      // Same request the client made (type included, so a file is stored as a file), then the bytes
+      const created = await bridge.callUnary("attachments.createUploadUrl", replayUploadRequest(staged));
+      const res = (created._tag === "Success" ? created.value : null) as { attachmentId?: string; relativeUrl?: string } | null;
+      if (!res?.attachmentId || !res.relativeUrl) {
+        const reason = created._tag === "Success" ? "no upload URL" : formatRpcFailure(created.cause);
+        throw new Error(`Attachment '${staged.name}' could not be sent to the chat's VM: ${reason}`);
       }
-      nextAttachments.push(att);
+      const upload = await fetch(`${sb.upstreamUrl}${res.relativeUrl}`, {
+        method: "POST",
+        headers: {
+          ...(sb.upstreamHeaders ?? {}),
+          "content-type": staged.mimeType,
+          "content-length": String(staged.bytes.byteLength),
+        },
+        body: Buffer.from(staged.bytes),
+      });
+      await upload.body?.cancel();
+      if (!upload.ok) {
+        throw new Error(`Attachment '${staged.name}' could not be sent to the chat's VM: upload rejected (${upload.status})`);
+      }
+      remapped.set(id, res.attachmentId);
+      this.attachmentToSandbox.set(res.attachmentId, sb.sandboxId);
+      this.dropStagedAttachment(id);
+      nextAttachments.push({ ...att, id: res.attachmentId });
     }
 
     if (remapped.size === 0) return payload;
@@ -3399,7 +3576,7 @@ export class HubServer {
     this.mcp.recordThreadsDestroyed(threadIds, reason);
     for (const tid of threadIds) {
       this.threadToSandbox.delete(tid);
-      this.threadShells.delete(tid);
+      this.deleteThreadShell(tid);
       this.localThreadSubs.delete(tid);
       this.dropProjectionCache(tid);
       this.broadcastShellItem({
@@ -3504,17 +3681,21 @@ export class HubServer {
             };
           });
         }
+        const listed = new Set<string>();
         for (const t of snap.threads ?? []) {
           const rewritten = rewriteProjectIds(t, sb.vmProjectId, sb.hubProjectId) as Record<string, unknown>;
           const tid = String(rewritten.id ?? "");
-          if (!tid || this.skipVmShellItem(tid)) continue;
-          const isNew = !this.threadShells.has(tid);
-          this.threadShells.set(tid, rewritten);
+          if (!tid) continue;
+          listed.add(tid);
+          if (this.skipVmShellItem(tid)) continue;
+          const previous = this.threadShells.get(tid);
           this.bindThreadToSandbox(tid, sandboxId);
+          this.setThreadShell(tid, rewritten);
           if (typeof rewritten.worktreePath === "string" && rewritten.worktreePath) {
             this.bindWorktreeToSandbox(rewritten.worktreePath, sandboxId);
           }
-          if (isNew) {
+          // New, or a row the Hub restored while the VM was down: the VM's live row wins
+          if (!previous || JSON.stringify(previous) !== JSON.stringify(rewritten)) {
             this.broadcastShellItem({
               kind: "thread.updated",
               sequence: this.state.nextHubSequence(),
@@ -3523,12 +3704,23 @@ export class HubServer {
             });
           }
         }
+        // The snapshot lists every active thread of this VM (the bridge asks without `omitOlderSettled`
+        // or `omitIdleSubagents`): a chat it no longer lists was archived or deleted while the Hub
+        // was not listening. A trimmed snapshot (`olderSettled` set) proves nothing, so it removes none.
+        const complete = !("olderSettled" in (item.snapshot as Record<string, unknown>));
+        for (const tid of complete ? (this.state.getHubSandbox(sandboxId)?.threadIds ?? []) : []) {
+          if (listed.has(tid) || this.pendingThreads.has(tid) || !this.threadShells.has(tid)) continue;
+          this.deleteThreadShell(tid);
+          this.broadcastShellItem({ kind: "thread.removed", sequence: this.state.nextHubSequence(), location: "active", threadId: tid });
+        }
       } else if (item.kind === "thread.updated" && item.thread && typeof item.thread === "object") {
         const rewritten = rewriteProjectIds(item.thread, sb.vmProjectId, sb.hubProjectId) as Record<string, unknown>;
         const tid = String(rewritten.id ?? "");
         if (!tid || this.skipVmShellItem(tid)) continue;
-        this.threadShells.set(tid, rewritten);
         this.bindThreadToSandbox(tid, sandboxId);
+        // An archived thread leaves the active list (the merged snapshot's `threads`)
+        if (item.location === "archive") this.deleteThreadShell(tid);
+        else this.setThreadShell(tid, rewritten);
         if (typeof rewritten.worktreePath === "string" && rewritten.worktreePath) {
           this.bindWorktreeToSandbox(rewritten.worktreePath, sandboxId);
         }
@@ -3539,7 +3731,7 @@ export class HubServer {
           thread: rewritten,
         });
       } else if (item.kind === "thread.removed" && typeof item.threadId === "string") {
-        this.threadShells.delete(item.threadId);
+        if (item.location !== "archive") this.deleteThreadShell(item.threadId);
         this.broadcastShellItem({
           kind: "thread.removed",
           sequence: this.state.nextHubSequence(),
@@ -3704,16 +3896,19 @@ export class HubServer {
     const providers = templates.serverConfig?.providers;
     const live = this.state.getHubSandbox(sandbox.sandboxId);
     if (live && Array.isArray(providers)) this.observeProviderSessions(live, providers);
-    // Also harvest vcsRefs for this project if missing
+    // Refresh this project's refs from the VM's own T3 (newer than a bake's), keeping what every chat shares
     const project = this.state.getAllProjects(this.config)[sandbox.project];
     const bridge = this.bridges.get(sandbox.sandboxId);
-    if (project && bridge?.isOpen() && !this.state.getHub()?.projectTemplates[sandbox.project]?.vcsRefs) {
+    if (project && bridge?.isOpen()) {
       void bridge.callUnary("vcs.listRefs", { cwd: project.workdir }).then((res) => {
-        if (res._tag === "Success" && res.value) {
+        const vcsRefs = res._tag === "Success" ? templateVcsRefs(res.value) : null;
+        if (vcsRefs) {
+          const defaultBranch = defaultBranchOfRefs(vcsRefs);
           this.state.updateHub((h) => {
             h.projectTemplates[sandbox.project] = {
               ...(h.projectTemplates[sandbox.project] ?? {}),
-              vcsRefs: res.value,
+              vcsRefs,
+              ...(defaultBranch ? { defaultBranch } : {}),
             };
           });
         }
@@ -3924,6 +4119,9 @@ export class HubServer {
     this.state.updateHubSandbox(sandboxId, (s) => {
       if (!s.threadIds.includes(threadId)) s.threadIds.push(threadId);
     });
+    // A row the Hub showed before the binding (a booting chat) is stored once the chat has its VM
+    const row = this.threadShells.get(threadId);
+    if (row) this.shellStore.save(threadId, row);
   }
 
   private bindWorktreeToSandbox(worktreePath: string, sandboxId: string): void {

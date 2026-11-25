@@ -16,6 +16,7 @@ import { buildRepoSyncScript, describeRepoSync, parseRepoSyncOutput, type RepoSy
 import type { SlotRecord, StateStore } from "./state.ts";
 import { T3ReleaseResolver } from "./t3-release.ts";
 import { ensureT3Project, launchT3Thread, type LaunchThreadOptions } from "./t3rpc.ts";
+import { templateVcsRefs } from "./vcs-refs.ts";
 
 const SCRIPTS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "scripts");
 const PROVISION_SCRIPT = join(SCRIPTS_DIR, "provision-base.sh");
@@ -684,6 +685,8 @@ export class LifecycleManager {
         `T3_CHANNEL=${shellQuote(effectiveT3Channel)}`,
         `BAKE_CLEAN=1`,
       ];
+      // Project bakes also report the project's refs and default branch (see provision-base.sh)
+      if (project) bakeEnv.push(`BAKE_PROJECT_WORKDIR=${shellQuote(project.workdir)}`);
       // Base bakes install the runtimes; project bakes (built from base-t3) only verify them. Either way the
       // script waits until the provider status caches report installed before the snapshot is taken.
       const acpAgents = this.config.t3.prepareAcpAgents ?? [];
@@ -708,10 +711,24 @@ export class LifecycleManager {
         t3Version?: string;
         descriptor?: Record<string, unknown>;
         authSession?: Record<string, unknown>;
+        projectShell?: Record<string, unknown>;
+        vcsRefs?: unknown;
+        defaultBranch?: string;
       }>(out);
 
       if (parsed.descriptor || parsed.authSession) {
         this.state.setTemplates(parsed.descriptor ?? null, parsed.authSession ?? null);
+      }
+      // The project as the bake VM's T3 reported it: the Hub's no-VM answers start from these
+      if (!isBase && this.state.getHub() && (parsed.projectShell || parsed.vcsRefs || parsed.defaultBranch)) {
+        this.state.updateHub((h) => {
+          h.projectTemplates[target] = {
+            ...(h.projectTemplates[target] ?? {}),
+            ...(parsed.projectShell && typeof parsed.projectShell === "object" ? { shell: parsed.projectShell } : {}),
+            ...(templateVcsRefs(parsed.vcsRefs) ? { vcsRefs: templateVcsRefs(parsed.vcsRefs)! } : {}),
+            ...(parsed.defaultBranch ? { defaultBranch: parsed.defaultBranch } : {}),
+          };
+        });
       }
 
       if (hasCapability(this.boat, "pause") && this.boat.pause) {

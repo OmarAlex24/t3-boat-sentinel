@@ -22,6 +22,8 @@ import { LifecycleManager } from "./lifecycle.ts";
 import { formatRpcFailure } from "./hub-mcp.ts";
 import { buildPlaceholderThread, failPlaceholderThread, placeholderInputFrom } from "./hub-placeholder.ts";
 import { chatThreadIdOf, threadGoneError } from "./hub.ts";
+import { defaultBranchOfRefs, fallbackVcsRefs, templateVcsRefs } from "./vcs-refs.ts";
+import { normalizeGitRemoteUrl, repositoryIdentityFor } from "./repository-identity.ts";
 import { REPO_SYNC_MARKER, buildRepoSyncScript, parseRepoSyncOutput } from "./repo-sync.ts";
 import {
   applySettingsOverlay,
@@ -37,6 +39,16 @@ import { asSandboxProvider, type ProviderCapability, type SandboxProvider } from
 import { ProviderSessionStore } from "./provider-sessions.ts";
 import { StateStore } from "./state.ts";
 import { T3ReleaseResolver } from "./t3-release.ts";
+import { ATTACHMENT_UPLOAD_URL_TTL_MS, parseUploadRequest } from "./hub-attachments.ts";
+import { loadT3Contracts } from "./testing/t3-contracts.ts";
+
+/**
+ * The installed T3 app's own RPC schemas (`T3_APP_ASAR`, else the macOS Nightly app), or null when
+ * no app is installed (CI): contract decodes then skip, the plain assertions next to them still run.
+ */
+const t3Contracts = await loadT3Contracts();
+if (t3Contracts) console.log(`[contracts] decoding with the T3 app's schemas, version ${t3Contracts.version}`);
+else console.log("[contracts] no T3 app bundle found: contract decodes skipped");
 
 class MockBoat implements BoatClient {
   sandboxes = new Map<string, BoatSandbox>();
@@ -543,6 +555,61 @@ describe("LifecycleManager hardening", () => {
     expect(settingsUploads().map((u) => u.local)).toEqual([settingsFile, settingsFile]);
   });
 
+  test("project bakes record the project as the bake VM's T3 reports it: shell row, refs and default branch", async () => {
+    const config = makeTestConfig();
+    const state = new StateStore(config.stateDir, config);
+    state.ensureHub("Boat", Object.keys(state.getAllProjects(config)));
+    const boat = new MockBoat();
+    const workdir = "/home/user/my-app";
+    const identity = repositoryIdentityFor("git@github.com:acme/my-app.git", workdir);
+    const projectShell = {
+      id: "vm-project-1",
+      title: "my-app",
+      workspaceRoot: workdir,
+      repositoryIdentity: identity,
+      defaultModelSelection: null,
+      scripts: [],
+      createdAt: "2026-11-25T00:00:00.000Z",
+      updatedAt: "2026-11-25T00:00:00.000Z",
+      deletedAt: null,
+    };
+    const vcsRefs = {
+      isRepo: true,
+      hasPrimaryRemote: true,
+      nextCursor: null,
+      totalCount: 3,
+      refs: [
+        { name: "master", current: true, isDefault: true, isRemote: false, worktreePath: null },
+        { name: "release", current: false, isDefault: false, isRemote: false, worktreePath: null },
+        { name: "origin/master", current: false, isDefault: true, isRemote: true, remoteName: "origin", worktreePath: null },
+      ],
+    };
+    boat.execHook = (_id, script) =>
+      script.includes("BAKE_CLEAN=1") && script.includes("BAKE_PROJECT_WORKDIR=")
+        ? Promise.resolve({ exitCode: 0, stdout: JSON.stringify({ t3Version: "t3 v0.1.0", projectShell, vcsRefs, defaultBranch: "master", cleaned: true }), stderr: "" })
+        : undefined;
+    const lifecycle = new LifecycleManager(config, state, boat);
+    const bakeScript = () => boat.execScripts.filter((s) => s.includes("BAKE_CLEAN=1")).at(-1) ?? "";
+
+    await lifecycle.bake("base");
+    expect(bakeScript()).not.toContain("BAKE_PROJECT_WORKDIR");
+    expect(state.getHub()!.projectTemplates["my-app"]).toBeUndefined();
+
+    await lifecycle.bake("my-app");
+    expect(bakeScript()).toContain(`BAKE_PROJECT_WORKDIR='${workdir}'`);
+    // A clean clone's refs: the bake's local default branch is kept, other local branches are not
+    expect(state.getHub()!.projectTemplates["my-app"]).toEqual({ shell: projectShell, vcsRefs: templateVcsRefs(vcsRefs), defaultBranch: "master" });
+    expect(((state.getHub()!.projectTemplates["my-app"]!.vcsRefs as { refs: Array<{ name: string }> }).refs).map((r) => r.name)).toEqual([
+      "master",
+      "origin/master",
+    ]);
+    expect(defaultBranchOfRefs(vcsRefs)).toBe("master");
+    if (t3Contracts) {
+      expect(t3Contracts.decodeWith("OrchestrationProjectShell", projectShell)).toEqual({ ok: true });
+      expect(t3Contracts.decodeSuccess("vcs.listRefs", vcsRefs)).toEqual({ ok: true });
+    }
+  });
+
   test("concurrent spawns reserve distinct slots and never clobber an occupied slot unless replace=true", async () => {
     const config = makeTestConfig();
     const state = new StateStore(config.stateDir, config);
@@ -937,10 +1004,27 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     } = {},
   ) {
     let assetSeq = 0;
+    let uploadSeq = 0;
+    /** Upload URLs this VM issued, and the bytes clients (the Hub) posted to them. */
+    const uploadUrls = new Map<string, { attachmentId: string; payload: Record<string, unknown> }>();
+    const uploads: Array<{ attachmentId: string; payload: Record<string, unknown>; contentType: string | null; bytes: Uint8Array }> = [];
+    /** Active threads this VM holds, as rows its shell snapshot lists (like a real VM after a reconnect). */
+    const threads = new Map<string, Record<string, unknown>>();
     let vmSettings = (opts.configSnapshot?.settings ?? null) as Record<string, unknown> | null;
     const seenMethods: Array<{ tag: string; payload: unknown }> = [];
     const acks: string[] = [];
     const vmProjectId = `vm-proj-${vmTag}`;
+    /** This VM's project as T3 lists it in a shell snapshot (every key `OrchestrationProjectShell` requires). */
+    const vmProjectRow = {
+      id: vmProjectId,
+      title: "my-app",
+      workspaceRoot: "/home/user/my-app",
+      defaultModelSelection: null,
+      scripts: [],
+      createdAt: "2026-11-01T00:00:00.000Z",
+      updatedAt: "2026-11-01T00:00:00.000Z",
+      deletedAt: null,
+    };
     let configStream: { ws: { sendText(data: string): unknown }; requestId: string } | null = null;
     const server = Bun.serve({
       port: 0,
@@ -955,6 +1039,14 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
           return Response.json({
             projects: [{ id: vmProjectId, title: "my-app", workspaceRoot: "/home/user/my-app" }],
             threads: [],
+          });
+        }
+        if (req.method === "POST" && url.pathname.startsWith("/api/attachments/upload/")) {
+          const issued = uploadUrls.get(url.pathname.slice("/api/attachments/upload/".length));
+          if (!issued) return new Response("Not Found", { status: 404 });
+          return req.arrayBuffer().then((buf) => {
+            uploads.push({ ...issued, contentType: req.headers.get("content-type"), bytes: new Uint8Array(buf) });
+            return new Response(null, { status: 204 });
           });
         }
         return Response.json({ ok: true, vmTag });
@@ -1035,8 +1127,8 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
                     snapshot: {
                       schemaVersion: 2,
                       snapshotSequence: 1,
-                      projects: [{ id: vmProjectId, title: "my-app", workspaceRoot: "/home/user/my-app" }],
-                      threads: [],
+                      projects: [vmProjectRow],
+                      threads: [...threads.values()],
                       archivedThreads: [],
                     },
                   },
@@ -1108,13 +1200,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
                 requestId: frame.id,
                 exit: {
                   _tag: "Success",
-                  value: {
-                    thread: { id: threadId, projectId: vmProjectId, title: "Cached chat" },
-                    runs: [],
-                    messages: [{ id: `vm-msg-${threadId}`, role: "user", text: "What we said before" }],
-                    turnItems: [],
-                    visibleTurnItems: [],
-                  },
+                  value: vmThreadProjection(threadId, vmProjectId),
                 },
               }),
             );
@@ -1123,13 +1209,8 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
           if (frame.tag === "orchestration.launchThread") {
             const p = frame.payload ?? {};
             const threadId = String(p.threadId);
-            const threadShell = {
-              id: threadId,
-              projectId: vmProjectId,
-              title: String(p.title ?? "Chat"),
-              worktreePath: `/home/user/.t3/worktrees/my-app/${vmTag}-${threadId}`,
-              status: "running",
-            };
+            const threadShell = vmThreadRow(threadId, vmProjectId, String(p.title ?? "Chat"), `/home/user/.t3/worktrees/my-app/${vmTag}-${threadId}`);
+            threads.set(threadId, threadShell);
             ws.sendText(
               JSON.stringify({
                 _tag: "Exit",
@@ -1164,6 +1245,19 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
             ws.sendText(JSON.stringify({ _tag: "Exit", requestId: frame.id, exit }));
             return;
           }
+          if (frame.tag === "attachments.createUploadUrl") {
+            const n = ++uploadSeq;
+            const attachmentId = `vm-${vmTag}-att-${n}`;
+            uploadUrls.set(`vmtok-${n}`, { attachmentId, payload: frame.payload ?? {} });
+            ws.sendText(
+              JSON.stringify({
+                _tag: "Exit",
+                requestId: frame.id,
+                exit: { _tag: "Success", value: { attachmentId, relativeUrl: `/api/attachments/upload/vmtok-${n}`, expiresAt: Date.now() + 600_000 } },
+              }),
+            );
+            return;
+          }
           if (frame.tag === "terminal.open") {
             ws.sendText(
               JSON.stringify({
@@ -1196,7 +1290,44 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       vmProjectId,
       pushConfigItems,
       getSettings: () => vmSettings,
+      uploads,
+      threads,
     };
+  }
+
+  /** A thread row as a T3 VM lists it (every key `OrchestrationV2ThreadShell` requires), running. */
+  function vmThreadRow(threadId: string, projectId: string, title: string, worktreePath: string | null): Record<string, unknown> {
+    const input = placeholderInputFrom(
+      "launch",
+      { title, modelSelection: { instanceId: "claudeAgent", model: "claude-opus-5-5" }, runtimeMode: "full-access", interactionMode: "default" },
+      threadId,
+      projectId,
+    )!;
+    const { lastVisitedAt: _visited, ...row } = buildPlaceholderThread(input).shell;
+    return { ...row, worktreePath, status: "running" };
+  }
+
+  /** A settled thread's projection as a T3 VM answers `getThreadProjection`: one earlier user message. */
+  function vmThreadProjection(threadId: string, projectId: string): Record<string, unknown> {
+    const input = placeholderInputFrom(
+      "launch",
+      {
+        title: "Cached chat",
+        modelSelection: { instanceId: "claudeAgent", model: "claude-opus-5-5" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        initialMessage: { messageId: `vm-msg-${threadId}`, text: "What we said before", attachments: [] },
+      },
+      threadId,
+      projectId,
+    )!;
+    const { projection } = buildPlaceholderThread(input);
+    const settled = <T extends Record<string, unknown>>(rows: T[]) => rows.map((r) => ({ ...r, runId: null }));
+    const turnItems = settled(projection.turnItems as Record<string, unknown>[]).filter((i) => i.type === "user_message");
+    const visible = (projection.visibleTurnItems as Array<{ item: Record<string, unknown> }>)
+      .filter((r) => r.item.type === "user_message")
+      .map((r) => ({ ...r, item: { ...r.item, runId: null } }));
+    return { ...projection, runs: [], messages: settled(projection.messages as Record<string, unknown>[]), turnItems, visibleTurnItems: visible };
   }
 
   /** Pairs with the Hub and opens one client WebSocket; returns helpers to send and await frames. */
@@ -1733,6 +1864,222 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     });
   });
 
+  describe("attachments staged by the Hub (the app's upload flow)", () => {
+    const UPLOAD_URL_PATTERN = /^\/api\/attachments\/upload\/(?!\.{1,2}$)[\w.-]+$/;
+    type HubClient = Awaited<ReturnType<typeof connectHubClient>>;
+    const exitOf = async (client: HubClient, id: string) =>
+      (await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === id)) as Record<string, unknown> & {
+        exit: { _tag: string; value?: any; cause?: any };
+      };
+    /** Decodes a frame with the app's schema for `tag` (when the app is installed). */
+    const expectDecodes = (tag: string, frame: Record<string, unknown>) => {
+      if (t3Contracts) expect(t3Contracts.decodeFrame(tag, frame)).toEqual([{ ok: true }]);
+    };
+
+    /**
+     * One composer file, as the app sends it (attachmentUploadQueue + utils chunks): mint an upload URL,
+     * XHR `POST` the bytes with `Content-Type: <mimeType>` (any 2xx is success), then check the upload
+     * with `assets.createUrl({ _tag: "attachment" })` before sending the message.
+     */
+    async function uploadLikeTheApp(
+      client: HubClient,
+      cfg: SentinelConfig,
+      key: string,
+      input: { type?: "image" | "file"; name: string; mimeType: string },
+      bytes: Uint8Array<ArrayBuffer>,
+    ): Promise<string> {
+      const before = Date.now();
+      client.request(`mint-${key}`, "attachments.createUploadUrl", { ...input, sizeBytes: bytes.byteLength });
+      const mint = await exitOf(client, `mint-${key}`);
+      expect(mint.exit._tag).toBe("Success");
+      expectDecodes("attachments.createUploadUrl", mint);
+      const { attachmentId, relativeUrl, expiresAt } = mint.exit.value as { attachmentId: string; relativeUrl: string; expiresAt: number };
+      expect(relativeUrl).toMatch(UPLOAD_URL_PATTERN);
+      expect(expiresAt).toBeGreaterThanOrEqual(before + ATTACHMENT_UPLOAD_URL_TTL_MS);
+      expect(expiresAt).toBeLessThanOrEqual(Date.now() + ATTACHMENT_UPLOAD_URL_TTL_MS);
+
+      const posted = await fetch(`${client.base}${relativeUrl}`, {
+        method: "POST",
+        headers: { host: cfg.hub!.host, "content-type": input.mimeType },
+        body: bytes,
+      });
+      expect(posted.status).toBe(204);
+
+      client.request(`verify-${key}`, "assets.createUrl", { resource: { _tag: "attachment", attachmentId } });
+      const verify = await exitOf(client, `verify-${key}`);
+      expect(verify.exit._tag).toBe("Success");
+      expectDecodes("assets.createUrl", verify);
+      const asset = await fetch(`${client.base}${(verify.exit.value as { relativeUrl: string }).relativeUrl}`, { headers: { host: cfg.hub!.host } });
+      expect(asset.headers.get("content-type")).toBe(input.mimeType);
+      expect(new Uint8Array(await asset.arrayBuffer())).toEqual(bytes);
+      return attachmentId;
+    }
+
+    test("the upload URL result decodes with the app's contract; ids, names and the upload route follow T3", async () => {
+      if (t3Contracts) {
+        expect(t3Contracts.exported("ATTACHMENT_UPLOAD_URL_TTL_MS")).toBe(ATTACHMENT_UPLOAD_URL_TTL_MS);
+        // The answer the Hub gave before this fix: rejected by the app, hence "failed to upload"
+        const old = { attachmentId: "att_1", relativeUrl: "/api/attachments/upload/tok", uploadUrl: "https://boat.example.com/api/attachments/upload/tok" };
+        expect(t3Contracts.decodeSuccess("attachments.createUploadUrl", old).error).toContain("expiresAt");
+      }
+      // T3's input rules: type defaults to image; a file that is an SVG is stored with a .svg name
+      expect(parseUploadRequest({ name: "image.png", mimeType: "image/png", sizeBytes: 3 })).toMatchObject({ type: "image", name: "image.png" });
+      expect(parseUploadRequest({ type: "file", name: "diagram", mimeType: "image/svg+xml", sizeBytes: 3 })?.name).toBe("diagram.svg");
+      expect(parseUploadRequest({ type: "file", name: "logo", mimeType: "application/octet-stream", sizeBytes: 3 })?.name).toBe("logo");
+      expect(parseUploadRequest({ type: "video", name: "a", mimeType: "x/y", sizeBytes: 3 })).toBeNull();
+      expect(parseUploadRequest({ name: "a.png", mimeType: "image/png", sizeBytes: 0 })).toBeNull();
+
+      const vm = startFakeVmT3Server("vm1");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle } = await startHubWithVm(vm, "t3-sentinel-hub-att-contract-");
+      const client = await connectHubClient(handle, cfg);
+      const mint = async (key: string, payload: Record<string, unknown>) => {
+        client.request(key, "attachments.createUploadUrl", payload);
+        const frame = await exitOf(client, key);
+        expectDecodes("attachments.createUploadUrl", frame);
+        return frame.exit;
+      };
+      expect((await mint("img", { name: "image.png", mimeType: "image/png", sizeBytes: 4 })).value.attachmentId).toMatch(
+        /^pending-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+      );
+      expect((await mint("pdf", { type: "file", name: "report.pdf", mimeType: "application/pdf", sizeBytes: 4 })).value.attachmentId).toEndWith("-pdf");
+      expect((await mint("svg", { type: "file", name: "diagram", mimeType: "image/svg+xml", sizeBytes: 4 })).value.attachmentId).toEndWith("-svg");
+      expect((await mint("bin", { type: "file", name: "Makefile", mimeType: "text/plain", sizeBytes: 4 })).value.attachmentId).toEndWith("-bin");
+      // A payload T3's schema rejects gets a defect, like T3
+      const bad = await mint("bad", { type: "file", name: "", mimeType: "text/plain", sizeBytes: 4 });
+      expect(bad.cause[0]._tag).toBe("Die");
+
+      // The upload route answers like T3's: 400 for a size that differs, 204 once, then 404
+      const url = (await mint("once", { name: "image.png", mimeType: "image/png", sizeBytes: 4 })).value.relativeUrl as string;
+      const post = (body: Uint8Array<ArrayBuffer>) =>
+        fetch(`${client.base}${url}`, { method: "POST", headers: { host: cfg.hub!.host, "content-type": "image/png" }, body });
+      expect((await post(new Uint8Array(3))).status).toBe(400);
+      expect((await post(new Uint8Array(4))).status).toBe(204);
+      expect((await post(new Uint8Array(4))).status).toBe(404);
+
+      // Removing a staged upload from the composer drops it on the Hub (void success is null on the wire)
+      const discard = (await mint("discard", { name: "image.png", mimeType: "image/png", sizeBytes: 4 })).value;
+      client.request("del", "attachments.delete", { attachmentId: discard.attachmentId });
+      const del = await exitOf(client, "del");
+      expect(del.exit).toEqual({ _tag: "Success", value: null });
+      expectDecodes("attachments.delete", del);
+      const late = await fetch(`${client.base}${discard.relativeUrl}`, { method: "POST", headers: { host: cfg.hub!.host }, body: new Uint8Array(4) });
+      expect(late.status).toBe(404);
+      // An upload that never finished is not there yet
+      client.request("unfinished", "assets.createUrl", { resource: { _tag: "attachment", attachmentId: (await mint("u", { name: "a.png", mimeType: "image/png", sizeBytes: 4 })).value.attachmentId } });
+      const unfinished = await exitOf(client, "unfinished");
+      expect(unfinished.exit.cause[0].error._tag).toBe("AssetAttachmentNotFoundError");
+      expectDecodes("assets.createUrl", unfinished);
+    });
+
+    test("an image in a new chat and a file in a later message reach the chat's VM with their type, bytes and the VM's ids", async () => {
+      const vm = startFakeVmT3Server("vm1");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle } = await startHubWithVm(vm, "t3-sentinel-hub-att-e2e-");
+      const client = await connectHubClient(handle, cfg);
+      const hubProjectId = await subscribeHubShell(client);
+
+      // 1. An image attached to the first message of a new chat, uploaded before any VM exists
+      const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+      const imageId = await uploadLikeTheApp(client, cfg, "img", { name: "image.png", mimeType: "image/png" }, png);
+      const image = { type: "image", id: imageId, name: "image.png", mimeType: "image/png", sizeBytes: png.byteLength };
+      const launch = clientLaunchPayload("thread-att", hubProjectId, "What is in this image?");
+      launch.initialMessage.attachments = [image] as never[];
+      if (t3Contracts) expect(t3Contracts.decodePayload("orchestration.launchThread", launch)).toEqual({ ok: true });
+      client.request("launch", "orchestration.launchThread", launch);
+      expect((await exitOf(client, "launch")).exit._tag).toBe("Success");
+      await client.waitForFrame(shellThreadUpdate("thread-att", (t) => t.status === "running"));
+
+      expect(vm.uploads).toHaveLength(1);
+      expect(vm.uploads[0]).toMatchObject({ attachmentId: "vm-vm1-att-1", contentType: "image/png", bytes: png });
+      expect(vm.uploads[0].payload).toEqual({ name: "image.png", mimeType: "image/png", sizeBytes: png.byteLength });
+      const vmLaunch = vm.seenMethods.find((m) => m.tag === "orchestration.launchThread")!.payload as typeof launch;
+      expect(vmLaunch.initialMessage.attachments).toEqual([{ ...image, id: "vm-vm1-att-1" }] as never[]);
+
+      // 2. A file attached to a later message in the same chat
+      const pdf = new TextEncoder().encode("%PDF-1.7 hello");
+      const fileId = await uploadLikeTheApp(client, cfg, "pdf", { type: "file", name: "report.pdf", mimeType: "application/pdf" }, pdf);
+      expect(fileId).toEndWith("-pdf");
+      const file = { type: "file", id: fileId, name: "report.pdf", mimeType: "application/pdf", sizeBytes: pdf.byteLength };
+      const command = {
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        dispatchMode: { type: "start_immediately" },
+        commandId: "cmd-file",
+        threadId: "thread-att",
+        messageId: "msg-file",
+        text: "And this report?",
+        attachments: [file],
+      };
+      if (t3Contracts) expect(t3Contracts.decodePayload("orchestration.dispatchCommand", command)).toEqual({ ok: true });
+      client.request("send-file", "orchestration.dispatchCommand", command);
+      const sent = await exitOf(client, "send-file");
+      expect(sent.exit._tag).toBe("Success");
+      expectDecodes("orchestration.dispatchCommand", sent);
+
+      expect(vm.uploads).toHaveLength(2);
+      // `type: "file"` reaches the VM, so it stores a file (an image-only request would be rejected)
+      expect(vm.uploads[1].payload).toEqual({ type: "file", name: "report.pdf", mimeType: "application/pdf", sizeBytes: pdf.byteLength });
+      expect(vm.uploads[1]).toMatchObject({ attachmentId: "vm-vm1-att-2", contentType: "application/pdf", bytes: pdf });
+      const vmDispatch = vm.seenMethods.filter((m) => m.tag === "orchestration.dispatchCommand").at(-1)!.payload as typeof command;
+      expect(vmDispatch.attachments).toEqual([{ ...file, id: "vm-vm1-att-2" }]);
+
+      // 3. A VM that rejects the bytes fails the send with the reason, instead of passing an id the VM lacks
+      const again = await uploadLikeTheApp(client, cfg, "again", { type: "file", name: "notes.txt", mimeType: "text/plain" }, new TextEncoder().encode("hi"));
+      vm.uploads.length = 0;
+      const realFetch = globalThis.fetch;
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) =>
+        String(input).includes("/api/attachments/upload/vmtok-") ? new Response("nope", { status: 400 }) : realFetch(input, init)) as typeof fetch;
+      try {
+        client.request("send-bad", "orchestration.dispatchCommand", {
+          ...command,
+          commandId: "cmd-bad",
+          messageId: "msg-bad",
+          attachments: [{ type: "file", id: again, name: "notes.txt", mimeType: "text/plain", sizeBytes: 2 }],
+        });
+        const failed = await exitOf(client, "send-bad");
+        expect(failed.exit.cause[0].error).toMatchObject({ _tag: "OrchestrationV2DispatchCommandError", commandId: "cmd-bad" });
+        expect(failed.exit.cause[0].error.message).toContain("Attachment 'notes.txt' could not be sent to the chat's VM");
+        expectDecodes("orchestration.dispatchCommand", failed);
+      } finally {
+        globalThis.fetch = realFetch;
+      }
+    });
+
+    test("the app's delete right after sending to a new chat does not drop an upload its booting VM still needs", async () => {
+      const vm = startFakeVmT3Server("vm1");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-att-pinned-");
+      const client = await connectHubClient(handle, cfg);
+      const hubProjectId = await subscribeHubShell(client);
+      const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 9, 9]);
+      const imageId = await uploadLikeTheApp(client, cfg, "img", { name: "image.png", mimeType: "image/png" }, png);
+
+      let release!: () => void;
+      boat.createGate = new Promise<void>((r) => (release = r));
+      cleanups.push(() => release());
+      const launch = clientLaunchPayload("thread-pin", hubProjectId, "Look");
+      launch.initialMessage.attachments = [{ type: "image", id: imageId, name: "image.png", mimeType: "image/png", sizeBytes: png.byteLength }] as never[];
+      client.request("launch", "orchestration.launchThread", launch);
+      expect((await exitOf(client, "launch")).exit._tag).toBe("Success");
+      // What the app does once the send succeeded (attachmentUploadQueue: release the composer's uploads)
+      client.request("del", "attachments.delete", { attachmentId: imageId });
+      expect((await exitOf(client, "del")).exit).toEqual({ _tag: "Success", value: null });
+
+      boat.createGate = null;
+      release();
+      await client.waitForFrame(shellThreadUpdate("thread-pin", (t) => t.status === "running"));
+      expect(vm.uploads).toHaveLength(1);
+      expect(vm.uploads[0].bytes).toEqual(png);
+      const vmLaunch = vm.seenMethods.find((m) => m.tag === "orchestration.launchThread")!.payload as typeof launch;
+      expect((vmLaunch.initialMessage.attachments[0] as { id: string }).id).toBe("vm-vm1-att-1");
+      // Sent, so it is gone from the Hub now
+      client.request("gone", "assets.createUrl", { resource: { _tag: "attachment", attachmentId: imageId } });
+      expect((await exitOf(client, "gone")).exit._tag).toBe("Failure");
+    });
+  });
+
   describe("chats whose VM is asleep", () => {
     type HubClient = Awaited<ReturnType<typeof connectHubClient>>;
     const until = async (cond: () => boolean, timeoutMs = 5_000) => {
@@ -1761,6 +2108,109 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       expect(hub.handle.state.getHubSandbox(sandboxId)!.phase).toBe("sleeping");
       return { vm, client, sandboxId, ...hub };
     }
+
+    test("a Hub restart keeps every chat whose VM still exists in the sidebar; the VM's live row wins once it runs", async () => {
+      // One fake VM per sandbox, as in production (each lists only its own threads)
+      const vms = ["vm-r1", "vm-r2", "vm-r3", "vm-r4"].map((tag) => startFakeVmT3Server(tag));
+      for (const vm of vms) cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat, dir } = await startHubWithVm(vms[0], "t3-sentinel-hub-sidebar-restart-");
+      boat.hostPublic = async (id: string) => vms[Number(id.slice("sb-".length)) - 1].url;
+      const client: HubClient = await connectHubClient(handle, cfg);
+      const hubProjectId = await subscribeHubShell(client);
+      const chats = ["thread-run", "thread-sleep", "thread-cached", "thread-legacy"];
+      for (const threadId of chats) {
+        client.request(`launch-${threadId}`, "orchestration.launchThread", clientLaunchPayload(threadId, hubProjectId, "Hi", `Chat ${threadId}`));
+        await client.waitForFrame(shellThreadUpdate(threadId, (t) => t.status === "running"));
+      }
+      const sandboxOf = (threadId: string) => handle.state.listHubSandboxes().find((sb) => sb.threadIds.includes(threadId))!.sandboxId;
+      for (const threadId of ["thread-sleep", "thread-cached", "thread-legacy"]) await handle.hub!.sleepHubSandbox(sandboxOf(threadId));
+      handle.stop();
+
+      const rows = join(dir, "hub-thread-shells");
+      expect(readdirSync(rows).sort()).toEqual(chats.map((t) => `${t}.json`).sort());
+      // Two chats whose VMs slept before the Hub kept rows: one with a cached projection, one with nothing
+      rmSync(join(rows, "thread-cached.json"));
+      rmSync(join(rows, "thread-legacy.json"));
+      rmSync(join(dir, "hub-thread-cache", "thread-legacy.json"));
+      // A row left behind for a chat whose sandbox is gone
+      writeFileSync(join(rows, "thread-ghost.json"), JSON.stringify({ id: "thread-ghost", title: "Ghost" }));
+
+      const handle2 = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+      cleanups.push(() => handle2.stop());
+      const client2: HubClient = await connectHubClient(handle2, cfg);
+      client2.request("shell", "orchestration.subscribeShell", { requestCompletionMarker: true });
+      const shell = await client2.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "shell");
+      const listed = (shell.values as Array<{ snapshot?: { threads: Array<Record<string, unknown>> } }>)[0].snapshot!.threads;
+      // The whole merged snapshot decodes as the app's shell stream item (a bad row breaks the whole sidebar)
+      if (t3Contracts) expect(t3Contracts.decodeFrame("orchestration.subscribeShell", shell)).toEqual([{ ok: true }, { ok: true }]);
+      const byId = new Map(listed.map((t) => [String(t.id), t]));
+      expect([...byId.keys()].sort()).toEqual([...chats].sort());
+      expect(byId.get("thread-sleep")).toMatchObject({ title: "Chat thread-sleep", projectId: hubProjectId, status: "running" });
+      expect(byId.get("thread-cached")).toMatchObject({ title: "Cached chat", projectId: hubProjectId });
+      expect(byId.get("thread-legacy")).toMatchObject({ title: "Sleeping chat", projectId: hubProjectId, status: "idle" });
+      await until(() => !existsSync(join(rows, "thread-ghost.json")));
+      await until(() => existsSync(join(rows, "thread-legacy.json")));
+
+      // Opening a rebuilt chat works like before the restart: the Hub's view at once, and its VM wakes,
+      // whose live row then replaces the rebuilt one
+      client2.request("legacy-view", "orchestration.getThreadProjection", { threadId: "thread-legacy" });
+      const view = await client2.waitForFrame((f) => f._tag === "Exit" && f.requestId === "legacy-view");
+      expect((view.exit as { _tag: string })._tag).toBe("Success");
+      if (t3Contracts) expect(t3Contracts.decodeFrame("orchestration.getThreadProjection", view)).toEqual([{ ok: true }]);
+      await client2.waitForFrame(shellThreadUpdate("thread-legacy", (t) => t.title === "Chat thread-legacy"));
+
+      // The VM renamed the chat while the Hub was down: once it runs, its live row replaces the stored one
+      const sleepVm = vms[Number(sandboxOf("thread-sleep").slice(3)) - 1];
+      sleepVm.threads.set("thread-sleep", { ...sleepVm.threads.get("thread-sleep")!, title: "Renamed on the VM" });
+      await handle2.hub!.wakeHubSandbox(sandboxOf("thread-sleep"));
+      await client2.waitForFrame(shellThreadUpdate("thread-sleep", (t) => t.title === "Renamed on the VM"));
+      await until(() => readFileSync(join(rows, "thread-sleep.json"), "utf8").includes("Renamed on the VM"));
+
+      // A chat its VM no longer lists (archived while the Hub did not listen) leaves the sidebar on wake
+      const legacyVm = vms[Number(sandboxOf("thread-legacy").slice(3)) - 1];
+      await until(() => handle2.state.getHubSandbox(sandboxOf("thread-legacy"))?.phase === "running");
+      await handle2.hub!.sleepHubSandbox(sandboxOf("thread-legacy"));
+      legacyVm.threads.delete("thread-legacy");
+      await handle2.hub!.wakeHubSandbox(sandboxOf("thread-legacy"));
+      await client2.waitForFrame(
+        (f) =>
+          f._tag === "Chunk" &&
+          f.requestId === "shell" &&
+          (f.values as Array<{ kind?: string; threadId?: string }>).some((v) => v.kind === "thread.removed" && v.threadId === "thread-legacy"),
+      );
+      await until(() => !existsSync(join(rows, "thread-legacy.json")));
+
+      // A destroyed sandbox takes its chat's row with it
+      await handle2.hub!.destroyHubSandbox(sandboxOf("thread-cached"), "test");
+      await until(() => !existsSync(join(rows, "thread-cached.json")));
+      handle2.stop();
+      expect(readdirSync(rows).sort()).toEqual(["thread-run.json", "thread-sleep.json"]);
+    }, 20_000);
+
+    test("an archived chat leaves the active list and its stored row", async () => {
+      const { vm, handle, client, dir } = await (async () => {
+        const vm = startFakeVmT3Server("vm-archive");
+        cleanups.push(() => vm.server.stop(true));
+        const hub = await startHubWithVm(vm, "t3-sentinel-hub-archive-row-");
+        const client: HubClient = await connectHubClient(hub.handle, hub.cfg);
+        await launchThreadOnHub(client, "thread-arch");
+        return { vm, client, ...hub };
+      })();
+      await until(() => existsSync(join(dir, "hub-thread-shells", "thread-arch.json")));
+      const bridgeShell = (values: unknown[]) =>
+        (handle.hub as unknown as { handleVmShellItems(id: string, items: unknown[]): void }).handleVmShellItems("sb-1", values);
+      const row = { ...vm.threads.get("thread-arch")!, archivedAt: new Date().toISOString() };
+      bridgeShell([{ kind: "thread.removed", sequence: 5, location: "active", threadId: "thread-arch" }]);
+      bridgeShell([{ kind: "thread.updated", sequence: 6, location: "archive", thread: row }]);
+      const archived = await client.waitForFrame(
+        (f) => f._tag === "Chunk" && f.requestId === "shell" && (f.values as Array<{ location?: string }>).some((v) => v.location === "archive"),
+      );
+      if (t3Contracts) for (const r of t3Contracts.decodeFrame("orchestration.subscribeShell", archived)) expect(r).toEqual({ ok: true });
+      client.request("shell2", "orchestration.subscribeShell");
+      const shell = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "shell2");
+      expect((shell.values as Array<{ snapshot: { threads: unknown[] } }>)[0].snapshot.threads).toEqual([]);
+      await until(() => !existsSync(join(dir, "hub-thread-shells", "thread-arch.json")));
+    });
 
     test("opening a sleeping chat shows its history at once, says it is waking, then hands over to the VM", async () => {
       const { vm, client, boat, sandboxId, dir } = await sleepingChat("vm-sleep");
@@ -2270,6 +2720,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
           },
         ],
       });
+      if (t3Contracts) expect(t3Contracts.decodeExit("server.updateSettings", dup)).toEqual({ ok: true });
       // The old flat payload is rejected like a T3 server's decoder rejects it
       const flat = await updateExit(a, "flat", { fastWorktreeCheckout: true });
       expect(flat).toEqual({ _tag: "Failure", cause: [{ _tag: "Die", defect: 'Missing key\n  at ["patch"]' }] });
@@ -4801,6 +5252,391 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       expect(handle.state.getHubSandbox("sb-np")!.phase).toBe("running");
     });
   });
+
+  describe("audit: answers the Hub builds itself decode with the T3 app's own schemas", () => {
+    // Every RPC value, stream item, typed error and HTTP body the Hub synthesizes (instead of
+    // forwarding a VM's answer), sent the way the app sends the request and decoded with the
+    // installed app's own schemas (exit schema, stream item schema, HTTP endpoint schemas).
+    type HubClient = Awaited<ReturnType<typeof connectHubClient>>;
+    const until = async (cond: () => boolean, timeoutMs = 5_000) => {
+      const start = Date.now();
+      while (!cond()) {
+        if (Date.now() - start > timeoutMs) throw new Error("condition not met in time");
+        await Bun.sleep(20);
+      }
+    };
+    const testWithApp = t3Contracts ? test : test.skip;
+    type Failure = { scenario: string; tag: string; error: string; value: unknown };
+    const cwd = "/home/user/my-app";
+
+    /** Sends RPCs as the app does and decodes every frame the Hub sends back for them. */
+    function auditor(client: HubClient, scenario: string) {
+      let seq = 0;
+      const failures: Failure[] = [];
+      const checked: string[] = [];
+      const tags = new Map<string, string>();
+      const check = (tag: string, frame: Record<string, unknown>) => {
+        checked.push(tag);
+        if (!t3Contracts) return;
+        const values = frame._tag === "Chunk" ? (frame.values as unknown[]) : [frame.exit];
+        t3Contracts.decodeFrame(tag, frame).forEach((r, i) => {
+          if (!r.ok) failures.push({ scenario, tag, error: r.error ?? "", value: values[i] });
+        });
+      };
+      /** One request and its first frame; `silent` for a stream the Hub keeps open with nothing to send. */
+      const call = async (tag: string, payload: unknown = {}, opts: { silent?: boolean } = {}) => {
+        const id = `audit-${scenario}-${++seq}`;
+        tags.set(id, tag);
+        client.request(id, tag, payload);
+        if (opts.silent) {
+          await Bun.sleep(30);
+          expect(client.inbox.some((f) => f.requestId === id)).toBe(false);
+          return null;
+        }
+        const frame = await client.waitForFrame((f) => f.requestId === id, 15_000);
+        check(tag, frame);
+        return frame as Record<string, unknown> & { exit?: { _tag: string; value?: any; cause?: any }; values?: any[] };
+      };
+      /** Frames an open stream received since (e.g. shell broadcasts). */
+      const drain = (tag: string, requestId: string) => {
+        for (let i = 0; i < client.inbox.length; ) {
+          if (client.inbox[i].requestId === requestId) check(tag, client.inbox.splice(i, 1)[0]);
+          else i++;
+        }
+      };
+      /** Later frames of every stream this auditor opened (pushes after the first frame). */
+      const drainAll = () => {
+        for (let i = 0; i < client.inbox.length; ) {
+          const tag = tags.get(String(client.inbox[i].requestId));
+          if (tag) check(tag, client.inbox.splice(i, 1)[0]);
+          else i++;
+        }
+      };
+      return { call, drain, drainAll, check, failures, checked };
+    }
+    const report = (failures: Failure[]) =>
+      failures.map((f) => `${f.scenario} ${f.tag}: ${f.error.replace(/\s+/g, " ").slice(0, 400)} <- ${JSON.stringify(f.value)?.slice(0, 300)}`);
+
+    test("Boat projects: repository identity and refs from the repo URL, the bake, or a chat VM's T3", async () => {
+      const vm = startFakeVmT3Server("vm-audit-repo");
+      cleanups.push(() => vm.server.stop(true));
+      const repo = "https://github.com/OmarAlex24/webservice_panel.git";
+      const { cfg, handle } = await startHubWithVm(vm, "t3-sentinel-hub-audit-repo-", {
+        patchConfig: (c) => ({ ...c, projects: { ...c.projects, "my-app": { ...c.projects["my-app"], repo } } }),
+      });
+      const client = await connectHubClient(handle, cfg);
+      const a = auditor(client, "repo");
+      const shellProject = async () => {
+        const shell = await a.call("orchestration.subscribeShell", {});
+        expect(shell!.values![0].kind).toBe("snapshot");
+        return (shell!.values![0].snapshot.projects as Array<Record<string, any>>).find((p) => p.workspaceRoot === cwd)!;
+      };
+
+      // No template: the identity a T3 server derives from this remote, so the app offers "Run on → Boat"
+      // for a local checkout of the same repo (matched by canonicalKey, lower case)
+      const derived = await shellProject();
+      expect(derived.repositoryIdentity).toEqual({
+        canonicalKey: "github.com/omaralex24/webservice_panel",
+        locator: { source: "git-remote", remoteName: "origin", remoteUrl: repo },
+        rootPath: cwd,
+        displayName: "OmarAlex24/webservice_panel",
+        provider: "github",
+        owner: "OmarAlex24",
+        name: "webservice_panel",
+      });
+      expect(derived.repositoryIdentity.canonicalKey).toBe(normalizeGitRemoteUrl("git@github.com:OmarAlex24/webservice_panel.git"));
+
+      // No refs listed yet: an empty, schema-valid list rather than a guessed `main`
+      const none = await a.call("vcs.listRefs", { cwd });
+      expect(none!.exit!.value).toEqual({ isRepo: true, hasPrimaryRemote: true, nextCursor: null, totalCount: 0, refs: [] });
+
+      // Refs an older Hub stored in a shape the app no longer decodes are not served
+      handle.state.updateHub((h) => {
+        h.projectTemplates["my-app"] = { vcsRefs: { branches: [{ name: "main" }] } };
+      });
+      expect((await a.call("vcs.listRefs", { cwd }))!.exit!.value.refs).toEqual([]);
+
+      // The bake recorded the default branch (`origin/HEAD`): that branch, locally and on origin
+      handle.state.updateHub((h) => {
+        h.projectTemplates["my-app"] = { defaultBranch: "master" };
+      });
+      const fromBranch = await a.call("vcs.listRefs", { cwd });
+      expect(fromBranch!.exit!.value.refs.map((r: { name: string; isDefault: boolean }) => [r.name, r.isDefault])).toEqual([
+        ["master", true],
+        ["origin/master", true],
+      ]);
+
+      // Captured by the bake or a chat VM: the VM's own answers, as they are
+      const capturedRefs = {
+        isRepo: true,
+        hasPrimaryRemote: true,
+        nextCursor: null,
+        totalCount: 2,
+        refs: [
+          { name: "master", current: true, isDefault: true, isRemote: false, worktreePath: null },
+          { name: "origin/master", current: false, isDefault: true, isRemote: true, remoteName: "origin", worktreePath: null },
+        ],
+      };
+      const capturedIdentity = repositoryIdentityFor("git@github.com:OmarAlex24/webservice_panel.git", cwd);
+      handle.state.updateHub((h) => {
+        h.projectTemplates["my-app"] = {
+          shell: { ...derived, id: "vm-project", title: "webservice_panel", repositoryIdentity: capturedIdentity },
+          vcsRefs: capturedRefs,
+          defaultBranch: "master",
+        };
+      });
+      expect((await a.call("vcs.listRefs", { cwd }))!.exit!.value).toEqual(capturedRefs);
+      const captured = await shellProject();
+      expect(captured).toMatchObject({ id: derived.id, title: "my-app", workspaceRoot: cwd, repositoryIdentity: capturedIdentity });
+      if (t3Contracts) {
+        expect(t3Contracts.decodeWith("OrchestrationProjectShell", derived)).toEqual({ ok: true });
+        expect(t3Contracts.decodeWith("OrchestrationProjectShell", captured)).toEqual({ ok: true });
+      }
+      expect(report(a.failures)).toEqual([]);
+    }, 20_000);
+
+    test("environment RPCs with no VM: server config, lifecycle, auth access, shell, terminals, clones, workspace fallbacks", async () => {
+      const vm = startFakeVmT3Server("vm-audit-env");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle } = await startHubWithVm(vm, "t3-sentinel-hub-audit-env-");
+      const client = await connectHubClient(handle, cfg);
+      const other = await connectHubClient(handle, cfg); // a second paired client, connected
+      void other;
+      const a = auditor(client, "no-vm");
+      const hubProjectId = await subscribeHubShell(client);
+
+      const config = await a.call("server.getConfig");
+      expect(config!.exit!.value.observability).toMatchObject({ logsDirectoryPath: expect.any(String), localTracingEnabled: false });
+      await a.call("subscribeServerConfig");
+      await a.call("subscribeServerLifecycle");
+      const access = await a.call("subscribeAuthAccess");
+      const accessSnap = access!.values![0];
+      expect(accessSnap).toMatchObject({ version: 1, type: "snapshot", payload: { pairingLinks: [] } });
+      expect(accessSnap.payload.clientSessions).toHaveLength(2);
+      expect(accessSnap.payload.clientSessions.filter((c: { current: boolean }) => c.current)).toHaveLength(1);
+      expect(accessSnap.payload.clientSessions.every((c: { connected: boolean }) => c.connected)).toBe(true);
+      await a.call("orchestration.subscribeShell", { requestCompletionMarker: true });
+      await a.call("orchestration.getArchivedShellSnapshot", {});
+      const older = await a.call("orchestration.getOlderSettledThreads", { before: { settledAt: new Date().toISOString() }, limit: 10 });
+      expect(older!.exit!.value).toEqual({ snapshotSequence: expect.any(Number), threads: [], counts: [] });
+      const terminals = await a.call("subscribeTerminalMetadata", {});
+      expect(terminals!.values).toEqual([{ type: "snapshot", terminals: [] }]);
+      await a.call("subscribeWorktreeSetup", { threadId: "thread-none" });
+      await a.call("worktreeSetup.cancel", { threadId: "thread-none" });
+      await a.call("subscribeProjectClones", {});
+      await a.call("projectClone.cancel", { projectId: hubProjectId });
+      await a.call("projectClone.retry", { projectId: hubProjectId });
+      await a.call("server.reportClientActivity", {});
+      await a.call("preview.reportProfiles", {});
+      await a.call("preview.reportStatus", {});
+      await a.call("server.refreshProviders", {});
+      await a.call("server.getSettings", {});
+      await a.call("server.probe", {});
+      await a.call("server.updateSettings", { patch: {} });
+      // No bake or VM has listed this project's refs, and it has no repo: no refs, never a guessed `main`
+      const refs = await a.call("vcs.listRefs", { cwd });
+      expect(refs!.exit!.value).toEqual({ isRepo: true, hasPrimaryRemote: false, nextCursor: null, totalCount: 0, refs: [] });
+      await a.call("projects.listEntries", { cwd });
+      await a.call("projects.searchEntries", { cwd, query: "a", limit: 10 });
+      expect((await a.call("projects.listIgnoredFiles", { cwd }))!.exit!.value).toEqual({ files: [], truncated: false });
+      await a.call("subscribeVcsStatus", { cwd }, { silent: true });
+      await a.call("provider.install.subscribe", { instanceId: "claudeAgent" });
+      await a.call("provider.auth.subscribe", { instanceId: "claudeAgent" });
+      await a.call("provider.auth.start", { instanceId: "claudeAgent" });
+      await a.call("preview.list", { threadId: "thread-none" });
+      await a.call("orchestration.subscribePromptSuggestion", { threadId: "thread-none" }, { silent: true });
+      // Pull requests, peer links and source control with no VM: empty link lists, else a readable defect
+      expect((await a.call("peerLinks.list", {}))!.exit!.value).toEqual({ links: [] });
+      expect((await a.call("peerLinks.names", {}))!.exit!.value).toEqual({ links: [] });
+      const noVmTags = (t3Contracts?.rpcTags ?? ["pullRequests.list", "sourceControl.starred", "peerLinks.link"]).filter(
+        (t) => /^(pullRequests|peerLinks|sourceControl)\./.test(t) && t !== "peerLinks.list" && t !== "peerLinks.names",
+      );
+      for (const tag of noVmTags) {
+        if (t3Contracts?.isStream(tag)) continue;
+        const frame = await a.call(tag, {});
+        expect(frame!.exit!.cause[0]._tag).toBe("Die");
+      }
+      // An interrupted stream ends with an Interrupt cause
+      client.request("int-1", "subscribeServerConfig", {});
+      await client.waitForFrame((f) => f.requestId === "int-1");
+      client.ws.send(JSON.stringify({ _tag: "Interrupt", requestId: "int-1" }));
+      a.check("subscribeServerConfig", await client.waitForFrame((f) => f.requestId === "int-1" && f._tag === "Exit"));
+      a.drain("orchestration.subscribeShell", "shell");
+      expect(report(a.failures)).toEqual([]);
+    }, 20_000);
+
+    test("chats answered by the Hub: booting, failed, asleep; launch, thread views, commands, setup card, shell rows", async () => {
+      const vm = startFakeVmT3Server("vm-audit-chat");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-audit-chat-");
+      const client = await connectHubClient(handle, cfg);
+      const a = auditor(client, "booting");
+      client.request("shell", "orchestration.subscribeShell");
+      const first = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "shell");
+      a.check("orchestration.subscribeShell", first);
+      const hubProjectId = String((first.values as Array<{ snapshot: { projects: Array<{ id: string }> } }>)[0].snapshot.projects[0].id);
+
+      let release!: () => void;
+      boat.createGate = new Promise<void>((r) => (release = r));
+      cleanups.push(() => release());
+      await a.call("orchestration.launchThread", clientLaunchPayload("thread-b", hubProjectId, "Hello"));
+      await a.call("orchestration.subscribeThread", { threadId: "thread-b", requestCompletionMarker: true });
+      await a.call("orchestration.getThreadProjection", { threadId: "thread-b" });
+      await a.call("orchestration.getThreadFamily", { threadId: "thread-b" });
+      await a.call("orchestration.dispatchCommand", { type: "thread.visit", commandId: "cmd-v", threadId: "thread-b", visitedAt: new Date().toISOString() });
+      await a.call("subscribeWorktreeSetup", { threadId: "thread-b" });
+      await a.call("orchestration.launchThread", clientLaunchPayload("thread-b", hubProjectId, "Hello")); // re-sent after a socket loss
+      // Its start fails: failed row, failed setup card, failed run in the thread view
+      boat.createError = new Error("no capacity");
+      release();
+      await until(() => handle.state.getHub()?.pendingLaunches?.["thread-b"]?.phase === "failed");
+      await Bun.sleep(50);
+      a.drain("orchestration.subscribeShell", "shell");
+      a.drainAll(); // the thread view's failed snapshot, the failed setup card
+      await a.call("orchestration.getThreadProjection", { threadId: "thread-b" });
+      await a.call("subscribeWorktreeSetup", { threadId: "thread-b" });
+      boat.createError = null;
+      // Typed failures: a launch into an unknown project, a dispatch the Hub cannot route
+      await a.call("orchestration.launchThread", { ...clientLaunchPayload("thread-x", "no-such-project", "Hi"), commandId: "cmd-x" });
+      // A cloned repository becomes a project (result, clone snapshot, project row)
+      const clone = await a.call("projectClone.start", {
+        projectId: "11111111-2222-4333-8444-555555555555",
+        remoteUrl: "https://github.com/acme/widget.git",
+        destinationPath: "/home/user/widget",
+        title: "widget",
+      });
+      expect(clone!.exit!._tag).toBe("Success");
+      await a.call("subscribeProjectClones", {});
+      await Bun.sleep(50);
+      a.drain("orchestration.subscribeShell", "shell");
+      a.drainAll(); // clone progress pushes
+      expect(report(a.failures)).toEqual([]);
+
+      // A sleeping chat (its own Hub, so the project is the VM's), with and without a cached copy
+      const sleepy = await startHubWithVm(vm, "t3-sentinel-hub-audit-sleep-");
+      const client2 = await connectHubClient(sleepy.handle, sleepy.cfg);
+      const s = auditor(client2, "sleeping");
+      await launchThreadOnHub(client2, "thread-s");
+      const sbId = sleepy.handle.state.listHubSandboxes().find((x) => x.threadIds.includes("thread-s"))!.sandboxId;
+      await sleepy.handle.hub!.sleepHubSandbox(sbId);
+      sleepy.boat.resumeGate = new Promise<void>(() => {});
+      await s.call("orchestration.getThreadProjection", { threadId: "thread-s" });
+      await s.call("orchestration.getThreadFamily", { threadId: "thread-s" });
+      await s.call("orchestration.subscribeThread", { threadId: "thread-s" });
+      await s.call("orchestration.dispatchCommand", { type: "thread.visit", commandId: "cmd-v2", threadId: "thread-s", visitedAt: new Date().toISOString() });
+      s.drain("orchestration.subscribeShell", "shell");
+      s.drainAll();
+      expect(report(s.failures)).toEqual([]);
+
+      const vmNoCopy = startFakeVmT3Server("vm-audit-nocopy", { failProjection: true });
+      cleanups.push(() => vmNoCopy.server.stop(true));
+      const bare = await startHubWithVm(vmNoCopy, "t3-sentinel-hub-audit-nocopy-");
+      const client3 = await connectHubClient(bare.handle, bare.cfg);
+      const n = auditor(client3, "no-copy");
+      await launchThreadOnHub(client3, "thread-n");
+      await bare.handle.hub!.sleepHubSandbox(bare.handle.state.listHubSandboxes()[0].sandboxId);
+      let resume!: () => void;
+      bare.boat.resumeGate = new Promise<void>((r) => (resume = r));
+      // Its sidebar row stands in for the projection while it wakes; a wake failure says why
+      await n.call("orchestration.getThreadProjection", { threadId: "thread-n" });
+      bare.boat.resumeError = new Error("resume refused");
+      resume();
+      await bare.handle.hub!.wakeHubSandbox(bare.handle.state.listHubSandboxes()[0].sandboxId).catch(() => {});
+      await n.call("orchestration.getThreadProjection", { threadId: "thread-n" });
+      await n.call("orchestration.dispatchCommand", {
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        dispatchMode: { type: "start_immediately" },
+        commandId: "cmd-n",
+        threadId: "thread-n",
+        messageId: "msg-n",
+        text: "hi",
+        attachments: [],
+      });
+      n.drainAll();
+      expect(report(n.failures)).toEqual([]);
+    }, 20_000);
+
+    test("server self-update: progress items, the result and the typed failure", async () => {
+      const vm = startFakeVmT3Server("vm-audit-upd");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle } = await startHubWithVm(vm, "t3-sentinel-hub-audit-upd-");
+      const bakes = gateBakes(handle);
+      const client = await connectHubClient(handle, cfg);
+      const a = auditor(client, "self-update");
+      const target = "0.1.13-nightly.20261125.5245";
+      bakes.failOnce.add("my-app");
+      const failed = await a.call("server.updateServer", { targetVersion: target });
+      expect(failed!.exit!.cause[0].error._tag).toBe("ServerSelfUpdateError");
+      client.request("progress", "server.updateServerWithProgress", { targetVersion: target });
+      const done = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "progress", 15_000);
+      const chunks = client.inbox.filter((f) => f.requestId === "progress");
+      for (const f of chunks) a.check("server.updateServerWithProgress", f);
+      a.check("server.updateServerWithProgress", done);
+      expect(chunks.flatMap((f) => f.values as Array<{ type: string }>).map((v) => v.type)).toContain("complete");
+      expect(done.exit).toEqual({ _tag: "Success", value: null });
+      expect(report(a.failures)).toEqual([]);
+    }, 20_000);
+
+    testWithApp("typed errors the Hub builds for a chat whose VM is gone", () => {
+      const resource = { _tag: "media-file", threadId: "thread-gone", path: "/home/user/x.png" };
+      const cases: Array<[string, Record<string, unknown>]> = [
+        ["assets.createUrl", { resource }],
+        ["secrets.answerRequest", { threadId: "thread-gone" }],
+        ["agentFeedback.answerRequest", { threadId: "thread-gone" }],
+        ["peerLinks.answerRequest", { threadId: "thread-gone" }],
+        ["guestShare.create", { threadId: "thread-gone" }],
+        ["provider.mcpSignIn.start", { threadId: "thread-gone", server: "linear" }],
+        ["provider.mcpSignIn.complete", { threadId: "thread-gone", server: "linear" }],
+        ["provider.uploadFeedback", { threadId: "thread-gone" }],
+        ["workspace.addTaskFolderRepository", { threadId: "thread-gone" }],
+        ["scheduledTasks.upsert", { threadId: "thread-gone" }],
+        ["assets.persistChatAttachments", { threadId: "thread-gone" }],
+        ...t3Contracts!.rpcTags.filter((t) => t.startsWith("mcpApps.")).map((t): [string, Record<string, unknown>] => [t, { threadId: "thread-gone" }]),
+      ];
+      const failures = cases.flatMap(([tag, payload]) => {
+        const error = threadGoneError(tag, payload);
+        expect(error).not.toBeNull();
+        const r = t3Contracts!.decodeError(tag, error);
+        return r.ok ? [] : [`${tag}: ${r.error}`];
+      });
+      expect(failures).toEqual([]);
+    });
+
+    testWithApp("HTTP endpoints the Hub answers itself: descriptor, token, session, tickets, shell", async () => {
+      const vm = startFakeVmT3Server("vm-audit-http");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle } = await startHubWithVm(vm, "t3-sentinel-hub-audit-http-");
+      const base = `http://127.0.0.1:${handle.server.port}`;
+      const failures: string[] = [];
+      const decode = async (group: string, endpoint: string, res: Response) => {
+        expect(res.status).toBe(200);
+        const r = t3Contracts!.decodeHttp(group, endpoint, await res.json());
+        if (!r.ok) failures.push(`${group}.${endpoint}: ${r.error?.replace(/\s+/g, " ").slice(0, 400)}`);
+      };
+      const pair = await fetch(`${base}/api/pair`, {
+        method: "POST",
+        headers: { host: cfg.controlHost, authorization: `Bearer ${cfg.controlSecret}`, "content-type": "application/json" },
+        body: JSON.stringify({ slot: "hub" }),
+      });
+      const { code } = (await pair.json()) as { code: string };
+      const token = await fetch(`${base}/oauth/token`, {
+        method: "POST",
+        headers: { host: cfg.hub!.host, "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ subject_token: code, client_label: "Mac" }),
+      });
+      const tokenBody = (await token.clone().json()) as { access_token: string };
+      await decode("auth", "token", token);
+      const auth = { host: cfg.hub!.host, authorization: `Bearer ${tokenBody.access_token}` };
+      await decode("metadata", "descriptor", await fetch(`${base}/.well-known/t3/environment`, { headers: { host: cfg.hub!.host } }));
+      await decode("auth", "session", await fetch(`${base}/api/auth/session`, { headers: auth }));
+      await decode("auth", "webSocketTicket", await fetch(`${base}/api/auth/websocket-ticket`, { method: "POST", headers: auth }));
+      await decode("auth", "webSocketTicketFor", await fetch(`${base}/api/auth/websocket-ticket/rpc`, { method: "POST", headers: auth }));
+      await decode("orchestration", "shellSnapshot", await fetch(`${base}/api/orchestration/shell`, { headers: auth }));
+      expect(failures).toEqual([]);
+    });
+  });
 });
 
 describe("chat routing helpers", () => {
@@ -5115,5 +5951,100 @@ describe("hub placeholder thread", () => {
   test("falls back to the awaited launch when the payload lacks what a placeholder needs", () => {
     const { modelSelection: _m, ...withoutModel } = payload;
     expect(placeholderInputFrom("launch", withoutModel, "t1", "p1")).toBeNull();
+  });
+});
+
+describe("repository identity of Boat projects (T3's RepositoryIdentityResolver)", () => {
+  const ssh = "git@github.com:OmarAlex24/webservice_panel.git";
+  const https = "https://github.com/OmarAlex24/webservice_panel.git";
+
+  test("an HTTPS `.git` remote has the canonicalKey T3 computes for the SSH remote of the same repo", () => {
+    const identity = repositoryIdentityFor(https, "/home/user/webservice-panel")!;
+    expect(identity.canonicalKey).toBe("github.com/omaralex24/webservice_panel");
+    expect(identity.canonicalKey).toBe(normalizeGitRemoteUrl(ssh));
+    expect(repositoryIdentityFor(ssh, "/home/user/webservice-panel")!.canonicalKey).toBe(identity.canonicalKey);
+    expect(identity).toMatchObject({ provider: "github", owner: "OmarAlex24", name: "webservice_panel", displayName: "OmarAlex24/webservice_panel" });
+    expect(repositoryIdentityFor("https://gitlab.example.com/group/sub/app.git", "/w")).toMatchObject({
+      canonicalKey: "gitlab.example.com/group/sub/app",
+      provider: "unknown",
+      owner: "group",
+      name: "app",
+    });
+    expect(repositoryIdentityFor("/srv/git/local-only", "/w")).toBeNull();
+  });
+
+  test("a remote's credentials never reach the identity", () => {
+    const identity = repositoryIdentityFor("https://x-access-token:SECRET-tok@github.com/acme/app.git?private_token=SECRET-q", "/w")!;
+    expect(identity.locator).toEqual({ source: "git-remote", remoteName: "origin", remoteUrl: "https://github.com/acme/app.git" });
+    expect(JSON.stringify(identity)).not.toContain("SECRET");
+    expect(identity.canonicalKey).toBe("github.com/acme/app");
+  });
+
+  test("the fallback refs never guess a branch, and decode with the app's schema", () => {
+    expect(fallbackVcsRefs(null, true)).toEqual({ isRepo: true, hasPrimaryRemote: true, nextCursor: null, totalCount: 0, refs: [] });
+    expect((fallbackVcsRefs("master", true).refs as Array<{ name: string }>).map((r) => r.name)).toEqual(["master", "origin/master"]);
+    expect((fallbackVcsRefs("trunk", false).refs as Array<{ name: string }>).map((r) => r.name)).toEqual(["trunk"]);
+    expect(defaultBranchOfRefs(fallbackVcsRefs("master", true))).toBe("master");
+    // A chat VM's refs as a template: no chat branches, worktrees or other chat's current branch
+    const vmRefs = {
+      isRepo: true,
+      hasPrimaryRemote: true,
+      nextCursor: 100,
+      totalCount: 4,
+      refs: [
+        { name: "t3/feature", current: true, isDefault: false, isRemote: false, worktreePath: "/home/user/.t3/worktrees/x" },
+        { name: "master", current: false, isDefault: true, isRemote: false, worktreePath: "/home/user/app" },
+        { name: "origin/master", current: false, isDefault: true, isRemote: true, remoteName: "origin", worktreePath: null },
+        { name: "origin/dev", current: false, isDefault: false, isRemote: true, remoteName: "origin", worktreePath: null },
+      ],
+    };
+    const template = templateVcsRefs(vmRefs)!;
+    expect(template).toMatchObject({ nextCursor: null, totalCount: 3 });
+    expect((template.refs as Array<Record<string, unknown>>).map((r) => [r.name, r.current, r.worktreePath])).toEqual([
+      ["master", true, null],
+      ["origin/master", false, null],
+      ["origin/dev", false, null],
+    ]);
+    expect(templateVcsRefs({ branches: ["main"] })).toBeNull();
+    if (t3Contracts) expect(t3Contracts.decodeSuccess("vcs.listRefs", template)).toEqual({ ok: true });
+    if (!t3Contracts) return;
+    for (const refs of [fallbackVcsRefs(null, true), fallbackVcsRefs("master", true), fallbackVcsRefs("trunk", false)]) {
+      expect(t3Contracts.decodeSuccess("vcs.listRefs", refs)).toEqual({ ok: true });
+    }
+  });
+
+  (t3Contracts ? test : test.skip)("canonicalKey and remote parsing match the T3 app's own functions", () => {
+    const t3Normalize = t3Contracts!.exported("normalizeGitRemoteUrl") as (url: string) => string;
+    const remotes = [
+      ssh,
+      https,
+      "https://github.com/OmarAlex24/webservice_panel",
+      "https://github.com/OmarAlex24/webservice_panel/",
+      "ssh://git@github.com/OmarAlex24/webservice_panel.git",
+      "ssh://git@github.com:22/OmarAlex24/webservice_panel.git",
+      "git://github.com/OmarAlex24/webservice_panel.git",
+      "https://x-access-token:tok@github.com/OmarAlex24/webservice_panel.git",
+      "git@gitlab.com:group/sub/project.git",
+      "https://gitlab.example.com:8443/group/sub/project.git",
+      "git@github.com:Acme/My%20Repo.git",
+      "https://github.com/Acme/My%20Repo",
+      "git@[::1]:acme/app.git",
+      "/srv/git/local-only",
+      "C:/repos/app",
+    ];
+    for (const remote of remotes) expect([remote, normalizeGitRemoteUrl(remote)]).toEqual([remote, t3Normalize(remote)]);
+    // Production: the local "webservices" checkout and the Boat project "webservice-panel"
+    expect(t3Normalize(ssh)).toBe(repositoryIdentityFor(https, "/home/user/webservice-panel")!.canonicalKey as string);
+    expect(t3Contracts!.decodeWith("OrchestrationProjectShell", {
+      id: "p1",
+      title: "webservice-panel",
+      workspaceRoot: "/home/user/webservice-panel",
+      repositoryIdentity: repositoryIdentityFor(https, "/home/user/webservice-panel"),
+      defaultModelSelection: null,
+      scripts: [],
+      createdAt: "2026-11-25T00:00:00.000Z",
+      updatedAt: "2026-11-25T00:00:00.000Z",
+      deletedAt: null,
+    })).toEqual({ ok: true });
   });
 });

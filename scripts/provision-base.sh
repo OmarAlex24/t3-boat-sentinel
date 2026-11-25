@@ -437,6 +437,81 @@ if [ "$BAKE_CLEAN" = "1" ]; then
     run_provider_setup "$smoke_token"
   fi
 
+  # Project bakes: the project as the VM's own T3 reports it (its shell row, with `repositoryIdentity`),
+  # its refs (`vcs.listRefs`) and its default branch, so the Hub can show the project, offer
+  # "Run on" and fill the ref picker before any chat VM of the project has run. The wipe below
+  # removes the project registered here.
+  project_capture=""
+  default_branch=""
+  if [ -n "${BAKE_PROJECT_WORKDIR:-}" ] && git -C "$BAKE_PROJECT_WORKDIR" rev-parse --git-dir >/dev/null 2>&1; then
+    default_branch="$(git -C "$BAKE_PROJECT_WORKDIR" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##' || true)"
+    [ -n "$default_branch" ] || default_branch="$(git -C "$BAKE_PROJECT_WORKDIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    [ "$default_branch" != "HEAD" ] || default_branch=""
+    js_runner="node"
+    if command -v bun >/dev/null 2>&1; then js_runner="bun"; elif [ -x "$HOME/.bun/bin/bun" ]; then js_runner="$HOME/.bun/bin/bun"; fi
+    project_capture="$(SMOKE_TOK="$smoke_token" WORKDIR="$BAKE_PROJECT_WORKDIR" timeout 90 "$js_runner" -e '
+      (async () => {
+        const base = "http://127.0.0.1:3773";
+        const auth = { authorization: "Bearer " + process.env.SMOKE_TOK, "x-t3-orchestration-protocol": "2" };
+        const workdir = process.env.WORKDIR;
+        const shellProject = async () => {
+          const res = await fetch(base + "/api/orchestration/shell", { headers: auth });
+          if (!res.ok) throw new Error("shell failed: HTTP " + res.status);
+          const shell = await res.json();
+          return (shell.projects || []).find((p) => p.workspaceRoot === workdir && !p.deletedAt) || null;
+        };
+        let project = await shellProject();
+        if (!project) {
+          const name = workdir.split("/").filter(Boolean).pop() || "project";
+          const created = await fetch(base + "/api/projects/mutate", {
+            method: "POST",
+            headers: { ...auth, "content-type": "application/json" },
+            body: JSON.stringify({ type: "project.create", commandId: crypto.randomUUID(), projectId: crypto.randomUUID(), title: name, workspaceRoot: workdir }),
+          });
+          if (!created.ok) throw new Error("project.create failed: HTTP " + created.status);
+          for (let i = 0; i < 20 && !(project && project.repositoryIdentity); i++) {
+            project = await shellProject();
+            if (!(project && project.repositoryIdentity)) await new Promise((r) => setTimeout(r, 500));
+          }
+        }
+        const listRefs = async () => {
+          const tick = await fetch(base + "/api/auth/websocket-ticket/rpc", {
+            method: "POST",
+            headers: { authorization: "Bearer " + process.env.SMOKE_TOK },
+          });
+          if (!tick.ok) throw new Error("ws ticket failed: HTTP " + tick.status);
+          const { ticket } = await tick.json();
+          const ws = new WebSocket("ws://127.0.0.1:3773/ws?wsTicket=" + encodeURIComponent(ticket) + "&orchestrationProtocol=2");
+          await new Promise((res, rej) => { ws.addEventListener("open", res); ws.addEventListener("error", () => rej(new Error("local t3 ws failed"))); });
+          // The shell row is printed even when the refs cannot be read
+          const exit = await new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error("vcs.listRefs timed out")), 45000);
+            ws.addEventListener("message", (ev) => {
+              const raw = JSON.parse(String(ev.data));
+              for (const f of Array.isArray(raw) ? raw : [raw]) {
+                if (f._tag === "Ping") ws.send(JSON.stringify({ _tag: "Pong" }));
+                else if (f._tag === "Exit" && String(f.requestId) === "1") { clearTimeout(timer); resolve(f.exit); }
+              }
+            });
+            ws.send(JSON.stringify({ _tag: "Request", id: 1, tag: "vcs.listRefs", payload: { cwd: workdir }, headers: [] }));
+          });
+          ws.close();
+          return exit;
+        };
+        const exit = await listRefs().catch((err) => {
+          console.error("[bake] could not read the project refs from t3: " + err.message);
+          return null;
+        });
+        console.log(JSON.stringify({
+          ...(project ? { projectShell: project } : {}),
+          ...(exit && exit._tag === "Success" ? { vcsRefs: exit.value } : {}),
+        }));
+        process.exit(0);
+      })().catch((err) => { console.error("[bake] could not read the project from t3: " + err.message); process.exit(1); });
+    ' | tail -n 1 || true)"
+    echo "[bake] project default branch: ${default_branch:-unknown}; captured: $(printf '%s' "$project_capture" | grep -o '"projectShell"\|"vcsRefs"' | tr '\n' ' ')" >&2
+  fi
+
   # Stop services and wipe per-VM userdata (DB, environment-id, tokens, logs, worktrees, settings)
   # while preserving cached provider/ACP tool binaries (`providers/`, `cache/`, `tools/`, `acp-registry/`)
   t3_services_stop
@@ -481,11 +556,16 @@ if [ "$BAKE_CLEAN" = "1" ]; then
     exit 1
   fi
 
-  DESC="$descriptor" SESS="$auth_session" VER="$ver" node -e '
+  DESC="$descriptor" SESS="$auth_session" VER="$ver" CAPTURE="$project_capture" BRANCH="$default_branch" node -e '
+    let capture = {};
+    try { capture = process.env.CAPTURE ? JSON.parse(process.env.CAPTURE) : {}; } catch { capture = {}; }
     console.log(JSON.stringify({
       t3Version: process.env.VER,
       descriptor: JSON.parse(process.env.DESC),
       authSession: JSON.parse(process.env.SESS || "{}"),
+      ...(capture.projectShell ? { projectShell: capture.projectShell } : {}),
+      ...(capture.vcsRefs ? { vcsRefs: capture.vcsRefs } : {}),
+      ...(process.env.BRANCH ? { defaultBranch: process.env.BRANCH } : {}),
       cleaned: true,
     }));
   '

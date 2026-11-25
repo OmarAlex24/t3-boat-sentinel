@@ -93,7 +93,10 @@ export interface HubWakeFailure {
 
 export interface HubProjectTemplate {
   shell?: Record<string, unknown>;
+  /** `vcs.listRefs` for the project's workdir, from a VM's own T3 (a chat VM, or the project's bake). */
   vcsRefs?: unknown;
+  /** The repo's default branch (`origin/HEAD`), recorded at bake time or read from `vcsRefs`. */
+  defaultBranch?: string;
 }
 
 /** The last `server.updateServer` round that rebaked every golden snapshot (base + each project's own). */
