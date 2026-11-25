@@ -51,3 +51,6 @@ bun run sentinel bake <project>
 bun run sentinel reset hub:<sandboxId>
 bun run sentinel revoke hub
 ```
+
+### 5. Turn on Devin and Antigravity
+Follow "Devin and Antigravity" in the repo's `README.md` and start the settings file from `t3-settings.example.json`. After changing `t3.settingsFile`, `t3.prepareAcpAgents` or `t3.installProviders`, bake `base` first and then every project (`sentinel_bake`), or chats show the providers as "Not found". Provider sign-in needs a running chat VM. `bun run sentinel forget-session antigravity` deletes the stored Antigravity sign-in.

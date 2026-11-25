@@ -66,7 +66,7 @@ Disposable Boat VMs (`boat new --type large --from env-<project>`)
   If you start a chat before `env-<repo>` finishes baking, Sentinel automatically boots from `base-t3` and clones on first boot.
 - **Native Live Boot Progress in T3 Code:** Streams real-time VM creation, Klav setup, T3 server startup, and connection stages straight into T3 Code's native setup progress panel (`subscribeWorktreeSetup`) — no separate Mac CLI required.
 - **Immutable 2-Tier Golden Snapshots:** `base-t3` (Ubuntu + `t3` + watchdog + cached provider/ACP tool binaries + optional `klav-forward`) → `env-<project>` (always built cleanly from `base-t3`, smoke-tested, and wiped of per-VM DB/tokens while preserving pre-cached provider binaries). Supports daily UTC auto-bake (`baseBakeHourUtc` / `bakeHourUtc`).
-- **Provider Sign-ins That Follow You (`t3.persistProviderSessions`):** Sign in to Antigravity once in any Hub chat and every later chat VM starts signed in. Sentinel captures the credential file from the signed-in VM into `<stateDir>/credentials/<instanceId>/` (dir 0700, file 0600, atomic, newer `expiry` wins), copies it into each new VM before T3 starts, pulls the CLI's refreshed copy before a VM is destroyed, and never bakes it into a snapshot. Signing out in T3 (or `sentinel forget-session antigravity`) deletes the stored copy.
+- **Provider Sign-ins That Follow You (`t3.persistProviderSessions`):** Sign in to Antigravity once in any Hub chat and every later chat VM starts signed in. Sentinel captures the credential file from the signed-in VM into `<stateDir>/credentials/<instanceId>/` (dir 0700, file 0600, atomic, newer `expiry` wins), copies it into each new VM before T3 starts, pulls the CLI's refreshed copy before a VM is destroyed, and never bakes it into a snapshot. Signing out in T3 (or `sentinel forget-session antigravity`) deletes the stored copy. Setup steps: [Devin and Antigravity](#devin-and-antigravity).
 - **Zero-Trust LLM Proxy (`llmProxy:`):** Forward Claude/OpenAI requests to a private LAN/Tailscale gateway (e.g., `cliproxy`) without ever letting Boat VMs join your LAN or see your real API key. Each running VM receives a unique `t3llm_...` token that immediately returns `401` the moment the VM sleeps or is destroyed.
 - **Zero-Knowledge Secrets with [Klav](https://klav.dev) (`klav:`):** Supports Klav ADR 0036/0042 (`mode: proxy` with `klav-proxy` + ephemeral `tag:klav-sandbox` Tailscale + `klav-forward`) so agents can call external APIs (e.g. Northflank, GitHub, Cloudflare) without plaintext secrets ever entering the sandbox, revoking access automatically when the chat ends.
 - **Auto-Delete on Settle or Archive:** Configure `deleteWhen: archived-or-settled` (or `archived`) and `archiveAction: delete` (or `stop`). After `archiveGraceSecs` (default 20s), the VM is permanently deleted ($0/hr idle, no standby pool required).
@@ -163,6 +163,68 @@ Follow the agent-ready blueprint in [**`docs/AGENT-DEPLOY.md`**](docs/AGENT-DEPL
    *(Generate a fresh pairing link for each device — each code is single-use and multiple concurrent pairing codes are supported.)*
 
 4. **Code away:** Open your `Boat` environment in T3 Desktop or T3 Mobile, pick any repo, and send a message. Sentinel spawns a fresh Boat VM for that thread, streams live boot progress right inside T3, and destroys the VM automatically when you **Settle** or **Archive** the chat.
+
+---
+
+## Devin and Antigravity
+
+Chat VMs are disposable, so providers that need a runtime install or a sign-in must be set up in the snapshots and in sentinel. These steps turn on Devin (an ACP Registry agent) and Antigravity in Hub chats.
+
+1. **Create a T3 settings file** with a `providerInstances` entry for each provider, and point `t3.settingsFile` at it. Start from [`t3-settings.example.json`](t3-settings.example.json):
+   ```bash
+   cp t3-settings.example.json /opt/t3-boat-sentinel/t3-settings.json
+   ```
+   ```yaml
+   t3:
+     settingsFile: /opt/t3-boat-sentinel/t3-settings.json
+   ```
+   Use an absolute path. If the file does not exist, sentinel skips it without an error. With Docker Compose, mount the file into the container and use the container path.
+
+   How the file is applied:
+   - On every VM boot, it is merged into `~/.t3/userdata/settings.json`. The merge is shallow: each top-level key in your file replaces the VM's value. `providerInstances` is merged by instance ID, and an entry in your file replaces the whole entry with that ID. `linkedEnvironmentsEnabled` is always set to `true`.
+   - During a bake, the file is copied over `settings.json` as is, so it must list every provider you want, not only the new ones.
+
+2. **Tell the bake what to install and check:**
+   ```yaml
+   t3:
+     settingsFile: /opt/t3-boat-sentinel/t3-settings.json
+     prepareAcpAgents: [devin]          # ACP Registry agent IDs
+     installProviders: [antigravity]    # provider instance IDs
+     persistProviderSessions: [antigravity]  # optional, see step 4
+   ```
+   `prepareAcpAgents` takes ACP agent IDs. The bake checks the `providerInstances` entry with `driver: acpRegistry` and that `config.agentId`. If no entry references the agent, the bake logs `no provider instance references ACP agent devin; nothing to verify for it` and does not check it. `installProviders` takes instance IDs (the keys under `providerInstances`).
+
+3. **Restart sentinel and re-bake every snapshot:**
+   ```bash
+   sudo systemctl restart t3-boat-sentinel
+   bun run sentinel bake base
+   bun run sentinel bake <project>   # repeat for every project
+   ```
+   `bake base` installs the runtimes into `base-t3`. Project snapshots are built from `base-t3`, so they only get the runtimes after a re-bake. A project bake does not install anything; it checks that the runtimes are there. Both kinds of bake wait until T3 reports every listed provider as installed. If it does not within 180s, the bake fails with `provider status caches still not installed after 180s: <ids>; refusing to snapshot` and keeps the old snapshot.
+
+4. **Sign in.** Open a Boat chat and send a message, so a VM is running. Then go to **T3 Settings → Providers → Antigravity** and sign in with Google. Sign-in requests go to a running chat VM; with none running, they fail (see Troubleshooting).
+
+   With `persistProviderSessions: [antigravity]`, sentinel copies the Antigravity sign-in from that VM to `<stateDir>/credentials/antigravity/` on the sentinel host. Every chat VM created after that starts signed in. Details:
+   - The copy is taken a few seconds after the VM reports Antigravity as signed in, and again before the VM is destroyed (the CLI may have refreshed its token).
+   - It is placed only in new Hub chat VMs, before T3 starts. It is never baked into a snapshot.
+   - Only the `antigravity` driver is supported. Devin's sign-in is not stored, so sign in to Devin in each chat VM that needs it.
+   - It needs a provider that can copy files out of a VM. The Boat provider can. The `sandbox-sdk` provider cannot, so on it this option does nothing.
+
+   **Signing out.** Signing out of Antigravity in T3 deletes the stored copy, so new chat VMs start signed out. You can also delete it from the sentinel host:
+   ```bash
+   bun run sentinel forget-session antigravity
+   ```
+   Chat VMs that are already running keep their sign-in until they are destroyed. Sentinel does not copy it back from them unless they sign in again.
+
+### Troubleshooting
+
+| Message | Cause | Fix |
+|---|---|---|
+| `Not found · Antigravity ACP runtime is not installed` | The snapshot was baked before `installProviders` was set. | Re-bake: `bun run sentinel bake base`, then `bun run sentinel bake <project>` for every project. |
+| `Not found · ACP Registry agent 'devin' has not been prepared` | The snapshot was baked before `prepareAcpAgents` was set. | Re-bake base, then every project. |
+| `Google account access is not checked yet` | Normal on a fresh chat. T3 has not checked the account yet. | Nothing. It goes away after the first message. |
+| `No active Boat sandbox to handle …; start a thread first.` when signing in | No chat VM is running. Sentinel needs one to handle the request. | Open a chat, send a message, wait for the VM to boot, then sign in. |
+| Bake fails with `refusing to snapshot` | T3 did not report a listed provider as installed in time. | Check that each ID in `installProviders` is a key in `providerInstances` and that the settings file path is correct, then re-bake. |
 
 ---
 

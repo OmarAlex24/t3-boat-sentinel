@@ -49,6 +49,7 @@ t3:
   # Default false: update cleanly during `bake`, never mutate a live chat VM mid-session
   autoUpdateOnWake: false
   # Optional JSON file merged into `~/.t3/userdata/settings.json` on every VM boot (providers, defaults, etc.)
+  # Start from `t3-settings.example.json`; see "Devin and Antigravity" in README.md. Use an absolute path.
   # settingsFile: /opt/t3-boat-sentinel/t3-settings.json
   # Optional ACP Registry agents & managed provider runtimes to pre-install into `base-t3` during `bake base`.
   # Every bake (base and project) then waits until their provider status caches report installed and

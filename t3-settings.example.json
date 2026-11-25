@@ -1,0 +1,16 @@
+{
+  "providerInstances": {
+    "claudeAgent": { "driver": "claudeAgent", "enabled": true },
+    "acpRegistry_devin": {
+      "driver": "acpRegistry",
+      "displayName": "Devin",
+      "enabled": true,
+      "config": {
+        "agentId": "devin",
+        "distribution": "auto",
+        "registryIconUrl": "https://cdn.agentclientprotocol.com/registry/v1/latest/devin.svg"
+      }
+    },
+    "antigravity": { "driver": "antigravity", "displayName": "Antigravity", "enabled": true }
+  }
+}
