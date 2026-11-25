@@ -1040,6 +1040,9 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     while (cleanups.length) cleanups.pop()!();
   });
 
+  /** A `readAnswers` value: the VM fails that read. */
+  const READ_FAILS = Symbol("read fails");
+
   function startFakeVmT3Server(
     vmTag: string,
     opts: {
@@ -1098,6 +1101,16 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     const mediaConnections: Array<{ path: string; query: Record<string, string>; authorization: string | null }> = [];
     const mediaMessages: string[] = [];
     const previewEventStreams: Array<{ ws: { sendText(data: string): unknown }; requestId: string }> = [];
+    /**
+     * Answers this VM gives to read RPCs (tag -> value, or `READ_FAILS`); a `subscribeVcs*` stream
+     * sends its value as one chunk and stays open, like T3. Tests change them as the "repo" changes.
+     */
+    const readAnswers = new Map<string, unknown>();
+    const vcsStreams = new Map<string, { ws: { sendText(data: string): unknown }; tag: string }>();
+    /** Attachment files this VM serves at `/api/assets/att-<id>/<name>`, by attachment id. */
+    const assetFiles = new Map<string, { bytes: Uint8Array; mimeType: string }>();
+    /** Attachments the chat's earlier user message carries in `getThreadProjection`. */
+    const projectionAttachments: unknown[] = [];
     const server = Bun.serve({
       port: 0,
       hostname: "127.0.0.1",
@@ -1124,6 +1137,12 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
             projects: [{ id: vmProjectId, title: "my-app", workspaceRoot: "/home/user/my-app" }],
             threads: [],
           });
+        }
+        if (url.pathname.startsWith("/api/assets/att-")) {
+          const id = decodeURIComponent(url.pathname.slice("/api/assets/att-".length).split("/")[0] ?? "");
+          const file = assetFiles.get(id);
+          if (!file) return new Response("Not Found", { status: 404 });
+          return new Response(Buffer.from(file.bytes), { headers: { "content-type": file.mimeType } });
         }
         if (req.method === "POST" && url.pathname.startsWith("/api/attachments/upload/")) {
           const issued = uploadUrls.get(url.pathname.slice("/api/attachments/upload/".length));
@@ -1156,6 +1175,10 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
           }
           if (frame._tag === "Ack") {
             acks.push(String((frame as { requestId?: unknown }).requestId));
+            return;
+          }
+          if (frame._tag === "Interrupt") {
+            vcsStreams.delete(String((frame as { requestId?: unknown }).requestId));
             return;
           }
           if (frame._tag !== "Request" || !frame.id || !frame.tag) return;
@@ -1338,6 +1361,20 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
             );
             return;
           }
+          if (readAnswers.has(frame.tag)) {
+            const answer = readAnswers.get(frame.tag);
+            if (answer === READ_FAILS) {
+              ws.sendText(
+                JSON.stringify({ _tag: "Exit", requestId: frame.id, exit: { _tag: "Failure", cause: [{ _tag: "Die", defect: "git broke" }] } }),
+              );
+            } else if (frame.tag === "subscribeVcsStatus" || frame.tag === "subscribeVcsBranch") {
+              vcsStreams.set(frame.id, { ws, tag: frame.tag });
+              ws.sendText(JSON.stringify({ _tag: "Chunk", requestId: frame.id, values: [answer] }));
+            } else {
+              ws.sendText(JSON.stringify({ _tag: "Exit", requestId: frame.id, exit: { _tag: "Success", value: answer } }));
+            }
+            return;
+          }
           if (frame.tag === "orchestration.getThreadProjection") {
             const threadId = String(frame.payload?.threadId);
             ws.sendText(
@@ -1346,7 +1383,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
                 requestId: frame.id,
                 exit: {
                   _tag: "Success",
-                  value: vmThreadProjection(threadId, vmProjectId),
+                  value: vmThreadProjection(threadId, vmProjectId, projectionAttachments),
                 },
               }),
             );
@@ -1384,8 +1421,13 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
           }
           if (frame.tag === "assets.createUrl") {
             const resource = (frame.payload?.resource ?? {}) as Record<string, unknown>;
-            const exit =
-              resource._tag === "attachment" && !(opts.attachments ?? []).includes(String(resource.attachmentId))
+            const served = resource._tag === "attachment" && assetFiles.has(String(resource.attachmentId));
+            const exit = served
+              ? {
+                  _tag: "Success",
+                  value: { relativeUrl: `/api/assets/att-${encodeURIComponent(String(resource.attachmentId))}/file`, expiresAt: Date.now() + 600_000 },
+                }
+              : resource._tag === "attachment" && !(opts.attachments ?? []).includes(String(resource.attachmentId))
                 ? { _tag: "Failure", cause: [{ _tag: "Fail", error: { _tag: "AssetAttachmentNotFoundError", resource } }] }
                 : { _tag: "Success", value: { relativeUrl: `/api/assets/tok-${vmTag}-${++assetSeq}/image.png`, expiresAt: 1 } };
             ws.sendText(JSON.stringify({ _tag: "Exit", requestId: frame.id, exit }));
@@ -1441,6 +1483,12 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
         }),
       );
     };
+    /** Publishes a new value on this VM's open VCS streams of that tag, like T3 when the worktree changes. */
+    const pushVcs = (tag: string, value: unknown) => {
+      for (const [requestId, stream] of vcsStreams) {
+        if (stream.tag === tag) stream.ws.sendText(JSON.stringify({ _tag: "Chunk", requestId, values: [value] }));
+      }
+    };
     const pushPreviewEvent = (event: Record<string, unknown>) => {
       for (const stream of previewEventStreams) {
         stream.ws.sendText(JSON.stringify({ _tag: "Chunk", requestId: stream.requestId, values: [event] }));
@@ -1465,6 +1513,11 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       mediaMessages,
       previewEventStreams,
       pushPreviewEvent,
+      readAnswers,
+      vcsStreams,
+      pushVcs,
+      assetFiles,
+      projectionAttachments,
     };
   }
 
@@ -1481,7 +1534,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
   }
 
   /** A settled thread's projection as a T3 VM answers `getThreadProjection`: one earlier user message. */
-  function vmThreadProjection(threadId: string, projectId: string): Record<string, unknown> {
+  function vmThreadProjection(threadId: string, projectId: string, attachments: unknown[] = []): Record<string, unknown> {
     const input = placeholderInputFrom(
       "launch",
       {
@@ -1489,7 +1542,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
         modelSelection: { instanceId: "claudeAgent", model: "claude-opus-5-5" },
         runtimeMode: "full-access",
         interactionMode: "default",
-        initialMessage: { messageId: `vm-msg-${threadId}`, text: "What we said before", attachments: [] },
+        initialMessage: { messageId: `vm-msg-${threadId}`, text: "What we said before", attachments },
       },
       threadId,
       projectId,
@@ -2538,6 +2591,221 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       expect(after().some((m) => m.tag === "orchestration.dispatchCommand" && (m.payload as { type?: string }).type === "thread.turn.start")).toBe(true);
       // The open chat's stream moved to the VM
       await until(() => after().some((m) => m.tag === "orchestration.subscribeThread" && (m.payload as { threadId?: string }).threadId === "thread-zz"));
+    });
+
+    // ── What a sleeping chat's panels showed (git status and branch, review diff, refs, images) ──
+    /** A `VcsStatusStreamEvent` snapshot: `files` changed files of +`ins` −`del` each. */
+    const vcsStatus = (files: number, ins: number, del: number) => ({
+      _tag: "snapshot",
+      local: {
+        isRepo: true,
+        hasPrimaryRemote: true,
+        isDefaultRef: false,
+        refName: "t3/feature",
+        hasWorkingTreeChanges: files > 0,
+        workingTree: {
+          files: Array.from({ length: files }, (_, i) => ({ path: `src/f${i}.ts`, insertions: ins, deletions: del })),
+          insertions: ins * files,
+          deletions: del * files,
+        },
+      },
+      remote: null,
+    });
+    const vcsBranch = (refName: string) => ({ refName, isRepo: true });
+    const diffPreview = (cwd: string, diff: string) => ({
+      cwd,
+      generatedAt: "2026-11-25T10:00:00.000Z",
+      sources: [
+        { id: "working-tree", kind: "working-tree", title: "Working tree", baseRef: null, headRef: null, diff, diffHash: `h${diff.length}`, truncated: false },
+      ],
+    });
+    const refsResult = (names: string[]) => ({
+      refs: names.map((name, i) => ({ name, current: i === 0, isDefault: name === "main", worktreePath: null })),
+      isRepo: true,
+      hasPrimaryRemote: true,
+      nextCursor: null,
+      totalCount: names.length,
+    });
+    const PNG = (n: number) => new Uint8Array(Array.from({ length: n }, (_, i) => (i * 7) % 256));
+
+    /** A chat whose app opened its git panel, review diff and refs while its VM was up. */
+    async function awakeChatWithPanels(prefix: string) {
+      const vm = startFakeVmT3Server(prefix);
+      cleanups.push(() => vm.server.stop(true));
+      const hub = await startHubWithVm(vm, `t3-sentinel-hub-${prefix}-`);
+      const client: HubClient = await connectHubClient(hub.handle, hub.cfg);
+      await launchThreadOnHub(client, "thread-zz");
+      const sandboxId = hub.handle.state.listHubSandboxes()[0].sandboxId;
+      const worktree = String(vm.threads.get("thread-zz")!.worktreePath);
+      vm.readAnswers.set("subscribeVcsStatus", vcsStatus(1, 3, 1));
+      vm.readAnswers.set("subscribeVcsBranch", vcsBranch("t3/feature"));
+      vm.readAnswers.set("review.getDiffPreview", diffPreview(worktree, "diff v1"));
+      vm.readAnswers.set("vcs.listRefs", refsResult(["t3/feature", "main"]));
+      client.request("vcs-awake", "subscribeVcsStatus", { cwd: worktree });
+      client.request("branch-awake", "subscribeVcsBranch", { cwd: worktree });
+      client.request("diff-awake", "review.getDiffPreview", { cwd: worktree, sourceKind: "working-tree", ignoreWhitespace: false });
+      client.request("refs-awake", "vcs.listRefs", { cwd: worktree, limit: 100 });
+      for (const id of ["vcs-awake", "branch-awake"]) await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === id);
+      for (const id of ["diff-awake", "refs-awake"]) {
+        const exit = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === id);
+        expect((exit.exit as { _tag: string })._tag).toBe("Success");
+      }
+      return { vm, client, sandboxId, worktree, ...hub };
+    }
+    const panelTags = new Set(["subscribeVcsStatus", "subscribeVcsBranch", "review.getDiffPreview", "vcs.listRefs", "assets.createUrl"]);
+
+    test("a sleeping chat's git panel, diff and refs show what they were when its VM slept, without waking it", async () => {
+      const { vm, client, boat, handle, dir, sandboxId, worktree } = await awakeChatWithPanels("vm-panels");
+      // The worktree changed after the app last looked: the sleep asks the VM again
+      vm.readAnswers.set("subscribeVcsStatus", vcsStatus(2, 10, 2));
+      vm.readAnswers.set("subscribeVcsBranch", vcsBranch("t3/feature-b"));
+      vm.readAnswers.set("review.getDiffPreview", diffPreview(worktree, "diff v2"));
+      vm.readAnswers.set("vcs.listRefs", refsResult(["t3/feature-b", "main"]));
+      await handle.hub!.sleepHubSandbox(sandboxId);
+      expect(handle.state.getHubSandbox(sandboxId)!.phase).toBe("sleeping");
+      const readsFile = join(dir, "hub-thread-reads", "thread-zz.json");
+      expect(statSync(readsFile).mode & 0o777).toBe(0o600);
+      expect(statSync(join(dir, "hub-thread-reads")).mode & 0o777).toBe(0o700);
+      const seenBefore = vm.seenMethods.length;
+
+      // The app opens the chat (its payloads' keys in another order)
+      client.request("vcs", "subscribeVcsStatus", { cwd: worktree });
+      client.request("branch", "subscribeVcsBranch", { cwd: worktree });
+      client.request("diff", "review.getDiffPreview", { ignoreWhitespace: false, sourceKind: "working-tree", cwd: worktree });
+      client.request("refs", "vcs.listRefs", { limit: 100, cwd: worktree });
+      const vcs = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "vcs");
+      expect(vcs.values).toEqual([vcsStatus(2, 10, 2)]);
+      const branch = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "branch");
+      expect(branch.values).toEqual([vcsBranch("t3/feature-b")]);
+      const diff = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "diff");
+      expect(diff.exit).toEqual({ _tag: "Success", value: diffPreview(worktree, "diff v2") });
+      const refs = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "refs");
+      expect(refs.exit).toEqual({ _tag: "Success", value: refsResult(["t3/feature-b", "main"]) });
+      if (t3Contracts) {
+        expect(t3Contracts.decodeFrame("subscribeVcsStatus", vcs)).toEqual([{ ok: true }]);
+        expect(t3Contracts.decodeFrame("subscribeVcsBranch", branch)).toEqual([{ ok: true }]);
+        expect(t3Contracts.decodeFrame("review.getDiffPreview", diff)).toEqual([{ ok: true }]);
+        expect(t3Contracts.decodeFrame("vcs.listRefs", refs)).toEqual([{ ok: true }]);
+      }
+
+      await Bun.sleep(200);
+      expect(boat.resumed).toEqual([]);
+      // The streams stay open, quiet; nothing reached the VM
+      expect(client.inbox.some((f) => (f.requestId === "vcs" || f.requestId === "branch") && f._tag === "Exit")).toBe(false);
+      const fromApp = (m: { tag: string; payload: unknown }) => panelTags.has(m.tag) && (m.payload as { cwd?: unknown }).cwd === worktree;
+      expect(vm.seenMethods.slice(seenBefore).filter(fromApp)).toEqual([]);
+    });
+
+    test("a cached read that fails at sleep or is too big, and an attachment over the cap, are not kept; the rest is served", async () => {
+      const { vm, client, boat, handle, cfg, sandboxId, worktree } = await awakeChatWithPanels("vm-panels-caps");
+      handle.hub!.maxCachedReadBytes = 4_096;
+      handle.hub!.maxCachedAssetBytes = 1_000;
+      const small = { type: "image", id: "img-small", name: "shot.png", mimeType: "image/png", sizeBytes: 300 };
+      const big = { type: "image", id: "img-big", name: "huge.png", mimeType: "image/png", sizeBytes: 5_000 };
+      vm.projectionAttachments.push(small, big);
+      vm.assetFiles.set("img-small", { bytes: PNG(300), mimeType: "image/png" });
+      vm.assetFiles.set("img-big", { bytes: PNG(5_000), mimeType: "image/png" });
+      vm.readAnswers.set("review.getDiffPreview", READ_FAILS);
+      vm.readAnswers.set("vcs.listRefs", refsResult(Array.from({ length: 200 }, (_, i) => `t3/branch-${i}`)));
+      vm.readAnswers.set("subscribeVcsStatus", vcsStatus(2, 10, 2));
+      await handle.hub!.sleepHubSandbox(sandboxId);
+
+      client.request("vcs", "subscribeVcsStatus", { cwd: worktree });
+      client.request("diff", "review.getDiffPreview", { cwd: worktree, sourceKind: "working-tree", ignoreWhitespace: false });
+      client.request("refs", "vcs.listRefs", { cwd: worktree, limit: 100 });
+      client.request("img", "assets.createUrl", { resource: { _tag: "attachment", attachmentId: "img-small" } });
+      client.request("img-big", "assets.createUrl", { resource: { _tag: "attachment", attachmentId: "img-big" } });
+      const vcs = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "vcs");
+      expect(vcs.values).toEqual([vcsStatus(2, 10, 2)]);
+      // The failed diff gets the answer of a chat with no copy; the too-big refs, the project's template
+      const diff = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "diff");
+      expect(JSON.stringify(diff.exit)).toContain("No running sandbox for review.getDiffPreview");
+      const refs = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "refs");
+      expect((refs.exit as { _tag: string; value: { refs: unknown[] } }).value.refs.length).toBeLessThan(200);
+
+      // The image the history shows is served by the Hub, bytes and type as the VM had them
+      const img = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "img");
+      if (t3Contracts) expect(t3Contracts.decodeFrame("assets.createUrl", img)).toEqual([{ ok: true }]);
+      const relativeUrl = (img.exit as { value: { relativeUrl: string } }).value.relativeUrl;
+      expect(relativeUrl).toStartWith("/api/assets/");
+      const got = await fetch(`${client.base}${relativeUrl}`, { headers: { host: cfg.hub!.host } });
+      expect(got.status).toBe(200);
+      expect(got.headers.get("content-type")).toBe("image/png");
+      expect(new Uint8Array(await got.arrayBuffer())).toEqual(PNG(300));
+      const bigImg = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "img-big");
+      expect(bigImg.exit).toMatchObject({ _tag: "Failure", cause: [{ _tag: "Fail", error: { _tag: "AssetAttachmentNotFoundError" } }] });
+      if (t3Contracts) expect(t3Contracts.decodeFrame("assets.createUrl", bigImg)).toEqual([{ ok: true }]);
+      expect(boat.resumed).toEqual([]);
+    });
+
+    test("a message wakes the chat: its git panel follows the VM's live status and the cached copy is gone", async () => {
+      const { vm, client, boat, handle, dir, sandboxId, worktree } = await awakeChatWithPanels("vm-panels-wake");
+      vm.projectionAttachments.push({ type: "image", id: "img-1", name: "shot.png", mimeType: "image/png", sizeBytes: 64 });
+      vm.assetFiles.set("img-1", { bytes: PNG(64), mimeType: "image/png" });
+      vm.readAnswers.set("subscribeVcsStatus", vcsStatus(2, 10, 2));
+      await handle.hub!.sleepHubSandbox(sandboxId);
+      const readsFile = join(dir, "hub-thread-reads", "thread-zz.json");
+      const assetsDir = join(dir, "hub-thread-assets", "t-thread-zz");
+      expect(existsSync(readsFile)).toBe(true);
+      expect(readdirSync(assetsDir)).toHaveLength(1);
+
+      client.request("vcs", "subscribeVcsStatus", { cwd: worktree });
+      expect((await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "vcs")).values).toEqual([vcsStatus(2, 10, 2)]);
+      // The worktree changes while the VM sleeps (the agent's last write lands): the wake shows it
+      vm.readAnswers.set("subscribeVcsStatus", vcsStatus(3, 1, 0));
+      client.request("send", "orchestration.dispatchCommand", {
+        type: "thread.turn.start",
+        commandId: "cmd-send",
+        threadId: "thread-zz",
+        message: { messageId: "m-1", text: "Back to work", attachments: [] },
+      });
+      expect(((await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "send", 5_000)).exit as { _tag: string })._tag).toBe("Success");
+      expect(boat.resumed).toEqual([sandboxId]);
+      const live = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "vcs");
+      expect(live.values).toEqual([vcsStatus(3, 1, 0)]);
+      // And keeps following it
+      vm.pushVcs("subscribeVcsStatus", vcsStatus(4, 2, 2));
+      expect((await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "vcs")).values).toEqual([vcsStatus(4, 2, 2)]);
+      expect(existsSync(readsFile)).toBe(false);
+      expect(existsSync(assetsDir)).toBe(false);
+      // Asked again now, the VM answers
+      const seenBefore = vm.seenMethods.length;
+      client.request("refs", "vcs.listRefs", { cwd: worktree, limit: 100 });
+      await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "refs");
+      expect(vm.seenMethods.slice(seenBefore).some((m) => m.tag === "vcs.listRefs")).toBe(true);
+    });
+
+    test("archiving a sleeping chat, or deleting a parked one, removes its cached panels", async () => {
+      // Idle sleep: the archive goes to the VM (woken for it), and the copy goes with the wake
+      const idle = await awakeChatWithPanels("vm-panels-archive");
+      await idle.handle.hub!.sleepHubSandbox(idle.sandboxId);
+      const idleFile = join(idle.dir, "hub-thread-reads", "thread-zz.json");
+      expect(existsSync(idleFile)).toBe(true);
+      idle.client.request("archive", "orchestration.dispatchCommand", { type: "thread.archive", commandId: "cmd-arch", threadId: "thread-zz" });
+      expect(((await idle.client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "archive", 5_000)).exit as { _tag: string })._tag).toBe(
+        "Success",
+      );
+      expect(existsSync(idleFile)).toBe(false);
+
+      // Parked: served from the copy, and a delete removes the VM and the copy without waking it
+      const parked = await awakeChatWithPanels("vm-panels-delete");
+      parked.vm.projectionAttachments.push({ type: "image", id: "img-1", name: "shot.png", mimeType: "image/png", sizeBytes: 64 });
+      parked.vm.assetFiles.set("img-1", { bytes: PNG(64), mimeType: "image/png" });
+      await parked.handle.hub!.sleepHubSandbox(parked.sandboxId, { park: true });
+      expect(parked.handle.state.getHubSandbox(parked.sandboxId)!.parkedAt).toBeTruthy();
+      parked.client.request("refs", "vcs.listRefs", { cwd: parked.worktree, limit: 100 });
+      const refs = await parked.client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "refs");
+      expect(refs.exit).toEqual({ _tag: "Success", value: refsResult(["t3/feature", "main"]) });
+      const parkedFile = join(parked.dir, "hub-thread-reads", "thread-zz.json");
+      const parkedAssets = join(parked.dir, "hub-thread-assets", "t-thread-zz");
+      expect(existsSync(parkedAssets)).toBe(true);
+      parked.client.request("delete", "orchestration.dispatchCommand", { type: "thread.delete", commandId: "cmd-del", threadId: "thread-zz" });
+      expect(((await parked.client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "delete", 5_000)).exit as { _tag: string })._tag).toBe(
+        "Success",
+      );
+      expect(parked.boat.resumed).toEqual([]);
+      expect(existsSync(parkedFile)).toBe(false);
+      expect(existsSync(parkedAssets)).toBe(false);
     });
 
     test("with no Hub copy, a client's own cached history is kept, not replaced by an empty view", async () => {

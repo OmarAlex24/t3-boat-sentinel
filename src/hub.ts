@@ -27,6 +27,22 @@ import {
 } from "./security.ts";
 import type { ProjectConfig, ProjectKlavConfig, SentinelConfig } from "./config.ts";
 import { HubMcpHandler, formatRpcFailure, type HubSandboxPhase } from "./hub-mcp.ts";
+import {
+  CACHED_READ_STREAMS,
+  CACHED_READ_TAGS,
+  DEFAULT_MAX_CACHED_ASSET_BYTES,
+  DEFAULT_MAX_CACHED_READ_BYTES,
+  MAX_RECORDED_READS,
+  ThreadReadStore,
+  attachmentsIn,
+  fetchCapped,
+  isStandaloneStreamValue,
+  readKey,
+  remainingMs,
+  replayPayload,
+  type CachedAsset,
+  type ThreadReads,
+} from "./hub-read-cache.ts";
 import { HubShellStore } from "./hub-shell-store.ts";
 import {
   ProviderSetupRouter,
@@ -945,6 +961,20 @@ export class HubServer {
   private readonly wakeStatus = new Map<string, WakeStatus>();
   /** Each thread's projection, read from its VM before the VM went to sleep (also on disk). */
   private readonly projectionCache = new Map<string, Record<string, unknown>>();
+  /** What each sleeping chat's panels showed when its VM went to sleep: git status, diff, refs, attachments. */
+  private readonly readStore: ThreadReadStore;
+  /** The read-only requests each chat's app made while its VM was up, re-asked at every sleep; by thread id, then key. */
+  private readonly recordedReads = new Map<string, Map<string, { tag: string; payload: Record<string, unknown> }>>();
+  /** Asset URL tokens the Hub signed for a sleeping chat's cached attachment. */
+  private readonly cachedAssetTokens = new Map<string, { threadId: string; attachmentId: string; expiresAt: number }>();
+  /** Cache entries already logged as skipped (over a cap), so each is logged once. */
+  private readonly loggedCacheSkips = new Set<string>();
+  /** How long caching a VM's chats before it sleeps may take, all chats and reads together. */
+  sleepCacheTimeoutMs = 10_000;
+  /** Largest cached answer of one read (bytes of JSON); a bigger one is not cached. */
+  maxCachedReadBytes = DEFAULT_MAX_CACHED_READ_BYTES;
+  /** Attachment bytes cached per chat; attachments past this are not cached. */
+  maxCachedAssetBytes = DEFAULT_MAX_CACHED_ASSET_BYTES;
   private readonly urlTokenToSandbox = new Map<string, string>();
   /** Preview streams and device-hub sockets, piped to the VM that runs the chat. */
   private readonly media = new HubMediaProxy((data) => this.resolveMediaTarget(data));
@@ -1004,6 +1034,7 @@ export class HubServer {
   ) {
     this.boat = asSandboxProvider(provider);
     this.shellStore = new HubShellStore(config.stateDir, (threadId) => this.keepsStoredShell(threadId));
+    this.readStore = new ThreadReadStore(config.stateDir);
     this.mcp = new HubMcpHandler(
       config,
       state,
@@ -1867,6 +1898,10 @@ export class HubServer {
         const staged = this.stagedAttachments.get(stagedAssetId);
         if (!staged?.bytes) return withCors(new Response("Not Found", { status: 404 }));
         return withCors(new Response(req.method === "HEAD" ? null : Buffer.from(staged.bytes), { headers: stagedAssetHeaders(staged) }));
+      }
+      const cached = this.cachedAssetForToken(token);
+      if (cached) {
+        return withCors(new Response(req.method === "HEAD" ? null : Bun.file(cached.path), { headers: stagedAssetHeaders(cached.asset) }));
       }
       const sandboxId = this.urlTokenToSandbox.get(token);
       const sb = sandboxId ? this.state.getHubSandbox(sandboxId) : this.anyRunningSandbox();
@@ -3106,6 +3141,7 @@ export class HubServer {
   private forgetOrphanThread(threadId: string, command: string): number {
     this.threadToSandbox.delete(threadId);
     this.heldBookkeeping.delete(threadId);
+    this.recordedReads.delete(threadId);
     this.deleteThreadShell(threadId);
     this.localThreadSubs.delete(threadId);
     this.dropProjectionCache(threadId);
@@ -3169,6 +3205,7 @@ export class HubServer {
     });
     this.deleteThreadShell(threadId);
     this.localThreadSubs.delete(threadId);
+    this.recordedReads.delete(threadId);
     this.dropProjectionCache(threadId);
     const sequence = this.state.nextHubSequence();
     this.broadcastShellItem({ kind: "thread.removed", sequence, location: "active", threadId });
@@ -3265,6 +3302,7 @@ export class HubServer {
       for (const threadId of sb.threadIds) {
         this.threadToSandbox.delete(threadId);
         this.heldBookkeeping.delete(threadId);
+        this.recordedReads.delete(threadId);
         if (kept.has(threadId)) continue;
         this.deleteThreadShell(threadId);
         this.localThreadSubs.delete(threadId);
@@ -3364,8 +3402,11 @@ export class HubServer {
     if (status && sb) this.wakeStatus.set(sandboxId, status);
     else this.wakeStatus.delete(sandboxId);
     if (!sb) return;
+    if (!status) this.handOffLocalVcsStreams(sandboxId);
     for (const threadId of sb.threadIds) {
       if (!status) {
+        // The VM answers from now on: its panels' copy goes, and their streams move to it
+        this.discardReadCache(threadId);
         this.handOffLocalThreadSubs(threadId, sb);
         void this.deliverHeldBookkeeping(threadId, sb);
         continue;
@@ -3395,13 +3436,19 @@ export class HubServer {
     }
   }
 
-  /** Before a VM sleeps: keep a copy of each of its threads, so the Hub can show them while it sleeps. */
+  /**
+   * Before a VM sleeps: keep a copy of each of its threads, so the Hub can show them while it sleeps,
+   * with what their panels showed (git status, diff, refs, attachments). Bounded by `sleepCacheTimeoutMs`.
+   */
   private async cacheThreadProjections(sb: HubSandboxRecord): Promise<void> {
     const bridge = this.bridges.get(sb.sandboxId);
     if (!bridge?.isOpen()) return;
+    const deadline = Date.now() + this.sleepCacheTimeoutMs;
     await Promise.all(
       sb.threadIds.map(async (threadId) => {
-        const exit = await bridge.callUnary("orchestration.getThreadProjection", { threadId }, 10_000);
+        // Replaced at every sleep: whatever the last one kept is older than what the VM answers now
+        this.readStore.discard(threadId);
+        const exit = await bridge.callUnary("orchestration.getThreadProjection", { threadId }, remainingMs(deadline));
         if (exit._tag !== "Success" || !exit.value || typeof exit.value !== "object") {
           // An older copy must never replace the newer one the client holds
           this.dropProjectionCache(threadId);
@@ -3416,6 +3463,10 @@ export class HubServer {
         } catch (err) {
           console.warn(`[hub] could not save thread ${threadId} for its sleeping VM:`, err instanceof Error ? err.message : err);
         }
+        await this.cacheThreadReads(sb, bridge, threadId, projection, deadline).catch((err) => {
+          console.warn(`[hub] could not cache the panels of thread ${threadId}:`, err instanceof Error ? err.message : err);
+          this.readStore.discard(threadId);
+        });
       }),
     );
   }
@@ -3423,6 +3474,254 @@ export class HubServer {
   private dropProjectionCache(threadId: string): void {
     this.projectionCache.delete(threadId);
     rmSync(this.projectionCacheFile(threadId), { force: true });
+    this.discardReadCache(threadId);
+  }
+
+  // ── What a sleeping chat's panels showed ───────────────────────────────────────────────────────
+
+  /** A chat's cached reads and attachments go (its VM answers again, or the chat is gone). */
+  private discardReadCache(threadId: string): void {
+    this.readStore.discard(threadId);
+    for (const [token, entry] of this.cachedAssetTokens) if (entry.threadId === threadId) this.cachedAssetTokens.delete(token);
+  }
+
+  /** The chat whose worktree holds `cwd` (the deepest one), among chats the Hub knows. */
+  private threadForWorktree(cwd: string): string | null {
+    let best: { threadId: string; length: number } | null = null;
+    for (const [threadId, row] of this.threadShells) {
+      const wt = row.worktreePath;
+      if (typeof wt !== "string" || wt === "" || (cwd !== wt && !cwd.startsWith(`${wt}/`))) continue;
+      if (!this.threadToSandbox.has(threadId) && !this.expiredThread(threadId)) continue;
+      if (!best || wt.length > best.length) best = { threadId, length: wt.length };
+    }
+    return best?.threadId ?? null;
+  }
+
+  /** The chat a workspace request is for: the one it names, else the one whose worktree it reads. */
+  private threadForWorkspaceRpc(tid: string | null, cwd: string | null): string | null {
+    if (tid && (this.threadToSandbox.has(tid) || this.expiredThread(tid))) return tid;
+    return cwd ? this.threadForWorktree(cwd) : null;
+  }
+
+  /** Remembers a read the app made of a chat on its running VM, to ask again when the VM sleeps. */
+  private recordRead(threadId: string, tag: string, payload: unknown): void {
+    if (!CACHED_READ_TAGS.has(tag)) return;
+    let reads = this.recordedReads.get(threadId);
+    if (!reads) {
+      reads = new Map();
+      this.recordedReads.set(threadId, reads);
+    }
+    const key = readKey(tag, payload);
+    reads.delete(key);
+    reads.set(key, { tag, payload: replayPayload(tag, payload) });
+    while (reads.size > MAX_RECORDED_READS) reads.delete(reads.keys().next().value!);
+  }
+
+  /** True while a chat is answered from its cache: its VM sleeps or is parked (not waking), or the chat is read only. */
+  private servesCachedReads(threadId: string): boolean {
+    if (this.expiredThread(threadId)) return true;
+    const sbId = this.threadToSandbox.get(threadId);
+    const sb = sbId ? this.state.getHubSandbox(sbId) : undefined;
+    return !!sb && sb.phase === "sleeping" && !this.inFlightWakes.has(sb.sandboxId) && !this.destroyingSandboxes.has(sb.sandboxId);
+  }
+
+  private logCacheSkipOnce(threadId: string, what: string, detail: string): void {
+    const key = `${threadId} ${what}`;
+    if (this.loggedCacheSkips.has(key)) return;
+    this.loggedCacheSkips.add(key);
+    console.warn(`[hub] not caching ${what} of thread ${threadId} for its sleeping VM: ${detail}`);
+  }
+
+  /** Asks the VM again for each read the chat's app made, and copies the attachments its history shows. */
+  private async cacheThreadReads(
+    sb: HubSandboxRecord,
+    bridge: HubVmBridge,
+    threadId: string,
+    projection: Record<string, unknown>,
+    deadline: number,
+  ): Promise<void> {
+    const recorded = [...(this.recordedReads.get(threadId)?.entries() ?? [])];
+    const reads: ThreadReads = { savedAt: Date.now(), entries: {}, attachments: {} };
+    await Promise.all([
+      ...recorded.map(async ([key, read]) => {
+        const value = await this.askVmForRead(sb, bridge, read.tag, read.payload, deadline);
+        if (value === undefined) return;
+        const bytes = Buffer.byteLength(JSON.stringify(value));
+        if (bytes > this.maxCachedReadBytes) {
+          this.logCacheSkipOnce(threadId, key, `${bytes} bytes is over the ${this.maxCachedReadBytes}-byte cap`);
+          return;
+        }
+        reads.entries[key] = { tag: read.tag, value };
+      }),
+      this.cacheThreadAttachments(sb, bridge, threadId, projection, deadline, reads),
+    ]);
+    // A chat closed or woken meanwhile keeps nothing
+    if (!this.threadToSandbox.has(threadId) || this.inFlightWakes.has(sb.sandboxId)) {
+      this.readStore.discard(threadId);
+      return;
+    }
+    if (Object.keys(reads.entries).length === 0 && Object.keys(reads.attachments).length === 0) {
+      this.readStore.discard(threadId);
+      return;
+    }
+    this.readStore.save(threadId, reads);
+  }
+
+  /** One read, answered by the VM now (a stream's first standalone value); undefined if it fails or times out. */
+  private askVmForRead(
+    sb: HubSandboxRecord,
+    bridge: HubVmBridge,
+    tag: string,
+    payload: Record<string, unknown>,
+    deadline: number,
+  ): Promise<unknown> {
+    const vmPayload = rewriteProjectIds(payload, sb.hubProjectId, sb.vmProjectId);
+    const toHub = (value: unknown) => rewriteProjectIds(value, sb.vmProjectId, sb.hubProjectId);
+    if (!CACHED_READ_STREAMS.has(tag)) {
+      return bridge
+        .callUnary(tag, vmPayload, remainingMs(deadline))
+        .then((exit) => (exit._tag === "Success" && exit.value !== undefined ? toHub(exit.value) : undefined));
+    }
+    return new Promise((resolve) => {
+      let done = false;
+      let upReqId = "";
+      const finish = (value: unknown) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const timer = setTimeout(() => {
+        bridge.sendInterrupt(upReqId);
+        finish(undefined);
+      }, remainingMs(deadline));
+      upReqId = bridge.openStream(
+        tag,
+        vmPayload,
+        (values) => {
+          if (done) return;
+          const value = [...values].reverse().find((v) => isStandaloneStreamValue(tag, v));
+          if (value === undefined) return;
+          bridge.sendInterrupt(upReqId);
+          finish(toHub(value));
+        },
+        () => finish(undefined),
+      );
+    });
+  }
+
+  /** Copies the attachments a chat's history shows, up to `maxCachedAssetBytes` for the chat. */
+  private async cacheThreadAttachments(
+    sb: HubSandboxRecord,
+    bridge: HubVmBridge,
+    threadId: string,
+    projection: Record<string, unknown>,
+    deadline: number,
+    reads: ThreadReads,
+  ): Promise<void> {
+    let budget = this.maxCachedAssetBytes;
+    for (const att of attachmentsIn(projection)) {
+      if (remainingMs(deadline) <= 1) return;
+      if (att.sizeBytes > budget) {
+        this.logCacheSkipOnce(threadId, `attachment ${att.id}`, `${att.sizeBytes} bytes is over what is left of the ${this.maxCachedAssetBytes}-byte cap`);
+        continue;
+      }
+      const resource = { _tag: "attachment", attachmentId: att.id };
+      const exit = await bridge.callUnary("assets.createUrl", { resource }, remainingMs(deadline));
+      const relativeUrl = exit._tag === "Success" ? (exit.value as { relativeUrl?: unknown } | null)?.relativeUrl : undefined;
+      if (typeof relativeUrl !== "string" || !relativeUrl.startsWith("/")) continue;
+      const live = this.state.getHubSandbox(sb.sandboxId) ?? sb;
+      const bytes = await fetchCapped(`${live.upstreamUrl}${relativeUrl}`, live.upstreamHeaders ?? {}, budget, remainingMs(deadline)).catch(
+        () => null,
+      );
+      if (bytes === "over") {
+        this.logCacheSkipOnce(threadId, `attachment ${att.id}`, `it is over what is left of the ${this.maxCachedAssetBytes}-byte cap`);
+        continue;
+      }
+      if (!bytes) continue;
+      budget -= bytes.byteLength;
+      const file = this.readStore.writeAsset(threadId, att.id, bytes);
+      reads.attachments[att.id] = { name: att.name, mimeType: att.mimeType, file };
+    }
+  }
+
+  /**
+   * Answers a workspace read for a sleeping chat from its cache: a stream gets the cached value and
+   * stays open. False when nothing is cached for this request.
+   */
+  private serveCachedRead(
+    ws: ServerWebSocket<HubWsData>,
+    reqId: string | number,
+    tag: string,
+    payload: unknown,
+    threadId: string,
+  ): boolean {
+    if (!CACHED_READ_TAGS.has(tag) || !this.servesCachedReads(threadId)) return false;
+    const hit = this.readStore.get(threadId)?.entries[readKey(tag, payload)];
+    if (!hit || hit.tag !== tag) return false;
+    if (CACHED_READ_STREAMS.has(tag)) {
+      ws.data.localStreams.set(String(reqId), { rawId: reqId, tag, payload });
+      sendRpcFrame(ws, { _tag: "Chunk", requestId: reqId, values: [hit.value] });
+      return true;
+    }
+    sendRpcExitSuccess(ws, reqId, hit.value);
+    return true;
+  }
+
+  /** A signed URL for an attachment a sleeping chat's cache holds, served like a staged upload; false if none. */
+  private serveCachedAttachmentUrl(ws: ServerWebSocket<HubWsData>, reqId: string | number, attachmentId: string): boolean {
+    const threadId = this.readStore.attachmentOwner(attachmentId);
+    if (!threadId || !this.servesCachedReads(threadId)) return false;
+    const asset = this.readStore.get(threadId)?.attachments[attachmentId];
+    if (!asset || !existsSync(this.readStore.assetPath(threadId, asset))) return false;
+    const now = Date.now();
+    for (const [token, entry] of this.cachedAssetTokens) if (entry.expiresAt <= now) this.cachedAssetTokens.delete(token);
+    const token = randomToken(24);
+    const expiresAt = now + ATTACHMENT_UPLOAD_URL_TTL_MS;
+    this.cachedAssetTokens.set(token, { threadId, attachmentId, expiresAt });
+    sendRpcExitSuccess(ws, reqId, { relativeUrl: `/api/assets/${token}/${encodeURIComponent(asset.name)}`, expiresAt });
+    return true;
+  }
+
+  /** The cached attachment an asset URL token names, while its chat still sleeps. */
+  private cachedAssetForToken(token: string): { asset: CachedAsset; path: string } | null {
+    const entry = this.cachedAssetTokens.get(token);
+    if (!entry) return null;
+    if (entry.expiresAt <= Date.now()) {
+      this.cachedAssetTokens.delete(token);
+      return null;
+    }
+    const asset = this.readStore.get(entry.threadId)?.attachments[entry.attachmentId];
+    if (!asset) return null;
+    const path = this.readStore.assetPath(entry.threadId, asset);
+    return existsSync(path) ? { asset, path } : null;
+  }
+
+  /**
+   * Moves the VCS streams the Hub kept open for a VM's worktrees (it slept, or was not up) to that VM,
+   * so a panel fed from the cache follows the live VM again.
+   */
+  private handOffLocalVcsStreams(sandboxId: string): void {
+    const sb = this.state.getHubSandbox(sandboxId);
+    const bridge = this.bridges.get(sandboxId);
+    if (!sb || sb.phase !== "running" || !bridge?.isOpen()) return;
+    const ownsCwd = (cwd: string) => {
+      for (const [wt, sbId] of this.worktreeToSandbox) {
+        if (sbId === sandboxId && wt !== "" && (cwd === wt || cwd.startsWith(`${wt}/`))) return true;
+      }
+      return false;
+    };
+    for (const client of this.clients) {
+      for (const [key, sub] of client.data.localStreams) {
+        if (sub.tag !== "subscribeVcsStatus" && sub.tag !== "subscribeVcsBranch") continue;
+        const cwd = (sub.payload as { cwd?: unknown } | undefined)?.cwd;
+        if (typeof cwd !== "string" || !ownsCwd(cwd)) continue;
+        client.data.localStreams.delete(key);
+        bridge.forwardToClient(client, sub.rawId, sub.tag, sub.payload, []);
+        const chat = this.threadForWorktree(cwd);
+        if (chat && this.threadToSandbox.get(chat) === sandboxId) this.recordRead(chat, sub.tag, sub.payload);
+      }
+    }
   }
 
   private async handleWorkspaceRpc(
@@ -3464,10 +3763,19 @@ export class HubServer {
       try {
         const bridge = await this.ensureBridgeOpen(sb);
         bridge.forwardToClient(ws, reqId, tag, payload, headers);
+        // Asked again when this chat's VM next sleeps, so its panels can be shown while it sleeps
+        const chat = this.threadForWorkspaceRpc(tid, cwd);
+        if (chat && this.threadToSandbox.get(chat) === sb.sandboxId) this.recordRead(chat, tag, payload);
         return;
       } catch {
         // fall through to cached fallback
       }
+    }
+
+    // A sleeping or read-only chat: what its panel showed when the VM went to sleep
+    if (parked) {
+      const chat = this.threadForWorkspaceRpc(tid, cwd);
+      if (chat && this.serveCachedRead(ws, reqId, tag, payload, chat)) return;
     }
 
     // Zero running VMs for this project -> return clean cached fallback for composer calls
@@ -3496,8 +3804,9 @@ export class HubServer {
       return;
     }
     if (tag === "subscribeVcsStatus" || tag === "subscribeVcsBranch") {
-      // Keep VCS status/branch subscriptions open quietly when zero VMs are running for this project
-      ws.data.localStreams.set(String(reqId), { rawId: reqId, tag });
+      // Keep VCS status/branch subscriptions open quietly when zero VMs are running for this project;
+      // the payload lets the chat's VM take the stream over once it is up (`handOffLocalVcsStreams`)
+      ws.data.localStreams.set(String(reqId), { rawId: reqId, tag, payload });
       return;
     }
 
@@ -3623,6 +3932,8 @@ export class HubServer {
       });
       return;
     }
+    // An image in a sleeping chat's history: the copy the Hub kept when its VM went to sleep
+    if (this.serveCachedAttachmentUrl(ws, reqId, attachmentId)) return;
     const ownerId = this.attachmentToSandbox.get(attachmentId);
     const owner = ownerId ? this.state.getHubSandbox(ownerId) : undefined;
     if (owner?.phase === "sleeping") {
@@ -4453,6 +4764,12 @@ export class HubServer {
     if (existing) return existing;
     const promise = this.doSleepHubSandbox(sandboxId, opts.park === true).finally(() => {
       this.inFlightSleeps.delete(sandboxId);
+      const after = this.state.getHubSandbox(sandboxId);
+      if (after?.phase === "running") {
+        // It did not go to sleep (a park put off, a pause that failed): the VM still answers
+        for (const threadId of after.threadIds) this.discardReadCache(threadId);
+        this.handOffLocalVcsStreams(sandboxId);
+      }
     });
     this.inFlightSleeps.set(sandboxId, promise);
     return promise;
@@ -4581,6 +4898,7 @@ export class HubServer {
     for (const tid of threadIds) {
       this.threadToSandbox.delete(tid);
       this.heldBookkeeping.delete(tid);
+      this.recordedReads.delete(tid);
       this.deleteThreadShell(tid);
       this.localThreadSubs.delete(tid);
       this.dropProjectionCache(tid);
@@ -4745,6 +5063,7 @@ export class HubServer {
         this.adoptLocalProviderStreams(sandboxId);
         this.adoptKeepOpenStreams(sandboxId);
         this.adoptFanoutStreams(sandboxId);
+        this.handOffLocalVcsStreams(sandboxId);
         if (this.lastPreviewProfiles !== undefined) {
           void this.bridges.get(sandboxId)?.callUnary("preview.reportProfiles", this.lastPreviewProfiles, 10_000);
         }
