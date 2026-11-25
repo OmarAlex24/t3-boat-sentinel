@@ -202,6 +202,9 @@ interface LocalThreadSub {
 /** Commands that close a chat; for a chat still booting (or whose VM failed to start) they cancel the launch. */
 const CLOSING_COMMANDS = new Set(["thread.archive", "thread.delete", "thread.settle", "thread.auto-settle"]);
 
+/** A VM that is up: Boat reports it `running`, or `idle` when nothing in it is busy. */
+const isLiveSandboxState = (state: string | undefined): boolean => state === "running" || state === "idle";
+
 /** Commands that only record what the user did; answered at once and sent once the VM is up. */
 const BOOKKEEPING_COMMANDS = new Set([
   "thread.visit",
@@ -4283,7 +4286,7 @@ export class HubServer {
     let needsPause = ctx.resumed || previous?.vmPaused === false;
     if (!needsPause) {
       const info = await this.boat.info(sandboxId).catch(() => null);
-      needsPause = info?.state === "running";
+      needsPause = isLiveSandboxState(info?.state);
     }
     let vmPaused = !needsPause;
     if (needsPause && this.boat.pause) {
@@ -4627,7 +4630,7 @@ export class HubServer {
     try {
       // The VM's watchdog may have stopped it while the record still says running (until the reaper's next tick)
       const info = await Promise.race([this.boat.info(sandboxId), timeout]).catch(() => null);
-      if (info?.state !== "running") {
+      if (!isLiveSandboxState(info?.state)) {
         console.warn(`[hub] not repairing the relay of ${sandboxId}: ${this.boat.name} reports it ${info?.state ?? "missing"}`);
         return false;
       }

@@ -3021,6 +3021,8 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       const hubServer = hub.handle.hub!;
       hubServer.bridgeReconnectMs = 20;
       hubServer.relayRepairAfterFailures = 3;
+      // Real Boat reports a live VM with nothing busy in it as `idle`, not `running`
+      (hub.boat.sandboxes.get(sandboxId) as { state: string }).state = "idle";
       // `boat host` from now on: counted, and pointing wherever the test says
       let exposeTo = deadUrl();
       const exposes: string[] = [];
