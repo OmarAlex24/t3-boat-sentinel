@@ -1919,6 +1919,7 @@ export class HubServer {
         llmToken,
         mintToken: true,
         injectProviderSessions: true,
+        installProviderRuntimes: !supportsSnapshots,
       });
 
       if (!provisioned.upstreamToken) {

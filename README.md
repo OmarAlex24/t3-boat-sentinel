@@ -228,6 +228,36 @@ Chat VMs are disposable, so providers that need a runtime install or a sign-in m
 
 ---
 
+## Celesto
+
+Hub chats can run on [Celesto](https://celesto.ai) cloud computers instead of Boat VMs. Sentinel calls the Celesto REST API directly; no extra package is needed.
+
+```yaml
+provider:
+  type: celesto
+  apiKey: ${CELESTO_API_KEY}   # or leave apiKey out and set CELESTO_API_KEY in sentinel's environment
+  # templateId: coding-agent   # default
+  # user: ohm                  # default; T3 and its agents run as this user, never root
+  # sizeMap: { medium: standard }
+boat:
+  defaultSize: default         # default -> standard (2 vCPU / 4 GB); medium and large -> large (4 vCPU / 16 GB)
+```
+
+Sentinel size names map to Celesto sizes as shown above. You can also use a Celesto size directly (`nano`, `small`, `standard`, `large`).
+
+How it differs from Boat:
+- **No snapshots.** `sentinel bake` is unavailable. Every chat installs T3 when its computer boots, so chats take longer to start than on Boat. Each project's `bakeCmd` runs at boot too, before its `bootCmd`. Runtimes in `t3.prepareAcpAgents` and `t3.installProviders` (Devin, Antigravity) are also installed at boot. If that install fails, the chat still starts, without that provider.
+- **No systemd.** Celesto computers have no systemd, so T3 and the watchdog run under small restart loops (`~/.t3-sentinel/*-supervisor.sh`).
+- **Uploads go through command requests.** Celesto has no file-transfer API, so every upload, including the boot secrets (watchdog secret, LLM proxy token, `injectFiles`, project `envFile`), travels base64-encoded inside Celesto exec request bodies.
+- **No sign-in persistence.** `t3.persistProviderSessions` does nothing on Celesto: stored sign-ins are neither captured from nor copied into its computers. Sign in to each provider in each chat.
+- **Published URLs are public.** Celesto has no private preview, so `boat.hostVisibility` is ignored. T3's bearer auth is the only gate on each computer's URL.
+- **Pause keeps everything.** An idle chat's computer is stopped and started again on the next message. Disk, running processes and the URL survive.
+- **Sentinel only touches its own computers.** Celesto ignores computer names, so sentinel records the computers it creates in `<stateDir>/celesto-computers.json` (0600). The reaper never sees or deletes your other Celesto computers. Do not delete that file while chats are running: sentinel would lose track of their computers.
+- **Home directory.** Projects run as `ohm`, so set each project's `workdir` under `/home/ohm`. Repos added from T3 default to `/home/user/<name>`, which `ohm` cannot create. Klav provisioning also assumes `/home/user` and has not been tested on Celesto.
+- **Plan.** The Free plan only offers `nano` computers, which are too small for T3. Use a paid plan with `standard` or larger.
+
+---
+
 ## CLI & MCP Usage
 
 ### CLI (talks to the running daemon)

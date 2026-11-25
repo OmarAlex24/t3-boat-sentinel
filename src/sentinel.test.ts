@@ -7,13 +7,13 @@ import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 import { SlotAuth, hashToken } from "./auth.ts";
 import type { BoatClient, BoatExecResult, BoatSandbox, ResumeResult } from "./boat.ts";
-import { expandEnvPlaceholders, type SentinelConfig } from "./config.ts";
+import { expandEnvPlaceholders, loadConfig, type SentinelConfig } from "./config.ts";
 import { createSentinelServer, type SentinelServerHandle } from "./index.ts";
 import type { KlavClient } from "./klav.ts";
 import { LifecycleManager } from "./lifecycle.ts";
 import { handleMcpRequest } from "./mcp.ts";
-import { SandboxSdkProvider, type ExternalSdkProviderLike } from "./providers/index.ts";
-import type { SandboxProvider } from "./providers/types.ts";
+import { CelestoProvider, SandboxSdkProvider, createSandboxProvider, type ExternalSdkProviderLike } from "./providers/index.ts";
+import { asSandboxProvider, type ProviderCapability, type SandboxProvider } from "./providers/types.ts";
 import { ProviderSessionStore } from "./provider-sessions.ts";
 import { StateStore } from "./state.ts";
 
@@ -236,7 +236,108 @@ describe("config & auth primitives", () => {
   });
 });
 
+describe("Celesto provider config", () => {
+  function writeYaml(body: string): string {
+    const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-celesto-cfg-"));
+    tempDirs.push(dir);
+    const path = join(dir, "sentinel.yaml");
+    writeFileSync(path, `domain: example.com\ncontrolSecret: s\nstateDir: ${dir}\nslots: [{ name: boat-1 }]\n${body}`);
+    return path;
+  }
+
+  test("reads the API key from config or CELESTO_API_KEY and fails clearly without either", () => {
+    const prev = process.env.CELESTO_API_KEY;
+    try {
+      delete process.env.CELESTO_API_KEY;
+      expect(() => loadConfig(writeYaml("provider:\n  type: celesto\n"))).toThrow(/CELESTO_API_KEY/);
+      // An unset ${VAR} placeholder counts as missing
+      expect(() => loadConfig(writeYaml("provider:\n  type: celesto\n  apiKey: ${CELESTO_KEY_UNSET_X}\n"))).toThrow(
+        /CELESTO_API_KEY/,
+      );
+
+      process.env.CELESTO_API_KEY = "cel_from_env";
+      const fromEnv = loadConfig(writeYaml("provider:\n  type: celesto\n  user: ohm\n  sizeMap: { medium: standard }\n"));
+      expect(fromEnv.provider).toEqual({ type: "celesto", apiKey: "cel_from_env", user: "ohm", sizeMap: { medium: "standard" } });
+      const provider = createSandboxProvider(fromEnv);
+      expect(provider).toBeInstanceOf(CelestoProvider);
+      expect((provider as CelestoProvider).resolveSize("medium")).toBe("standard");
+
+      const explicit = loadConfig(writeYaml("provider:\n  type: celesto\n  apiKey: cel_explicit\n"));
+      expect(explicit.provider).toMatchObject({ type: "celesto", apiKey: "cel_explicit" });
+    } finally {
+      if (prev === undefined) delete process.env.CELESTO_API_KEY;
+      else process.env.CELESTO_API_KEY = prev;
+    }
+  });
+});
+
 describe("LifecycleManager hardening", () => {
+  test("providers without snapshots or download: runtimes install at boot and stored sign-ins are never uploaded", async () => {
+    const vm = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch() {
+        return Response.json({ projects: [{ id: "vm-p1", title: "my-app", workspaceRoot: "/home/user/my-app" }], threads: [] });
+      },
+    });
+    cleanups.push(() => vm.stop(true));
+
+    const run = async (opts: { snapshots: boolean; download: boolean }) => {
+      const base = makeTestConfig(0);
+      const cfg: SentinelConfig = {
+        ...base,
+        t3: { ...base.t3, persistProviderSessions: ["antigravity"], prepareAcpAgents: ["devin"], installProviders: ["antigravity"] },
+      };
+      mkdirSync(join(cfg.stateDir, "credentials", "antigravity"), { recursive: true, mode: 0o700 });
+      writeFileSync(join(cfg.stateDir, "credentials", "antigravity", "antigravity-oauth-token"), "ya29.SECRET", { mode: 0o600 });
+
+      const boat = new MockBoat();
+      boat.snapshots.add("env-my-app");
+      boat.upstreamBaseUrl = `http://127.0.0.1:${vm.port}`;
+      const legacy = asSandboxProvider(boat);
+      const uploads: string[] = [];
+      const execs: Array<{ script: string; timeout?: number }> = [];
+      const provider: SandboxProvider = {
+        ...legacy,
+        name: "test-provider",
+        capabilities: new Set<ProviderCapability>(opts.snapshots ? ["pause", "snapshots"] : ["pause"]),
+        ...(opts.snapshots ? {} : { listSnapshots: undefined, saveSnapshot: undefined }),
+        download: opts.download ? legacy.download : undefined,
+        upload: async (_id, _local, remote) => {
+          uploads.push(remote);
+        },
+        exec: (id, script, timeout) => {
+          execs.push({ script, timeout });
+          return legacy.exec(id, script, timeout);
+        },
+        execOk: (id, script, timeout) => {
+          execs.push({ script, timeout });
+          return legacy.execOk(id, script, timeout);
+        },
+      };
+      const state = new StateStore(cfg.stateDir, cfg);
+      const lifecycle = new LifecycleManager(cfg, state, provider);
+      const res = await lifecycle.spawn("my-app", { slot: "boat-1" });
+      expect(res.slot.phase).toBe("running");
+      const provision = execs.find((e) => e.script.includes("bash ~/.t3-sentinel/provision-base.sh"))!;
+      return { uploads, provision };
+    };
+
+    // Celesto-like: no snapshots, no download
+    const celestoLike = await run({ snapshots: false, download: false });
+    expect(celestoLike.uploads.some((r) => r.includes("provider-sessions"))).toBe(false);
+    expect(celestoLike.provision.script).toContain("T3_PREPARE_ACP_AGENTS='devin'");
+    expect(celestoLike.provision.script).toContain("T3_INSTALL_PROVIDERS='antigravity'");
+    expect(celestoLike.provision.timeout).toBe(900);
+
+    // Boat-like: snapshots + download keep today's behavior
+    const boatLike = await run({ snapshots: true, download: true });
+    expect(boatLike.uploads.some((r) => r.includes("provider-sessions"))).toBe(true);
+    expect(boatLike.provision.script).not.toContain("T3_INSTALL_PROVIDERS");
+    expect(boatLike.provision.script).not.toContain("T3_PREPARE_ACP_AGENTS");
+    expect(boatLike.provision.timeout).toBe(300);
+  });
+
   test("reaper never kills an in-flight bake VM; env-* always bakes from base-t3", async () => {
     const config = makeTestConfig();
     const state = new StateStore(config.stateDir, config);
