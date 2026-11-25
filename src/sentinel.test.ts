@@ -1240,6 +1240,46 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       expect(boat.execScripts.some((sc) => sc.includes("rm -rf ~/.t3-sentinel/provider-sessions"))).toBe(true);
     });
 
+    test("a failed read is retried; a hung teardown pull never delays the destroy past its bound", async () => {
+      const vm = startFakeVmT3Server("vm-ag-hang", {
+        configSnapshot: { providers: agProviders("authenticated"), settings: {} },
+      });
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat, dir } = await startHubWithVm(vm, "t3-sentinel-ag-hang-", {
+        persistProviderSessions: ["antigravity"],
+      });
+      let mode: "fail" | "ok" | "hang" = "fail";
+      let attempts = 0;
+      const original = boat.exec.bind(boat);
+      boat.exec = async (id: string, script: string) => {
+        if (!(script.includes("antigravity-oauth-token") && script.includes("base64"))) return original(id, script);
+        attempts++;
+        if (mode === "fail") return { exitCode: 1, stdout: "", stderr: "boom" };
+        if (mode === "hang") return new Promise<never>(() => {});
+        const token = agToken("ya29.RETRY-SECRET", "2026-12-01T00:00:00Z");
+        return { exitCode: 0, stdout: `antigravity-oauth-token:${Buffer.from(token).toString("base64")}\n`, stderr: "" };
+      };
+      const client = await connectHubClient(handle, cfg);
+      await launchThreadOnHub(client, "thread-ag-hang");
+      await waitFor(() => attempts === 1);
+      await handle.lifecycle.providerSessions.settle();
+      expect(existsSync(storedPath(dir))).toBe(false);
+
+      mode = "ok";
+      vm.pushConfigItems([{ version: 1, type: "providerStatuses", payload: { providers: agProviders("authenticated") } }]);
+      await waitFor(() => existsSync(storedPath(dir)));
+      expect(attempts).toBe(2);
+
+      mode = "hang";
+      handle.lifecycle.providerSessions.teardownTimeoutMs = 50;
+      const sandboxId = handle.state.listHubSandboxes()[0].sandboxId;
+      const started = Date.now();
+      await handle.hub!.destroyHubSandbox(sandboxId, "test");
+      expect(Date.now() - started).toBeLessThan(2_000);
+      expect(attempts).toBe(3);
+      expect(boat.deleted).toContain(sandboxId);
+    });
+
     test("a successful sign-out forwarded by the Hub deletes the stored copy; forget-session API validates input", async () => {
       const vm = startFakeVmT3Server("vm-ag-logout", {
         configSnapshot: { providers: agProviders("authenticated"), settings: {} },
@@ -1269,6 +1309,16 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       await handle.lifecycle.providerSessions.settle();
       expect(existsSync(storedPath(dir))).toBe(false);
       expect(reads.count).toBe(0);
+
+      // After a sentinel restart, VMs created before the sign-out are still not re-captured
+      const restarted = new ProviderSessionStore(cfg, handle.lifecycle.getProvider());
+      restarted.debounceMs = 10;
+      const sb = handle.state.listHubSandboxes()[0];
+      restarted.observe(sb.sandboxId, agProviders("authenticated"), sb.createdAt);
+      await restarted.settle();
+      expect(existsSync(storedPath(dir))).toBe(false);
+      expect(reads.count).toBe(0);
+      expect(statSync(join(dir, "credentials", "antigravity.signed-out-at")).mode & 0o777).toBe(0o600);
 
       const base = `http://127.0.0.1:${handle.server.port}`;
       const call = (body: unknown) =>

@@ -161,6 +161,24 @@ export class ProviderSessionStore {
     return join(this.baseDir, instanceId);
   }
 
+  /** Non-secret marker with the time of the last sign-out; kept outside the instance dir. */
+  private forgottenMarker(instanceId: string): string {
+    return join(this.baseDir, `${instanceId}.signed-out-at`);
+  }
+
+  /** True when the VM was created before the instance's last sign-out (it may still hold that token). */
+  private signedOutBefore(instanceId: string, sandboxCreatedAt?: string): boolean {
+    if (!sandboxCreatedAt) return false;
+    let at: number;
+    try {
+      at = Date.parse(readFileSync(this.forgottenMarker(instanceId), "utf8").trim());
+    } catch {
+      return false;
+    }
+    const created = Date.parse(sandboxCreatedAt);
+    return !Number.isNaN(at) && !Number.isNaN(created) && created <= at;
+  }
+
   /** Lists stored instance IDs (names only, never contents). */
   listStored(): string[] {
     return this.enabledInstances().filter((id) => this.storedFiles(id).length > 0);
@@ -197,8 +215,11 @@ export class ProviderSessionStore {
     for (const id of instanceIds) this.lastStatus.set(key(sandboxId, id), "authenticated");
   }
 
-  /** Feeds one VM's provider list. Only call for VMs that finished booting. */
-  observe(sandboxId: string, providers: unknown[]): void {
+  /**
+   * Feeds one VM's provider list. Only call for VMs that finished booting. `sandboxCreatedAt` lets a
+   * sign-out survive a sentinel restart: VMs created before it are not re-captured until they sign in again.
+   */
+  observe(sandboxId: string, providers: unknown[], sandboxCreatedAt?: string): void {
     if (this.enabled.size === 0) return;
     for (const raw of providers) {
       if (!raw || typeof raw !== "object") continue;
@@ -209,6 +230,7 @@ export class ProviderSessionStore {
       const status = p.enabled === false ? "disabled" : typeof p.auth?.status === "string" ? p.auth.status : "unknown";
       const k = key(sandboxId, instanceId);
       const prev = this.lastStatus.get(k);
+      if (prev === undefined && this.signedOutBefore(instanceId, sandboxCreatedAt)) this.suppressed.add(k);
       this.lastStatus.set(k, status);
       if (status !== "authenticated") {
         // A fresh sign-in on this VM after a sign-out may be captured again
@@ -261,16 +283,20 @@ export class ProviderSessionStore {
       `cd "$HOME/.t3/userdata/${rel}" 2>/dev/null || exit 0; ` +
       `for f in ${names.join(" ")}; do if [ -f "$f" ]; then printf '%s:' "$f"; base64 -w0 "$f"; printf '\\n'; fi; done; true`;
 
+    // A failed read is retried on the VM's next `authenticated` report
+    const allowRetry = () => this.lastStatus.delete(key(sandboxId, instanceId));
     let stdout: string;
     try {
       const res = await this.boat.exec(sandboxId, script, timeoutSecs);
       if (res.exitCode !== 0) {
         console.warn(`[sessions] could not read ${instanceId} credentials from ${sandboxId} (exit ${res.exitCode})`);
+        allowRetry();
         return;
       }
       stdout = res.stdout;
     } catch {
       console.warn(`[sessions] could not read ${instanceId} credentials from ${sandboxId}`);
+      allowRetry();
       return;
     }
 
@@ -286,6 +312,7 @@ export class ProviderSessionStore {
     }
     if (found.size === 0) {
       console.log(`[sessions] ${sandboxId} reports ${instanceId} signed in but holds no credential file; nothing stored`);
+      allowRetry();
       return;
     }
     // A sign-out (or forget) happened while reading: drop this copy
@@ -390,6 +417,13 @@ export class ProviderSessionStore {
     const dir = this.instanceDir(instanceId);
     const removed = existsSync(dir);
     rmSync(dir, { recursive: true, force: true });
+    try {
+      mkdirSync(this.baseDir, { recursive: true, mode: 0o700 });
+      chmodSync(this.baseDir, 0o700);
+      writeAtomic0600(this.baseDir, this.baseDir, this.forgottenMarker(instanceId), Buffer.from(new Date().toISOString()));
+    } catch {
+      console.warn(`[sessions] could not record the ${instanceId} sign-out time; a restart may re-capture it from older VMs`);
+    }
     if (removed) console.log(`[sessions] forgot stored ${instanceId} session`);
     return { removed };
   }

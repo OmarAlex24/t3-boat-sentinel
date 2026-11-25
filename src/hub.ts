@@ -2320,7 +2320,7 @@ export class HubServer {
   private observeProviderSessions(sb: HubSandboxRecord, providers: unknown[]): void {
     // Records only exist once provisioning finished; skip VMs that are not live
     if (sb.phase !== "running" || this.destroyingSandboxes.has(sb.sandboxId)) return;
-    this.lifecycle.providerSessions.observe(sb.sandboxId, providers);
+    this.lifecycle.providerSessions.observe(sb.sandboxId, providers, sb.createdAt);
   }
 
   /** Re-checks one provider on the VM it was injected into and caches the answer. Never throws. */
