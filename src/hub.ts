@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import type { ServerWebSocket } from "bun";
 import {
   CLIENT_TOKEN_TTL_SECS,
@@ -25,7 +27,15 @@ import {
 } from "./security.ts";
 import type { ProjectConfig, SentinelConfig } from "./config.ts";
 import { HubMcpHandler, formatRpcFailure, type HubSandboxPhase } from "./hub-mcp.ts";
-import { buildPlaceholderThread, failPlaceholderThread, placeholderInputFrom, type PlaceholderInput } from "./hub-placeholder.ts";
+import {
+  buildPlaceholderThread,
+  failPlaceholderThread,
+  placeholderInputFrom,
+  projectionFromShell,
+  withStatusNotice,
+  type PlaceholderInput,
+  type StatusNotice,
+} from "./hub-placeholder.ts";
 import {
   applySettingsOverlay,
   applySettingsUpdate,
@@ -108,8 +118,8 @@ interface PendingUpstreamCall {
  */
 interface PendingThreadLaunch {
   record: HubPendingLaunchRecord;
-  /** `orchestration.subscribeThread` streams the Hub serves from the placeholder until the hand-off. */
-  threadSubs: Array<{ ws: ServerWebSocket<HubWsData>; reqId: string | number; payload: unknown; headers: unknown }>;
+  /** The VM's shell already lists the thread (a launch resumed after a Hub restart): don't send it again. */
+  seenOnVm: boolean;
   /** Set when the chat is archived or deleted while booting: the VM is destroyed once it exists. */
   cancelled: boolean;
   /** Settles when the thread exists on its VM; rejects when the launch fails or is cancelled. */
@@ -117,6 +127,27 @@ interface PendingThreadLaunch {
   resolveReady: (sb: HubSandboxRecord) => void;
   rejectReady: (err: Error) => void;
 }
+
+/** A thread stream the Hub serves itself while the thread's VM is booting, asleep or waking. */
+interface LocalThreadSub {
+  ws: ServerWebSocket<HubWsData>;
+  reqId: string | number;
+  payload: unknown;
+  headers: unknown;
+  /** False when the Hub sent only `synchronized` (the client keeps its own cached copy). */
+  servedSnapshot: boolean;
+}
+
+/** Commands that only record what the user did; answered at once and sent once the VM is up. */
+const BOOKKEEPING_COMMANDS = new Set([
+  "thread.visit",
+  "thread.mark-unread",
+  "thread.pin",
+  "thread.unpin",
+  "thread.pin.reorder",
+  "thread.active.reorder",
+  "thread.tag.set",
+]);
 
 interface StagedAttachment {
   id: string;
@@ -691,6 +722,12 @@ export class HubServer {
   private readonly inFlightWakes = new Map<string, Promise<HubSandboxRecord>>();
   /** Chats answered before their VM was ready (booting or failed), by thread id. */
   private readonly pendingThreads = new Map<string, PendingThreadLaunch>();
+  /** Thread streams the Hub serves while the thread's VM is not up, by thread id. */
+  private readonly localThreadSubs = new Map<string, LocalThreadSub[]>();
+  /** A sleeping VM being woken, or whose last wake failed (with the reason), by sandbox id. */
+  private readonly wakeStatus = new Map<string, { phase: "waking" } | { phase: "failed"; error: string }>();
+  /** Each thread's projection, read from its VM before the VM went to sleep (also on disk). */
+  private readonly projectionCache = new Map<string, Record<string, unknown>>();
   private readonly urlTokenToSandbox = new Map<string, string>();
   private readonly stagedAttachments = new Map<string, StagedAttachment>();
   private readonly stagedUploadTokens = new Map<string, string>(); // uploadToken -> attachmentId
@@ -855,6 +892,41 @@ export class HubServer {
         this.serveProviderStreamLocally(ws, reqId, tag, payload);
       }
     });
+  }
+
+  /**
+   * Forwards an environment stream the Hub keeps open (automations, previews...). When its VM goes
+   * away (sleep, destroy) the stream moves to another open VM, or waits quietly for the next one,
+   * instead of failing with "The environment request failed."
+   */
+  private forwardKeepOpenStream(
+    bridge: HubVmBridge,
+    ws: ServerWebSocket<HubWsData>,
+    reqId: string | number,
+    tag: string,
+    payload: unknown,
+    headers: unknown,
+  ): void {
+    const lostSandboxId = bridge.sandbox.sandboxId;
+    bridge.forwardToClient(ws, reqId, tag, payload, headers, undefined, () => {
+      if (!this.clients.has(ws) || !ws.data.localStreams.has(String(reqId))) return;
+      const next = Array.from(this.bridges.values()).find(
+        (b) => b.sandbox.sandboxId !== lostSandboxId && b.sandbox.phase === "running" && b.isOpen(),
+      );
+      if (next) this.forwardKeepOpenStream(next, ws, reqId, tag, payload, headers);
+    });
+  }
+
+  /** Gives streams that were waiting for a VM to one whose bridge just opened. */
+  private adoptKeepOpenStreams(sandboxId: string): void {
+    const bridge = this.bridges.get(sandboxId);
+    if (!bridge?.isOpen()) return;
+    for (const client of this.clients) {
+      for (const [key, sub] of client.data.localStreams) {
+        if (!KEEP_OPEN_SUBSCRIPTIONS.has(sub.tag) || client.data.upstreamRequests.has(key)) continue;
+        this.forwardKeepOpenStream(bridge, client, sub.rawId, sub.tag, sub.payload ?? {}, []);
+      }
+    }
   }
 
   /** Hands provider setup streams the Hub answered locally to a VM whose bridge just opened. */
@@ -1515,11 +1587,11 @@ export class HubServer {
       return;
     }
     if (KEEP_OPEN_SUBSCRIPTIONS.has(tag)) {
-      ws.data.localStreams.set(reqKey, { rawId: reqId, tag });
+      ws.data.localStreams.set(reqKey, { rawId: reqId, tag, payload });
       const live = this.anyRunningSandbox();
       const bridge = live ? this.bridges.get(live.sandboxId) : undefined;
       if (bridge?.isOpen()) {
-        bridge.forwardToClient(ws, reqId, tag, payload, headers);
+        this.forwardKeepOpenStream(bridge, ws, reqId, tag, payload, headers);
       }
       return;
     }
@@ -1606,18 +1678,20 @@ export class HubServer {
         sendRpcExitFailure(ws, reqId, `Missing threadId for ${tag}`);
         return;
       }
+      const servable = tag === "orchestration.subscribeThread" || tag === "orchestration.getThreadProjection";
       const pending = this.pendingThreads.get(tid);
-      if (pending && (tag === "orchestration.subscribeThread" || tag === "orchestration.getThreadProjection")) {
-        this.servePendingThread(ws, reqId, tag, payload, headers, pending);
+      if (pending && servable) {
+        this.serveLocalThread(ws, reqId, tag, payload, pending.record.projection);
         return;
       }
+      if (!pending && servable && this.serveSleepingThread(ws, reqId, tag, payload, tid)) return;
       try {
         const sb = await this.resolveSandboxForThread(tid);
         const bridge = await this.ensureBridgeOpen(sb);
         // The Hub's placeholder snapshot is sequence 0: a VM must answer such a client with a full snapshot
         bridge.forwardToClient(ws, reqId, tag, tag === "orchestration.subscribeThread" ? withoutZeroCursor(payload) : payload, headers);
       } catch (err) {
-        sendRpcExitFailure(ws, reqId, err instanceof Error ? err.message : String(err));
+        this.sendTypedFailure(ws, reqId, tag, payload, err instanceof Error ? err.message : String(err));
       }
       return;
     }
@@ -1739,7 +1813,7 @@ export class HubServer {
         sendRpcFrame(ws, { _tag: "Exit", requestId: reqId, exit });
       }
     } catch (err) {
-      sendRpcExitFailure(ws, reqId, err instanceof Error ? err.message : String(err));
+      this.sendTypedFailure(ws, reqId, "orchestration.launchThread", payload, err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -1798,6 +1872,13 @@ export class HubServer {
         sendRpcExitSuccess(ws, reqId, { sequence: this.cancelPendingLaunch(pending, cmdType) });
         return;
       }
+      if (BOOKKEEPING_COMMANDS.has(cmdType) && !this.threadVmIsUp(tid)) {
+        // Answered now so opening a booting or sleeping chat raises no slow-request warning; the VM
+        // gets it once up (for a sleeping chat this starts the wake, as opening it always did)
+        sendRpcExitSuccess(ws, reqId, { sequence: this.state.ensureHub().sequence });
+        void this.forwardWhenUp(tid, payload);
+        return;
+      }
       // Other commands for a booting chat wait for its VM (resolveSandboxForThread)
       const sb = await this.resolveSandboxForThread(tid);
       const bridge = await this.ensureBridgeOpen(sb);
@@ -1813,7 +1894,7 @@ export class HubServer {
         sendRpcFrame(ws, { _tag: "Exit", requestId: reqId, exit });
       }
     } catch (err) {
-      sendRpcExitFailure(ws, reqId, err instanceof Error ? err.message : String(err));
+      this.sendTypedFailure(ws, reqId, "orchestration.dispatchCommand", payload, err instanceof Error ? err.message : String(err));
     }
   }
 
@@ -1858,7 +1939,7 @@ export class HubServer {
       rejectReady = reject;
     });
     ready.catch(() => {});
-    const pending: PendingThreadLaunch = { record, threadSubs: [], cancelled: false, ready, resolveReady, rejectReady };
+    const pending: PendingThreadLaunch = { record, seenOnVm: false, cancelled: false, ready, resolveReady, rejectReady };
     if (record.phase === "failed") rejectReady(new Error(record.error ?? "This chat's VM failed to start"));
     this.pendingThreads.set(record.threadId, pending);
     this.threadShells.set(record.threadId, record.shell);
@@ -1921,7 +2002,9 @@ export class HubServer {
       // A VM reused after a Hub restart replays the settings overlay on this connection first
       await this.settingsReplayDone(sb.sandboxId);
       let exit: { _tag: "Success"; value: unknown } | { _tag: "Failure"; cause: unknown };
-      if (kind === "launch") {
+      if (pending.seenOnVm) {
+        exit = { _tag: "Success", value: null };
+      } else if (kind === "launch") {
         const payload = await this.replayStagedAttachmentsInPayload(sb, bridge, {
           ...pending.record.payload,
           threadId,
@@ -1945,7 +2028,7 @@ export class HubServer {
         `[hub] chat ${threadId} started on ${sb.sandboxId}: forward=${Date.now() - forwardStartedAt}ms, ${Date.now() - startedAt}ms after the client's request`,
       );
       pending.resolveReady(sb);
-      this.handOffThreadSubs(pending, sb);
+      this.handOffLocalThreadSubs(threadId, sb);
     } catch (err) {
       if (pending.cancelled) {
         if (sb) await this.discardCancelledLaunch(sb, threadId);
@@ -1961,6 +2044,7 @@ export class HubServer {
     pending.cancelled = true;
     this.forgetPendingLaunch(threadId);
     this.threadShells.delete(threadId);
+    this.localThreadSubs.delete(threadId);
     pending.rejectReady(new Error("This chat was closed before its VM finished starting"));
     const sequence = this.state.nextHubSequence();
     this.broadcastShellItem({ kind: "thread.removed", sequence, location: "active", threadId });
@@ -1991,13 +2075,7 @@ export class HubServer {
       location: "active",
       thread: failed.shell,
     });
-    for (const sub of this.liveThreadSubs(pending)) {
-      sendRpcFrame(sub.ws, {
-        _tag: "Chunk",
-        requestId: sub.reqId,
-        values: [{ kind: "snapshot", snapshotSequence: 0, projection: failed.projection }],
-      });
-    }
+    this.pushLocalThreadSnapshot(threadId, failed.projection);
     pending.rejectReady(new Error(message));
 
     // Unbind first: destroying a VM removes the threads bound to it, and this chat must stay
@@ -2029,37 +2107,58 @@ export class HubServer {
     });
   }
 
-  private servePendingThread(
+  /** Serves a thread stream or projection read from a Hub-built projection. */
+  private serveLocalThread(
     ws: ServerWebSocket<HubWsData>,
     reqId: string | number,
     tag: string,
     payload: unknown,
-    headers: unknown,
-    pending: PendingThreadLaunch,
+    projection: Record<string, unknown> | null,
   ): void {
-    const projection = pending.record.projection;
     if (tag === "orchestration.getThreadProjection") {
-      sendRpcExitSuccess(ws, reqId, projection);
+      if (projection) sendRpcExitSuccess(ws, reqId, projection);
+      else this.sendTypedFailure(ws, reqId, tag, payload, "This chat's VM is asleep and the Hub has no copy of it yet.");
       return;
     }
+    const tid = extractThreadId(payload)!;
     ws.data.localStreams.set(String(reqId), { rawId: reqId, tag, payload });
-    pending.threadSubs.push({ ws, reqId, payload, headers });
-    const values: unknown[] = [{ kind: "snapshot", snapshotSequence: 0, projection }];
-    if ((payload as { requestCompletionMarker?: unknown } | null)?.requestCompletionMarker) values.push({ kind: "synchronized" });
-    sendRpcFrame(ws, { _tag: "Chunk", requestId: reqId, values });
+    const subs = this.localThreadSubs.get(tid) ?? [];
+    subs.push({ ws, reqId, payload, headers: [], servedSnapshot: projection !== null });
+    this.localThreadSubs.set(tid, subs);
+    // Sequence 0 marks the Hub's copy: the hand-off asks the VM for a full snapshot
+    const values: unknown[] = projection ? [{ kind: "snapshot", snapshotSequence: 0, projection }] : [];
+    if (projection || (payload as { requestCompletionMarker?: unknown } | null)?.requestCompletionMarker) {
+      values.push({ kind: "synchronized" });
+    }
+    if (values.length > 0) sendRpcFrame(ws, { _tag: "Chunk", requestId: reqId, values });
   }
 
-  private liveThreadSubs(pending: PendingThreadLaunch): PendingThreadLaunch["threadSubs"] {
-    return pending.threadSubs.filter(
+  private liveLocalThreadSubs(threadId: string): LocalThreadSub[] {
+    const subs = (this.localThreadSubs.get(threadId) ?? []).filter(
       (sub) =>
         this.clients.has(sub.ws) && sub.ws.data.localStreams.get(String(sub.reqId))?.tag === "orchestration.subscribeThread",
     );
+    if (subs.length > 0) this.localThreadSubs.set(threadId, subs);
+    else this.localThreadSubs.delete(threadId);
+    return subs;
   }
 
-  /** Moves the placeholder's thread streams to the VM, which answers each with a full snapshot. */
-  private handOffThreadSubs(pending: PendingThreadLaunch, sb: HubSandboxRecord): void {
-    const subs = this.liveThreadSubs(pending);
-    pending.threadSubs = [];
+  /** Sends a newer Hub-built projection to the thread's local streams. */
+  private pushLocalThreadSnapshot(threadId: string, projection: Record<string, unknown>): void {
+    for (const sub of this.liveLocalThreadSubs(threadId)) {
+      sub.servedSnapshot = true;
+      sendRpcFrame(sub.ws, {
+        _tag: "Chunk",
+        requestId: sub.reqId,
+        values: [{ kind: "snapshot", snapshotSequence: 0, projection }],
+      });
+    }
+  }
+
+  /** Moves a thread's local streams to its VM. A stream that got the Hub's copy asks for a full snapshot. */
+  private handOffLocalThreadSubs(threadId: string, sb: HubSandboxRecord): void {
+    const subs = this.liveLocalThreadSubs(threadId);
+    this.localThreadSubs.delete(threadId);
     if (subs.length === 0) return;
     const bridge = this.bridges.get(sb.sandboxId);
     for (const sub of subs) {
@@ -2068,9 +2167,188 @@ export class HubServer {
         sendRpcExitFailure(sub.ws, sub.reqId, "The chat's VM disconnected; reconnecting");
         continue;
       }
-      const { afterSequence: _placeholderCursor, ...payload } = (sub.payload ?? {}) as Record<string, unknown>;
+      let payload = sub.payload;
+      if (sub.servedSnapshot) {
+        const { afterSequence: _hubCopyCursor, ...rest } = (sub.payload ?? {}) as Record<string, unknown>;
+        payload = rest;
+      }
       bridge.forwardToClient(sub.ws, sub.reqId, "orchestration.subscribeThread", payload, sub.headers);
     }
+  }
+
+  /** True when the thread's VM is running (commands for it go straight through). */
+  private threadVmIsUp(threadId: string): boolean {
+    if (this.pendingThreads.has(threadId)) return false;
+    const sbId = this.threadToSandbox.get(threadId);
+    const sb = sbId ? this.state.getHubSandbox(sbId) : undefined;
+    return !sb || sb.phase === "running";
+  }
+
+  /** Sends a command the Hub already answered once the thread's VM is up; dropped if it never comes up. */
+  private async forwardWhenUp(threadId: string, payload: Record<string, unknown>): Promise<void> {
+    try {
+      const sb = await this.resolveSandboxForThread(threadId);
+      const bridge = await this.ensureBridgeOpen(sb);
+      const exit = await bridge.callUnary(
+        "orchestration.dispatchCommand",
+        rewriteProjectIds(payload, sb.hubProjectId, sb.vmProjectId),
+        60_000,
+      );
+      if (exit._tag !== "Success") console.warn(`[hub] deferred ${String(payload.type)} for ${threadId} failed: ${formatRpcFailure(exit.cause)}`);
+    } catch {
+      // The chat failed, was closed, or its VM could not wake; the user sees that in the chat
+    }
+  }
+
+  /**
+   * Ends a request with the RPC's typed error when it has one with a message, so the app shows the
+   * reason (a `Die` reads "The environment request failed.").
+   */
+  private sendTypedFailure(
+    ws: ServerWebSocket<HubWsData>,
+    reqId: string | number,
+    tag: string,
+    payload: unknown,
+    message: string,
+  ): void {
+    const p = (payload && typeof payload === "object" ? payload : {}) as Record<string, unknown>;
+    const threadId = extractThreadId(p);
+    const commandId = typeof p.commandId === "string" && p.commandId ? p.commandId : null;
+    if ((tag === "orchestration.subscribeThread" || tag === "orchestration.getThreadProjection") && threadId) {
+      sendRpcExitFail(ws, reqId, { _tag: "OrchestrationV2GetThreadProjectionError", threadId, message });
+    } else if (tag === "orchestration.dispatchCommand" && commandId && typeof p.type === "string") {
+      sendRpcExitFail(ws, reqId, { _tag: "OrchestrationV2DispatchCommandError", commandId, commandType: p.type, message });
+    } else if (tag === "orchestration.launchThread" && commandId && typeof p.projectId === "string" && p.projectId) {
+      sendRpcExitFail(ws, reqId, { _tag: "OrchestrationV2ThreadLaunchError", commandId, projectId: p.projectId, message });
+    } else {
+      sendRpcExitFailure(ws, reqId, message);
+    }
+  }
+
+  // ── Chats whose VM is asleep ─────────────────────────────────────────────────────────────────
+
+  /** The sleeping (or waking) sandbox a thread belongs to, if any. */
+  private sleepingSandboxForThread(threadId: string): HubSandboxRecord | undefined {
+    const sbId = this.threadToSandbox.get(threadId);
+    const sb = sbId ? this.state.getHubSandbox(sbId) : undefined;
+    if (!sb) return undefined;
+    return sb.phase === "sleeping" || this.inFlightWakes.has(sb.sandboxId) ? sb : undefined;
+  }
+
+  private sleepNotice(sandboxId: string): StatusNotice {
+    const status = this.wakeStatus.get(sandboxId);
+    if (status?.phase === "waking") {
+      return { outcome: "updated", summary: "Waking this chat's VM. Messages you send are delivered once it is up." };
+    }
+    if (status?.phase === "failed") {
+      return {
+        outcome: "failed",
+        summary: "This chat's VM could not wake. Open the chat again or send a message to retry.",
+        detail: status.error,
+      };
+    }
+    return { outcome: "updated", summary: "This chat's VM is asleep. Opening the chat or sending a message wakes it." };
+  }
+
+  /** The Hub's view of a sleeping chat: its cached projection (or its sidebar row) with a status row. */
+  private sleepingThreadView(threadId: string, sandboxId: string): Record<string, unknown> | null {
+    const cached = this.readProjectionCache(threadId);
+    const shell = this.threadShells.get(threadId);
+    const base = cached ?? (shell ? projectionFromShell(shell) : null);
+    return base ? withStatusNotice(base, threadId, this.sleepNotice(sandboxId)) : null;
+  }
+
+  /**
+   * Serves a sleeping chat's thread view at once and starts waking its VM; the stream moves to the VM
+   * once it is up. False when the Hub knows nothing of the thread (then the request waits for the wake).
+   */
+  private serveSleepingThread(
+    ws: ServerWebSocket<HubWsData>,
+    reqId: string | number,
+    tag: string,
+    payload: unknown,
+    threadId: string,
+  ): boolean {
+    const sb = this.sleepingSandboxForThread(threadId);
+    if (!sb) return false;
+    let view: Record<string, unknown> | null = null;
+    if (this.readProjectionCache(threadId)) {
+      view = this.sleepingThreadView(threadId, sb.sandboxId);
+    } else {
+      // No copy of the history: a client holding its own keeps it (only `synchronized`); one with
+      // nothing gets the sidebar row with the status, so it never stays on "Syncing messages..."
+      const afterSequence = (payload as { afterSequence?: unknown } | null)?.afterSequence;
+      const clientHasCopy = typeof afterSequence === "number" && afterSequence > 0;
+      if (!clientHasCopy || tag === "orchestration.getThreadProjection") view = this.sleepingThreadView(threadId, sb.sandboxId);
+      if (!view && !clientHasCopy) return false;
+    }
+    this.serveLocalThread(ws, reqId, tag, payload, view);
+    if (!this.inFlightWakes.has(sb.sandboxId)) {
+      void this.wakeHubSandbox(sb.sandboxId).catch(() => {});
+    }
+    return true;
+  }
+
+  /** Wake start, success and failure: update what sleeping chats show, and hand them over on success. */
+  private onWakeStatus(sandboxId: string, status: { phase: "waking" } | { phase: "failed"; error: string } | null): void {
+    if (status) this.wakeStatus.set(sandboxId, status);
+    else this.wakeStatus.delete(sandboxId);
+    const sb = this.state.getHubSandbox(sandboxId);
+    if (!sb) return;
+    for (const threadId of sb.threadIds) {
+      if (!status) {
+        this.handOffLocalThreadSubs(threadId, sb);
+        continue;
+      }
+      const subs = this.liveLocalThreadSubs(threadId);
+      if (subs.length === 0) continue;
+      const view = this.sleepingThreadView(threadId, sandboxId);
+      if (view) this.pushLocalThreadSnapshot(threadId, view);
+    }
+  }
+
+  private projectionCacheFile(threadId: string): string {
+    return join(this.config.stateDir, "hub-thread-cache", `${encodeURIComponent(threadId)}.json`);
+  }
+
+  private readProjectionCache(threadId: string): Record<string, unknown> | null {
+    const hit = this.projectionCache.get(threadId);
+    if (hit) return hit;
+    const file = this.projectionCacheFile(threadId);
+    if (!existsSync(file)) return null;
+    try {
+      const projection = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+      this.projectionCache.set(threadId, projection);
+      return projection;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Before a VM sleeps: keep a copy of each of its threads, so the Hub can show them while it sleeps. */
+  private async cacheThreadProjections(sb: HubSandboxRecord): Promise<void> {
+    const bridge = this.bridges.get(sb.sandboxId);
+    if (!bridge?.isOpen()) return;
+    await Promise.all(
+      sb.threadIds.map(async (threadId) => {
+        const exit = await bridge.callUnary("orchestration.getThreadProjection", { threadId }, 10_000);
+        if (exit._tag !== "Success" || !exit.value || typeof exit.value !== "object") return;
+        const projection = rewriteProjectIds(exit.value, sb.vmProjectId, sb.hubProjectId) as Record<string, unknown>;
+        this.projectionCache.set(threadId, projection);
+        try {
+          const file = this.projectionCacheFile(threadId);
+          mkdirSync(join(this.config.stateDir, "hub-thread-cache"), { recursive: true, mode: 0o700 });
+          writeFileSync(file, JSON.stringify(projection), { mode: 0o600 });
+        } catch (err) {
+          console.warn(`[hub] could not save thread ${threadId} for its sleeping VM:`, err instanceof Error ? err.message : err);
+        }
+      }),
+    );
+  }
+
+  private dropProjectionCache(threadId: string): void {
+    this.projectionCache.delete(threadId);
+    rmSync(this.projectionCacheFile(threadId), { force: true });
   }
 
   private async handleWorkspaceRpc(
@@ -2609,6 +2887,12 @@ export class HubServer {
     });
 
     this.inFlightWakes.set(sandboxId, promise);
+    // What sleeping chats show: waking, then handed to the VM or the reason it could not wake
+    this.onWakeStatus(sandboxId, { phase: "waking" });
+    promise.then(
+      () => this.onWakeStatus(sandboxId, null),
+      (err) => this.onWakeStatus(sandboxId, { phase: "failed", error: err instanceof Error ? err.message : String(err) }),
+    );
     return promise;
   }
 
@@ -2620,6 +2904,7 @@ export class HubServer {
       return;
     }
     console.log(`[hub] pausing idle sandbox ${sandboxId} (${sb.project})`);
+    await this.cacheThreadProjections(sb).catch(() => {});
     this.bridges.get(sandboxId)?.stop();
     this.bridges.delete(sandboxId);
     await this.boat.pause(sandboxId);
@@ -2655,6 +2940,7 @@ export class HubServer {
     this.bridges.delete(sandboxId);
     this.settingsReplays.delete(sandboxId);
     this.replayedSettings.delete(sandboxId);
+    this.wakeStatus.delete(sandboxId);
 
     // Threads may have been bound while the pull ran
     const current = this.state.getHubSandbox(sandboxId) ?? sb;
@@ -2667,6 +2953,8 @@ export class HubServer {
     for (const tid of threadIds) {
       this.threadToSandbox.delete(tid);
       this.threadShells.delete(tid);
+      this.localThreadSubs.delete(tid);
+      this.dropProjectionCache(tid);
       this.broadcastShellItem({
         kind: "thread.removed",
         sequence: this.state.nextHubSequence(),
@@ -2726,6 +3014,7 @@ export class HubServer {
       (sandboxId, providers) => this.handleVmProviderStatuses(sandboxId, providers),
       (sandboxId) => {
         this.adoptLocalProviderStreams(sandboxId);
+        this.adoptKeepOpenStreams(sandboxId);
         this.replaySettingsOverlay(sandboxId);
       },
     );
@@ -2768,7 +3057,7 @@ export class HubServer {
         for (const t of snap.threads ?? []) {
           const rewritten = rewriteProjectIds(t, sb.vmProjectId, sb.hubProjectId) as Record<string, unknown>;
           const tid = String(rewritten.id ?? "");
-          if (!tid) continue;
+          if (!tid || this.skipVmShellItem(tid)) continue;
           const isNew = !this.threadShells.has(tid);
           this.threadShells.set(tid, rewritten);
           this.bindThreadToSandbox(tid, sandboxId);
@@ -2787,7 +3076,7 @@ export class HubServer {
       } else if (item.kind === "thread.updated" && item.thread && typeof item.thread === "object") {
         const rewritten = rewriteProjectIds(item.thread, sb.vmProjectId, sb.hubProjectId) as Record<string, unknown>;
         const tid = String(rewritten.id ?? "");
-        if (!tid) continue;
+        if (!tid || this.skipVmShellItem(tid)) continue;
         this.threadShells.set(tid, rewritten);
         this.bindThreadToSandbox(tid, sandboxId);
         if (typeof rewritten.worktreePath === "string" && rewritten.worktreePath) {
@@ -2809,6 +3098,18 @@ export class HubServer {
         });
       }
     }
+  }
+
+  /**
+   * A failed chat keeps the Hub's row even if its VM (being destroyed) still reports the thread.
+   * A booting chat the VM already lists is not launched again.
+   */
+  private skipVmShellItem(threadId: string): boolean {
+    const pending = this.pendingThreads.get(threadId);
+    if (!pending) return false;
+    if (pending.record.phase === "failed") return true;
+    pending.seenOnVm = true;
+    return false;
   }
 
   /** Sends the Hub's current provider list to every client subscribed to `subscribeServerConfig`. */

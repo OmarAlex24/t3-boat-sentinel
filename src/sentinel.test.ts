@@ -12,6 +12,7 @@ import { createSentinelServer, type SentinelServerHandle } from "./index.ts";
 import type { KlavClient } from "./klav.ts";
 import { LifecycleManager } from "./lifecycle.ts";
 import { formatRpcFailure } from "./hub-mcp.ts";
+import { buildPlaceholderThread, failPlaceholderThread, placeholderInputFrom } from "./hub-placeholder.ts";
 import {
   applySettingsOverlay,
   applySettingsUpdate,
@@ -42,6 +43,10 @@ class MockBoat implements BoatClient {
   createGate: Promise<void> | null = null;
   /** When set, `create` fails with it. */
   createError: Error | null = null;
+  /** While set, `resume` waits on it (a VM that is still waking). */
+  resumeGate: Promise<void> | null = null;
+  /** When set, `resume` fails with it. */
+  resumeError: Error | null = null;
   private seq = 1;
 
   async create(name: string, size: string, fromSnapshot?: string): Promise<string> {
@@ -64,6 +69,8 @@ class MockBoat implements BoatClient {
   }
 
   async resume(id: string): Promise<ResumeResult> {
+    if (this.resumeGate) await this.resumeGate;
+    if (this.resumeError) throw this.resumeError;
     const sb = this.sandboxes.get(id);
     if (!sb) return "data_expired";
     this.resumed.push(id);
@@ -897,6 +904,8 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       applySettings?: boolean;
       /** Fail `orchestration.launchThread` with this message. */
       rejectLaunch?: string;
+      /** With `rejectLaunch`: report the thread on the shell stream just after the failure. */
+      lateShellItemAfterReject?: boolean;
     } = {},
   ) {
     let vmSettings = (opts.configSnapshot?.settings ?? null) as Record<string, unknown> | null;
@@ -1036,6 +1045,42 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
                 _tag: "Exit",
                 requestId: frame.id,
                 exit: { _tag: "Failure", cause: [{ _tag: "Die", defect: opts.rejectLaunch }] },
+              }),
+            );
+            if (opts.lateShellItemAfterReject) {
+              const thread = { id: String(frame.payload?.threadId), projectId: vmProjectId, title: "Half made", status: "idle" };
+              setTimeout(() => {
+                ws.sendText(
+                  JSON.stringify({
+                    _tag: "Chunk",
+                    requestId: "hub-shell",
+                    values: [{ kind: "thread.updated", sequence: 3, location: "active", thread }],
+                  }),
+                );
+              }, 20);
+            }
+            return;
+          }
+          if (frame.tag === "scheduledTasks.subscribe") {
+            ws.sendText(JSON.stringify({ _tag: "Chunk", requestId: frame.id, values: [{ tasks: [] }] }));
+            return;
+          }
+          if (frame.tag === "orchestration.getThreadProjection") {
+            const threadId = String(frame.payload?.threadId);
+            ws.sendText(
+              JSON.stringify({
+                _tag: "Exit",
+                requestId: frame.id,
+                exit: {
+                  _tag: "Success",
+                  value: {
+                    thread: { id: threadId, projectId: vmProjectId, title: "Cached chat" },
+                    runs: [],
+                    messages: [{ id: `vm-msg-${threadId}`, role: "user", text: "What we said before" }],
+                    turnItems: [],
+                    visibleTurnItems: [],
+                  },
+                },
               }),
             );
             return;
@@ -1531,6 +1576,147 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       const shell = await client2.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "shell");
       const threads = (shell.values as Array<{ snapshot: { threads: Array<{ id: string }> } }>)[0].snapshot.threads;
       expect(threads.map((t) => t.id)).toContain("thread-s");
+    });
+
+    test("a failed chat stays even if its VM reports the thread after the failure", async () => {
+      const vm = startFakeVmT3Server("vm-late", { rejectLaunch: "launch rejected", lateShellItemAfterReject: true });
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-late-");
+      const client = await connectHubClient(handle, cfg);
+      const hubProjectId = await subscribeHubShell(client);
+
+      client.request("launch", "orchestration.launchThread", clientLaunchPayload("thread-late", hubProjectId));
+      await client.waitForFrame(shellThreadUpdate("thread-late", (t) => t.status === "failed"));
+      await until(() => boat.deleted.length === 1);
+      await Bun.sleep(100);
+      const removed = client.inbox.some(
+        (f) =>
+          f._tag === "Chunk" &&
+          (f.values as Array<{ kind?: string; threadId?: string } | null>)?.some((v) => v?.kind === "thread.removed" && v.threadId === "thread-late"),
+      );
+      expect(removed).toBe(false);
+      client.request("shell-2", "orchestration.subscribeShell");
+      const shell = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "shell-2");
+      const row = (shell.values as Array<{ snapshot: { threads: Array<{ id: string; status: string }> } }>)[0].snapshot.threads.find(
+        (t) => t.id === "thread-late",
+      );
+      expect(row?.status).toBe("failed");
+    });
+  });
+
+  describe("chats whose VM is asleep", () => {
+    type HubClient = Awaited<ReturnType<typeof connectHubClient>>;
+    const until = async (cond: () => boolean, timeoutMs = 5_000) => {
+      const start = Date.now();
+      while (!cond()) {
+        if (Date.now() - start > timeoutMs) throw new Error("condition not met in time");
+        await Bun.sleep(20);
+      }
+    };
+    type Row = { item: { type: string; summary?: string; outcome?: string; detail?: string } };
+    const noticeOf = (f: Record<string, unknown>) => {
+      const snap = (f.values as Array<{ kind: string; projection?: { visibleTurnItems: Row[] } }>).find((v) => v.kind === "snapshot");
+      return snap?.projection?.visibleTurnItems.find((r) => r.item.type === "notification")?.item;
+    };
+    const threadChunk = (reqId: string, pred: (notice: Row["item"] | undefined, f: Record<string, unknown>) => boolean) =>
+      (f: Record<string, unknown>) => f._tag === "Chunk" && f.requestId === reqId && pred(noticeOf(f), f);
+
+    async function sleepingChat(prefix: string) {
+      const vm = startFakeVmT3Server(prefix);
+      cleanups.push(() => vm.server.stop(true));
+      const hub = await startHubWithVm(vm, `t3-sentinel-hub-${prefix}-`);
+      const client: HubClient = await connectHubClient(hub.handle, hub.cfg);
+      await launchThreadOnHub(client, "thread-zz");
+      const sandboxId = hub.handle.state.listHubSandboxes()[0].sandboxId;
+      await hub.handle.hub!.sleepHubSandbox(sandboxId);
+      expect(hub.handle.state.getHubSandbox(sandboxId)!.phase).toBe("sleeping");
+      return { vm, client, sandboxId, ...hub };
+    }
+
+    test("opening a sleeping chat shows its history at once, says it is waking, then hands over to the VM", async () => {
+      const { vm, client, boat, sandboxId, dir } = await sleepingChat("vm-sleep");
+      expect(existsSync(join(dir, "hub-thread-cache", "thread-zz.json"))).toBe(true);
+      let release!: () => void;
+      boat.resumeGate = new Promise<void>((r) => (release = r));
+      cleanups.push(() => release());
+      const seenBefore = vm.seenMethods.length;
+
+      // The app reopens the chat with its cached cursor, and records the visit
+      client.request("sub", "orchestration.subscribeThread", { threadId: "thread-zz", afterSequence: 7, requestCompletionMarker: true });
+      client.request("visit", "orchestration.dispatchCommand", {
+        type: "thread.visit",
+        commandId: "cmd-visit",
+        threadId: "thread-zz",
+        visitedAt: new Date().toISOString(),
+      });
+      const first = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "sub");
+      const snap = (first.values as Array<{ kind: string; projection?: { messages: Array<{ text: string }> } }>)[0];
+      expect(snap.kind).toBe("snapshot");
+      expect(snap.projection!.messages[0].text).toBe("What we said before");
+      expect((first.values as Array<{ kind: string }>).some((v) => v.kind === "synchronized")).toBe(true);
+      // Answered at once, not after the wake
+      const visit = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "visit", 1_000);
+      expect((visit.exit as { _tag: string })._tag).toBe("Success");
+      await client.waitForFrame(threadChunk("sub", (n) => n?.summary?.startsWith("Waking this chat's VM") === true), 2_000);
+      expect(boat.resumed).toHaveLength(0);
+
+      release();
+      await until(() => vm.seenMethods.slice(seenBefore).some((m) => m.tag === "orchestration.subscribeThread"));
+      const handedOff = vm.seenMethods.slice(seenBefore).find((m) => m.tag === "orchestration.subscribeThread")!.payload as Record<string, unknown>;
+      // It got the Hub's copy, so the VM sends a full snapshot
+      expect("afterSequence" in handedOff).toBe(false);
+      expect(boat.resumed).toEqual([sandboxId]);
+      await until(() =>
+        vm.seenMethods
+          .slice(seenBefore)
+          .some((m) => m.tag === "orchestration.dispatchCommand" && (m.payload as { type?: string }).type === "thread.visit"),
+      );
+    });
+
+    test("a failed wake says why in the chat, and commands fail with a readable reason", async () => {
+      const { client, boat } = await sleepingChat("vm-wakefail");
+      boat.resumeError = new Error("klav-forward is not listening");
+
+      client.request("sub", "orchestration.subscribeThread", { threadId: "thread-zz" });
+      const failed = await client.waitForFrame(threadChunk("sub", (n) => n?.outcome === "failed"));
+      const notice = noticeOf(failed)!;
+      expect(notice.summary).toContain("could not wake");
+      expect(notice.detail).toContain("klav-forward is not listening");
+
+      client.request("msg", "orchestration.dispatchCommand", {
+        type: "message.dispatch",
+        commandId: "cmd-m",
+        threadId: "thread-zz",
+        messageId: "m-1",
+        text: "hello?",
+        attachments: [],
+      });
+      const exit = (await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "msg")).exit as {
+        _tag: string;
+        cause: Array<{ _tag: string; error?: Record<string, unknown> }>;
+      };
+      expect(exit._tag).toBe("Failure");
+      expect(exit.cause[0]).toMatchObject({
+        _tag: "Fail",
+        error: { _tag: "OrchestrationV2DispatchCommandError", commandId: "cmd-m", commandType: "message.dispatch" },
+      });
+      expect(String(exit.cause[0].error!.message)).toContain("klav-forward is not listening");
+    });
+
+    test("automations follow the VMs: no failure when the VM sleeps, back on the next VM that opens", async () => {
+      const { vm, client, handle, sandboxId } = await sleepingChat("vm-auto");
+      // Nothing running: the stream waits quietly
+      client.request("tasks", "scheduledTasks.subscribe", {});
+      await Bun.sleep(100);
+      expect(client.inbox.some((f) => f.requestId === "tasks")).toBe(false);
+      const before = vm.seenMethods.filter((m) => m.tag === "scheduledTasks.subscribe").length;
+      await handle.hub!.wakeHubSandbox(sandboxId);
+      await until(() => vm.seenMethods.filter((m) => m.tag === "scheduledTasks.subscribe").length === before + 1);
+      await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "tasks");
+      // The VM sleeps again: the stream is not failed
+      await handle.hub!.sleepHubSandbox(sandboxId);
+      await Bun.sleep(100);
+      expect(client.inbox.some((f) => f._tag === "Exit" && f.requestId === "tasks")).toBe(false);
     });
   });
 
@@ -3996,5 +4182,60 @@ describe("hub settings overlay", () => {
     expect(once.providerInstances).toEqual({ opencode: { driver: "opencode", enabled: false, config: { apiKey: "\u2022\u2022\u2022" } } });
     // The VM still gets the user's raw values
     expect(JSON.stringify(overlayReplayCalls(overlay))).toContain("sk-raw");
+  });
+});
+
+describe("hub placeholder thread", () => {
+  // Required keys of the T3 client's decoders (0.1.13-nightly.20261125.5245): a record missing one
+  // fails to decode, and a bad shell row breaks the whole sidebar.
+  const SHELL_KEYS = [
+    "createdBy", "creationSource", "id", "projectId", "title", "providerInstanceId", "modelSelection", "runtimeMode",
+    "interactionMode", "branch", "worktreePath", "lineage", "forkedFrom", "activeProviderThreadId", "latestRunId",
+    "activeRunId", "status", "pendingRuntimeRequest", "latestVisibleMessage", "latestUserMessageAt",
+    "hasActionableProposedPlan", "itemCount", "visibleItemCount", "createdAt", "updatedAt", "archivedAt",
+    "settledOverride", "settledAt", "deletedAt",
+  ];
+  const PROJECTION_KEYS = [
+    "thread", "runs", "attempts", "nodes", "subagents", "providerSessions", "providerThreads", "providerTurns",
+    "runtimeRequests", "messages", "plans", "turnItems", "checkpointScopes", "checkpoints", "contextHandoffs",
+    "contextTransfers", "visibleTurnItems", "updatedAt",
+  ];
+  const payload = {
+    commandId: "c1",
+    threadId: "t1",
+    projectId: "p1",
+    title: "Hello",
+    modelSelection: { instanceId: "claudeAgent", model: "claude-opus-5-5" },
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    workspaceStrategy: { type: "root" },
+    initialMessage: { messageId: "m1", text: "hi", attachments: [] },
+  };
+
+  test("has every key the client requires, before and after a failure", () => {
+    const placeholder = buildPlaceholderThread(placeholderInputFrom("launch", payload, "t1", "p1")!);
+    for (const record of [placeholder, failPlaceholderThread(placeholder, "boom")]) {
+      for (const key of SHELL_KEYS) expect(Object.keys(record.shell)).toContain(key);
+      for (const key of PROJECTION_KEYS) expect(Object.keys(record.projection)).toContain(key);
+    }
+  });
+
+  test("shows the first message as a timeline row and the starting state as a system notice", () => {
+    const { projection, shell } = buildPlaceholderThread(placeholderInputFrom("launch", payload, "t1", "p1")!);
+    const rows = projection.visibleTurnItems as Array<{ item: Record<string, unknown> }>;
+    expect(rows.map((r) => r.item.type)).toEqual(["user_message", "notification"]);
+    expect(rows[0].item).toMatchObject({ messageId: "m1", text: "hi" });
+    expect(rows[1].item).toMatchObject({ source: { kind: "system" }, outcome: "updated" });
+    expect(shell).toMatchObject({ status: "preparing", activityRunStatus: "preparing" });
+    const failed = failPlaceholderThread({ shell, projection }, "no capacity");
+    const failedRows = failed.projection.visibleTurnItems as Array<{ item: Record<string, unknown> }>;
+    expect(failedRows.filter((r) => r.item.type === "notification")).toHaveLength(1);
+    expect(failedRows.at(-1)!.item).toMatchObject({ outcome: "failed", detail: "no capacity" });
+    expect(failed.shell).toMatchObject({ status: "failed", lastError: "no capacity" });
+  });
+
+  test("falls back to the awaited launch when the payload lacks what a placeholder needs", () => {
+    const { modelSelection: _m, ...withoutModel } = payload;
+    expect(placeholderInputFrom("launch", withoutModel, "t1", "p1")).toBeNull();
   });
 });
