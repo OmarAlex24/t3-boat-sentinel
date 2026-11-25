@@ -285,6 +285,59 @@ describe("CelestoProvider", () => {
     expect((await provider.info(id)).name).toBe("t3s-hub-abc-1");
   });
 
+  test("list() hides a computer while its create() is in progress, then shows it", async () => {
+    const { fake, stateDir } = setup();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let waiting!: () => void;
+    const blocked = new Promise<void>((r) => (waiting = r));
+    // Every sleep (the poll between status reads) parks until the gate opens
+    const provider = new CelestoProvider({
+      apiKey: "cel_test_key",
+      stateDir,
+      fetch: fake.fetch,
+      sleep: async () => {
+        waiting();
+        await gate;
+      },
+      pollIntervalMs: 1,
+    });
+
+    const creating = provider.create({ name: "t3s-hub-race-1", size: "default" });
+    await blocked;
+    // The POST is done and the id recorded, but create() is still waiting for `running`
+    const [entry] = provider.registryEntries();
+    expect(entry.id).toMatch(/^cmp_new/);
+    expect(fake.computers.get(entry.id!)?.pending).toEqual([]);
+    expect(await provider.list()).toEqual([]);
+
+    release();
+    const id = await creating;
+    expect(id).toBe(entry.id!);
+    expect(await provider.list()).toEqual([{ id, name: "t3s-hub-race-1", state: "running", stoppedAt: null }]);
+  });
+
+  test("a create() that fails after the POST shows up in list() again, so the reaper can delete it", async () => {
+    const { fake, stateDir } = setup();
+    const provider = new CelestoProvider({
+      apiKey: "cel_test_key",
+      stateDir,
+      sleep: async () => {},
+      pollIntervalMs: 1,
+      fetch: async (url, init) => {
+        const res = await fake.fetch(url, init);
+        // The new computer breaks while booting
+        if (init.method === "POST" && url.endsWith("/computers")) {
+          const { id } = (await res.clone().json()) as { id: string };
+          fake.computers.set(id, { id, name: `watt-${id}`, status: "error" });
+        }
+        return res;
+      },
+    });
+    await expect(provider.create({ name: "t3s-hub-broken-1", size: "default" })).rejects.toThrow(/is error/);
+    expect((await provider.list()).map((c) => c.name)).toEqual(["t3s-hub-broken-1"]);
+  });
+
   test("list() throws on a corrupt registry instead of reporting nothing", async () => {
     const { provider, registryPath } = setup();
     writeFileSync(registryPath, "{not json");

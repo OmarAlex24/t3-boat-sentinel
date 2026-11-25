@@ -117,7 +117,11 @@ export class CelestoProvider implements SandboxProvider {
   private warnedPrivate = false;
   /** Serializes registry read-modify-write cycles inside this process. */
   private registryLock: Promise<unknown> = Promise.resolve();
-  /** Idempotency keys with a create call in progress (never recovered from `list()`). */
+  /**
+   * Idempotency keys whose `create()` is still in progress in this process, from before the POST
+   * until it returns or throws. `list()` hides them (the reaper must not delete a computer still
+   * waiting for `running` or `/home/user`) and never recovers them.
+   */
   private readonly creating = new Set<string>();
 
   constructor(opts: CelestoProviderOptions) {
@@ -245,31 +249,35 @@ export class CelestoProvider implements SandboxProvider {
       entries.push({ idempotencyKey, intendedName: opts.name, createdAt: new Date().toISOString(), sizeId });
     });
     this.creating.add(idempotencyKey);
-    let id: string;
     try {
-      id = await this.postCreate(idempotencyKey, sizeId);
-    } catch (err) {
-      if (isDefinitiveRejection(err)) {
-        // Definitive rejection: nothing was created
-        await this.mutateRegistry((entries) => {
-          const i = entries.findIndex((e) => e.idempotencyKey === idempotencyKey);
-          if (i >= 0) entries.splice(i, 1);
-        });
+      let id: string;
+      try {
+        id = await this.postCreate(idempotencyKey, sizeId);
+      } catch (err) {
+        if (isDefinitiveRejection(err)) {
+          // Definitive rejection: nothing was created
+          await this.mutateRegistry((entries) => {
+            const i = entries.findIndex((e) => e.idempotencyKey === idempotencyKey);
+            if (i >= 0) entries.splice(i, 1);
+          });
+        }
+        // Otherwise the result is unknown; the entry stays so `list()` can recover the id later
+        throw err;
       }
-      // Otherwise the result is unknown; the entry stays so `list()` can recover the id later
-      throw err;
+      // Once this throws and `creating` drops the key, `list()` shows the computer and the reaper
+      // deletes it as an orphan
+      await this.waitForStatus(id, ["running"], 180_000, `start ${opts.name}`);
+      try {
+        await this.prepareHomeUser(id);
+      } catch (err) {
+        // The caller never learns this id, so nothing else would clean the computer up promptly
+        await this.delete(id).catch(() => {});
+        throw err;
+      }
+      return id;
     } finally {
       this.creating.delete(idempotencyKey);
     }
-    await this.waitForStatus(id, ["running"], 180_000, `start ${opts.name}`);
-    try {
-      await this.prepareHomeUser(id);
-    } catch (err) {
-      // The caller never learns this id, so nothing else would clean the computer up promptly
-      await this.delete(id).catch(() => {});
-      throw err;
-    }
-    return id;
   }
 
   /**
@@ -315,10 +323,14 @@ export class CelestoProvider implements SandboxProvider {
     return toInfo(res.data, entry?.intendedName);
   }
 
-  /** Only computers this Sentinel created, named with their Sentinel names. */
+  /**
+   * Only computers this Sentinel created, named with their Sentinel names. Computers whose
+   * `create()` is still in progress here are left out: the caller does not know the id yet, so the
+   * reaper would take them for orphans.
+   */
   async list(): Promise<SandboxInfo[]> {
     await this.recoverPendingCreates();
-    const entries = this.readRegistry().filter((e) => e.id);
+    const entries = this.readRegistry().filter((e) => e.id && !this.creating.has(e.idempotencyKey));
     if (entries.length === 0) return [];
     const res = await this.request<{ computers?: CelestoComputer[] }>("GET", "/computers");
     const remote = new Map((res.data?.computers ?? []).map((c) => [c.id, c]));
