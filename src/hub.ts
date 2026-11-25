@@ -869,6 +869,8 @@ export class HubServer {
   forwarderTermTimeoutSecs = 10;
   /** How long a woken VM's bridge may take to open. */
   wakeBridgeTimeoutMs = 20_000;
+  /** How long archive or delete waits for a VM's bridge before treating the VM as unreachable. */
+  closeBridgeTimeoutMs = 8_000;
   /** How long a parked VM is kept before its chat becomes read only (Boat drops the disk after 14 days). */
   parkedTtlMs = PARKED_DATA_TTL_MS;
   /** After a parked VM wakes, `all-archived` does not park it again for this long (its watchdog's stale grace). */
@@ -1012,6 +1014,7 @@ export class HubServer {
       this.restoreLiveSandboxes();
       this.restorePendingLaunches();
       this.lifecycle.onParkedHubSandboxGone = (sandboxId) => this.expireParkedSandbox(sandboxId, "gone-remotely");
+      this.lifecycle.onHubSandboxGone = (sandboxId) => this.forgetVanishedSandbox(sandboxId);
     }
   }
 
@@ -2469,6 +2472,12 @@ export class HubServer {
         return;
       }
       if (!pending && (await this.handleParkedThreadCommand(ws, reqId, cmdType, payload, tid))) return;
+      const closes = cmdType === "thread.archive" || cmdType === "thread.delete";
+      if (closes && !pending && this.threadSandboxIsGone(tid)) {
+        // Its VM record is gone (or it never had one): nothing can apply the close, so the Hub drops the chat
+        sendRpcExitSuccess(ws, reqId, { sequence: this.forgetOrphanThread(tid, cmdType) });
+        return;
+      }
       if (BOOKKEEPING_COMMANDS.has(cmdType) && !this.threadVmIsUp(tid)) {
         // Answered now so opening a booting or sleeping chat raises no slow-request warning; the VM
         // gets it once up (for a sleeping chat this starts the wake, as opening it always did)
@@ -2478,7 +2487,11 @@ export class HubServer {
       }
       // Other commands for a booting chat wait for its VM (resolveSandboxForThread)
       const sb = await this.resolveSandboxForThread(tid);
-      const bridge = await this.ensureBridgeOpen(sb);
+      const bridge = closes ? await this.bridgeForClose(sb) : await this.ensureBridgeOpen(sb);
+      if (!bridge) {
+        await this.closeUnreachableThread(ws, reqId, cmdType, payload, tid, sb);
+        return;
+      }
       const nextPayload = await this.replayStagedAttachmentsInPayload(
         sb,
         bridge,
@@ -2966,6 +2979,74 @@ export class HubServer {
       return true;
     }
     return false;
+  }
+
+  /**
+   * True when a chat (not booting) has no VM record to apply a command: bound to a record that no
+   * longer exists, or not bound at all. A VM being destroyed still counts as there (it removes the chat).
+   */
+  private threadSandboxIsGone(threadId: string): boolean {
+    if (this.inFlightSpawns.has(threadId) || this.pendingThreads.has(threadId) || this.expiredThread(threadId)) return false;
+    const sandboxId = this.threadToSandbox.get(threadId);
+    if (!sandboxId) return true;
+    return !this.destroyingSandboxes.has(sandboxId) && !this.state.getHubSandbox(sandboxId);
+  }
+
+  /** Archive or delete of a chat whose VM record is gone: its row, streams and cached copy go. */
+  private forgetOrphanThread(threadId: string, command: string): number {
+    this.threadToSandbox.delete(threadId);
+    this.deleteThreadShell(threadId);
+    this.localThreadSubs.delete(threadId);
+    this.dropProjectionCache(threadId);
+    const sequence = this.state.nextHubSequence();
+    this.broadcastShellItem({ kind: "thread.removed", sequence, location: "active", threadId });
+    console.log(`[hub] chat ${threadId} closed (${command}) with no VM left to apply it`);
+    return sequence;
+  }
+
+  /**
+   * The bridge a close goes through, waited on for `closeBridgeTimeoutMs` only; null when the VM
+   * cannot be reached (its bridge does not open), never for a VM that answers, even with a failure.
+   */
+  private async bridgeForClose(sb: HubSandboxRecord): Promise<HubVmBridge | null> {
+    try {
+      return await this.ensureBridgeOpen(sb, this.closeBridgeTimeoutMs);
+    } catch (err) {
+      console.warn(`[hub] could not reach ${sb.sandboxId} to close a chat: ${redactForLog(err)}`);
+      return null;
+    }
+  }
+
+  /**
+   * Archive or delete of a chat whose VM cannot be reached. With no other open chat on it, the Hub
+   * deletes the VM (like a parked chat's close) and the chat goes with it; otherwise the close fails.
+   */
+  private async closeUnreachableThread(
+    ws: ServerWebSocket<HubWsData>,
+    reqId: string | number,
+    cmdType: string,
+    payload: Record<string, unknown>,
+    threadId: string,
+    sb: HubSandboxRecord,
+  ): Promise<void> {
+    const others = this.openTopLevelThreads(this.state.getHubSandbox(sb.sandboxId) ?? sb, threadId);
+    if (others.length > 0) {
+      this.sendTypedFailure(
+        ws,
+        reqId,
+        "orchestration.dispatchCommand",
+        payload,
+        `This chat's VM cannot be reached, and other chats still run on it. Try again in a moment.`,
+      );
+      return;
+    }
+    console.log(`[hub] chat ${threadId} closed (${cmdType}) while ${sb.sandboxId} cannot be reached; deleting the VM`);
+    await this.destroyHubSandbox(
+      sb.sandboxId,
+      cmdType === "thread.archive" ? "chat-archived-while-unreachable" : "chat-deleted-while-unreachable",
+      { pull: false },
+    );
+    sendRpcExitSuccess(ws, reqId, { sequence: this.state.ensureHub().sequence });
   }
 
   /** Archive or delete of a read-only chat: it leaves the sidebar and the Hub forgets its copy. */
@@ -4312,25 +4393,47 @@ export class HubServer {
     });
   }
 
-  async destroyHubSandbox(sandboxId: string, reason: string): Promise<void> {
+  /** `pull: false` skips the teardown read of provider sign-ins (a VM that cannot be reached). */
+  async destroyHubSandbox(sandboxId: string, reason: string, opts: { pull?: boolean } = {}): Promise<void> {
     const sb = this.state.getHubSandbox(sandboxId);
     if (!sb || this.destroyingSandboxes.has(sandboxId)) return;
     this.destroyingSandboxes.add(sandboxId);
     try {
-      await this.doDestroyHubSandbox(sb, reason);
+      await this.doDestroyHubSandbox(sb, reason, opts.pull !== false);
     } finally {
       this.destroyingSandboxes.delete(sandboxId);
     }
   }
 
-  private async doDestroyHubSandbox(sb: HubSandboxRecord, reason: string): Promise<void> {
+  private async doDestroyHubSandbox(sb: HubSandboxRecord, reason: string, pull: boolean): Promise<void> {
     const sandboxId = sb.sandboxId;
     console.log(`[hub] destroying sandbox ${sandboxId} (project=${sb.project}, reason=${reason})`);
 
     // Best effort, bounded (~10s): the CLI may have refreshed the token since it was captured
-    if (sb.phase === "running") {
+    if (pull && sb.phase === "running") {
       await this.lifecycle.providerSessions.pullBeforeDestroy(sandboxId).catch(() => {});
     }
+    const { klavAgent } = this.forgetHubSandboxLocally(sb, reason);
+
+    if (klavAgent && this.klav) {
+      await this.klav.revokeForSandbox(klavAgent).catch((err) => {
+        console.warn(`[hub] Klav revoke failed for ${klavAgent}:`, err);
+      });
+    }
+
+    this.state.queueDelete(sandboxId, `hub:${reason}`, klavAgent);
+    await this.boat.delete(sandboxId).catch((err) => {
+      console.warn(`[hub] delete failed for ${sandboxId} (queued for reaper):`, err);
+    });
+    void this.lifecycle.reaperTick();
+  }
+
+  /**
+   * The Hub's half of a destroy: forgets the sandbox (bridge, media sockets, routes, wake and settings
+   * state) and removes its chats from the sidebar (`thread.removed`). Klav and Boat are left to the caller.
+   */
+  private forgetHubSandboxLocally(sb: HubSandboxRecord, reason: string): { klavAgent: string | null } {
+    const sandboxId = sb.sandboxId;
     this.lifecycle.providerSessions.forgetSandbox(sandboxId);
     this.providerBook.forgetSandbox(sandboxId);
     this.providerSetupRouter.forgetSandbox(sandboxId);
@@ -4341,12 +4444,15 @@ export class HubServer {
     this.settingsReplays.delete(sandboxId);
     this.replayedSettings.delete(sandboxId);
     this.wakeStatus.delete(sandboxId);
+    this.clearPauseRetry(sandboxId);
+    this.parkCacheMisses.delete(sandboxId);
+    this.unparkedAt.delete(sandboxId);
 
-    // Threads may have been bound while the pull ran
+    // Threads may have been bound while a teardown pull ran
     const current = this.state.getHubSandbox(sandboxId) ?? sb;
     const threadIds = [...current.threadIds];
     const worktreePaths = [...current.worktreePaths];
-    const klavAgent = current.klavAgentName;
+    const klavAgent = current.klavAgentName ?? null;
 
     this.state.removeHubSandbox(sandboxId);
     this.mcp.recordThreadsDestroyed(threadIds, reason);
@@ -4368,18 +4474,30 @@ export class HubServer {
     for (const [attachmentId, owner] of this.attachmentToSandbox) {
       if (owner === sandboxId) this.attachmentToSandbox.delete(attachmentId);
     }
+    return { klavAgent };
+  }
 
-    if (klavAgent && this.klav) {
-      await this.klav.revokeForSandbox(klavAgent).catch((err) => {
-        console.warn(`[hub] Klav revoke failed for ${klavAgent}:`, err);
-      });
+  /**
+   * The reaper found a (not parked) VM Boat no longer lists, e.g. deleted in Boat's UI: its chats
+   * leave the sidebar and the Hub forgets it, as after a destroy. Nothing is left to delete in Boat.
+   */
+  async forgetVanishedSandbox(sandboxId: string): Promise<void> {
+    const sb = this.state.getHubSandbox(sandboxId);
+    if (!sb || this.destroyingSandboxes.has(sandboxId)) return;
+    // A wake or sleep in flight settles it itself (a resume of a missing VM reports its disk gone)
+    if (this.inFlightWakes.has(sandboxId) || this.inFlightSleeps.has(sandboxId)) return;
+    this.destroyingSandboxes.add(sandboxId);
+    try {
+      console.warn(`[hub] sandbox ${sandboxId} (${sb.project}) no longer exists in ${this.boat.name}; removing its chat(s)`);
+      const { klavAgent } = this.forgetHubSandboxLocally(sb, "vanished-remotely");
+      if (klavAgent && this.klav) {
+        await this.klav.revokeForSandbox(klavAgent).catch((err) => {
+          console.warn(`[hub] Klav revoke failed for ${klavAgent}: ${redactForLog(err)}`);
+        });
+      }
+    } finally {
+      this.destroyingSandboxes.delete(sandboxId);
     }
-
-    this.state.queueDelete(sandboxId, `hub:${reason}`, klavAgent);
-    await this.boat.delete(sandboxId).catch((err) => {
-      console.warn(`[hub] delete failed for ${sandboxId} (queued for reaper):`, err);
-    });
-    void this.lifecycle.reaperTick();
   }
 
   async handleWatchdogEvent(payload: WatchdogEventPayload): Promise<void> {
@@ -4435,13 +4553,13 @@ export class HubServer {
     bridge.start();
   }
 
-  private async ensureBridgeOpen(sb: HubSandboxRecord): Promise<HubVmBridge> {
+  private async ensureBridgeOpen(sb: HubSandboxRecord, timeoutMs = 20_000): Promise<HubVmBridge> {
     let bridge = this.bridges.get(sb.sandboxId);
     if (!bridge) {
       this.attachBridge(sb);
       bridge = this.bridges.get(sb.sandboxId)!;
     }
-    await bridge.waitUntilOpen(20_000);
+    await bridge.waitUntilOpen(timeoutMs);
     return bridge;
   }
 
