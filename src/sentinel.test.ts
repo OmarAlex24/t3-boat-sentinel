@@ -285,10 +285,22 @@ describe("Celesto provider config", () => {
       const cfgPath = writeYaml("provider:\n  type: celesto\n");
       const env: Record<string, string> = { ...(process.env as Record<string, string>), SENTINEL_CONFIG: cfgPath, SENTINEL_URL: `http://127.0.0.1:${daemon.port}` };
       delete env.CELESTO_API_KEY;
+      // cwd outside the repo so Bun cannot auto-load a .env that carries CELESTO_API_KEY
       const cli = async (...args: string[]) => {
-        const proc = Bun.spawn([process.execPath, join(import.meta.dir, "index.ts"), ...args], { env, stdout: "pipe", stderr: "pipe" });
-        const [code, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
-        return { code, stderr };
+        const proc = Bun.spawn([process.execPath, join(import.meta.dir, "index.ts"), ...args], {
+          cwd: dirname(cfgPath),
+          env,
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        // A `serve` that did start would never exit on its own
+        const timer = setTimeout(() => proc.kill(), 10_000);
+        try {
+          const [code, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+          return { code, stderr };
+        } finally {
+          clearTimeout(timer);
+        }
       };
       for (const args of [["token", "hub", "x"], ["revoke", "hub"], ["forget-session", "antigravity"]]) {
         const res = await cli(...args);
