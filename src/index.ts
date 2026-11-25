@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  CELESTO_MISSING_KEY_MESSAGE,
   asSandboxProvider,
   createSandboxProvider,
   type LegacyBoatClient,
@@ -191,6 +192,10 @@ async function main(): Promise<void> {
 
   switch (cmd) {
     case "serve": {
+      // The daemon reaches Celesto on its own (reaper, chats), so it needs the key from the start
+      if (config.provider?.type === "celesto" && !config.provider.apiKey) {
+        throw new Error(CELESTO_MISSING_KEY_MESSAGE);
+      }
       const handle = createSentinelServer(config);
       console.log(`[sentinel] listening on http://${handle.server.hostname}:${handle.server.port}`);
       console.log(`[sentinel] control panel: https://${config.controlHost}`);

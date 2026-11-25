@@ -11,12 +11,14 @@
 // 3. Idle detection: reports `event: "idle"` to sentinel (which runs `boat stop`).
 //    If sentinel is unreachable or `inspectShell` fails for > `maxUnreachableSecs`,
 //    falls back to `boat stop self` as a billing backstop.
+//    Hosts without the `boat` CLI (Celesto) have no backstop: the VM keeps running until
+//    sentinel is reachable again and stops it. That is logged once, not on every tick.
 // 4. NEVER modifies or overwrites any saved snapshot!
 
 import { execFile } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { availableParallelism, homedir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 const HOME = homedir();
@@ -49,6 +51,26 @@ const PERSON_EVENTS = [
 
 const config = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
 const log = (...args) => console.log(new Date().toISOString(), "[watchdog]", ...args);
+// Lines that would otherwise repeat every tick while sentinel or T3 is down: at most one per key per window
+const THROTTLE_MS = 5 * 60_000;
+const lastLoggedAt = new Map();
+const logThrottled = (key, ...args) => {
+  const now = Date.now();
+  const last = lastLoggedAt.get(key);
+  if (last !== undefined && now - last < THROTTLE_MS) return;
+  lastLoggedAt.set(key, now);
+  log(...args);
+};
+// `boat stop self` needs the boat CLI, which only Boat VMs have
+const BOAT_BIN = (() => {
+  const ascii = join(HOME, ".ascii", "bin", "boat");
+  if (existsSync(ascii)) return ascii;
+  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+    if (dir && existsSync(join(dir, "boat"))) return join(dir, "boat");
+  }
+  return null;
+})();
+let warnedNoBackstop = false;
 
 let everHadTopLevelThread = existsSync(SAW_THREAD_PATH);
 let allArchivedSince = null;
@@ -227,17 +249,23 @@ async function notifySentinel(event, detail = {}) {
     });
     return res.ok;
   } catch (err) {
-    log(`callback ${event} failed:`, err.message);
+    logThrottled(`callback:${event}`, `callback ${event} failed:`, err.message);
     return false;
   }
 }
 
 function stopSelfBackstop(reason) {
-  log(`backstop stopping self (${reason})`);
+  if (!BOAT_BIN) {
+    if (!warnedNoBackstop) {
+      warnedNoBackstop = true;
+      log(`no boat CLI on this host: cannot stop self (${reason}); the VM keeps running until sentinel stops it`);
+    }
+    return Promise.resolve();
+  }
+  logThrottled(`backstop:${reason}`, `backstop stopping self (${reason})`);
   return new Promise((resolve) => {
-    const boatBin = existsSync(join(HOME, ".ascii", "bin", "boat")) ? join(HOME, ".ascii", "bin", "boat") : "boat";
-    execFile(boatBin, ["stop", "self"], { timeout: 60_000 }, (err) => {
-      if (err) log("boat stop self failed:", err.message);
+    execFile(BOAT_BIN, ["stop", "self"], { timeout: 60_000 }, (err) => {
+      if (err) logThrottled("backstop-failed", "boat stop self failed:", err.message);
       resolve();
     });
   });
@@ -265,7 +293,7 @@ async function tick() {
     shell = await inspectShell();
     shellFailingSince = null;
   } catch (err) {
-    log("t3 shell unavailable:", err.message);
+    logThrottled("shell-unavailable", "t3 shell unavailable:", err.message);
     shellFailingSince ??= now;
     // Billing backstop: if T3 server stays unreachable/incompatible for 20m, stop self
     if (now - shellFailingSince >= MAX_SHELL_FAIL_MS) {
@@ -323,7 +351,7 @@ async function tick() {
 
   const idleSecs = (now - lastActivityAt) / 1000;
   if (idleSecs >= config.sleepAfterSecs) {
-    log(`idle for ${Math.round(idleSecs)}s -> requesting sentinel to stop VM`);
+    logThrottled("idle", `idle for ${Math.round(idleSecs)}s -> requesting sentinel to stop VM`);
     const ok = await notifySentinel("idle", { idleSecs: Math.round(idleSecs) });
     // If sentinel doesn't stop us within 60s (e.g. sentinel offline), stop self as safety net
     if (!ok || idleSecs >= config.sleepAfterSecs + 60) {

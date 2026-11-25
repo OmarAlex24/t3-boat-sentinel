@@ -13,6 +13,7 @@ import type { ProjectConfig, SentinelConfig } from "./config.ts";
 import type { KlavClient } from "./klav.ts";
 import { ProviderSessionStore, STAGED_SESSIONS_DIR } from "./provider-sessions.ts";
 import type { SlotRecord, StateStore } from "./state.ts";
+import { T3ReleaseResolver } from "./t3-release.ts";
 import { ensureT3Project, launchT3Thread, type LaunchThreadOptions } from "./t3rpc.ts";
 
 const SCRIPTS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "scripts");
@@ -54,20 +55,37 @@ export class LifecycleManager {
   private inFlightBakes = new Set<string>();
   private inFlightSpawns = new Set<string>();
   private reaperTimer: ReturnType<typeof setInterval> | null = null;
+  private warnedNoSessionInject = false;
   private bakeTimer: ReturnType<typeof setInterval> | null = null;
 
   private readonly boat: SandboxProvider;
   /** Provider sign-ins synced across chat VMs (`t3.persistProviderSessions`). */
   readonly providerSessions: ProviderSessionStore;
+  /** Exact T3 versions for providers without snapshots (`t3.version: latest`). */
+  private readonly t3Releases: T3ReleaseResolver;
 
   constructor(
     private readonly config: SentinelConfig,
     private readonly state: StateStore,
     provider: SandboxProvider | LegacyBoatClient,
     private readonly klav?: KlavClient,
+    opts: { t3Releases?: T3ReleaseResolver } = {},
   ) {
     this.boat = asSandboxProvider(provider);
     this.providerSessions = new ProviderSessionStore(config, this.boat);
+    this.t3Releases = opts.t3Releases ?? new T3ReleaseResolver();
+  }
+
+  /**
+   * `T3_VERSION` for `provision-base.sh`. Providers with snapshots get `t3.version` unchanged (the
+   * baked image already carries T3). Providers without them install T3 on every VM, so `latest`
+   * becomes an exact version looked up here once, keeping the VM off the rate-limited GitHub API.
+   */
+  async provisionT3Version(): Promise<string> {
+    const version = this.config.t3.version;
+    const supportsSnapshots = hasCapability(this.boat, "snapshots") && typeof this.boat.listSnapshots === "function";
+    if (supportsSnapshots || version !== "latest") return version;
+    return this.t3Releases.resolve(version, this.config.t3.channel);
   }
 
   getProvider(): SandboxProvider {
@@ -233,6 +251,7 @@ export class LifecycleManager {
             perSandboxLlmToken,
             true,
             true,
+            !supportsSnapshots,
           );
 
           const endpoint = await this.boat.exposePort(sandboxId, 3773, {
@@ -862,6 +881,11 @@ export class LifecycleManager {
      * signed in. Never set on wake, where the VM's own copy may be newer.
      */
     injectProviderSessions?: boolean;
+    /**
+     * Fresh VMs on providers without snapshots: install `t3.prepareAcpAgents` / `t3.installProviders`
+     * at boot, since no baked base image carries those runtimes.
+     */
+    installProviderRuntimes?: boolean;
   }): Promise<{
     descriptor?: Record<string, unknown>;
     authSession?: Record<string, unknown>;
@@ -870,7 +894,18 @@ export class LifecycleManager {
     injectedProviderSessions?: string[];
   }> {
     const { sandboxId, watchdogSlotKey, environmentId, label, projectName, project, watchdogSecret, llmToken, mintToken } = opts;
-    const staged = opts.injectProviderSessions ? this.providerSessions.stagedCredentials() : [];
+    // Stored sign-ins are only staged on providers with a file transfer (`download`): elsewhere the
+    // upload would carry the token inside the provider's exec request bodies
+    const canStageSessions = typeof this.boat.download === "function";
+    if (opts.injectProviderSessions && !canStageSessions && this.providerSessions.enabledInstances().length > 0) {
+      if (!this.warnedNoSessionInject) {
+        this.warnedNoSessionInject = true;
+        console.warn(
+          `[sessions] provider ${this.boat.name} has no file download; stored provider sign-ins are not copied into its VMs`,
+        );
+      }
+    }
+    const staged = opts.injectProviderSessions && canStageSessions ? this.providerSessions.stagedCredentials() : [];
     const stagingDirs = [...new Set(staged.map((c) => c.remoteDir))];
     // Staging dirs live under the 0700 ~/.t3-sentinel; provision-base.sh installs the files 0600 and removes them
     const mkdirs = stagingDirs.map((d) => ` && mkdir -p ${d}`).join("");
@@ -964,18 +999,24 @@ export class LifecycleManager {
     }
 
     const envVars = [
-      `T3_VERSION=${shellQuote(this.config.t3.version)}`,
+      `T3_VERSION=${shellQuote(await this.provisionT3Version())}`,
       `T3_CHANNEL=${shellQuote(this.config.t3.channel)}`,
       `SLOT_ENV_ID=${shellQuote(environmentId)}`,
       `SLOT_LABEL=${shellQuote(label)}`,
       `MINT_UPSTREAM_TOKEN=${mintToken ? "1" : "0"}`,
     ];
+    const bootAcpAgents = opts.installProviderRuntimes ? (this.config.t3.prepareAcpAgents ?? []) : [];
+    const bootProviders = opts.installProviderRuntimes ? (this.config.t3.installProviders ?? []) : [];
+    if (bootAcpAgents.length > 0) envVars.push(`T3_PREPARE_ACP_AGENTS=${shellQuote(bootAcpAgents.join(","))}`);
+    if (bootProviders.length > 0) envVars.push(`T3_INSTALL_PROVIDERS=${shellQuote(bootProviders.join(","))}`);
     if (project && project.registerProject !== false) {
       envVars.push(`PROJECT_WORKDIR=${shellQuote(project.workdir)}`);
       envVars.push(`PROJECT_TITLE=${shellQuote(projectName)}`);
     }
 
-    const out = await this.boat.execOk(sandboxId, `${envVars.join(" ")} bash ~/.t3-sentinel/provision-base.sh`, 300);
+    // Runtime installs at boot can take minutes (Antigravity validation alone up to 90s)
+    const provisionTimeout = bootAcpAgents.length > 0 || bootProviders.length > 0 ? 900 : 300;
+    const out = await this.boat.execOk(sandboxId, `${envVars.join(" ")} bash ~/.t3-sentinel/provision-base.sh`, provisionTimeout);
     const parsed = lastJsonLine<{
       descriptor?: Record<string, unknown>;
       authSession?: Record<string, unknown>;
@@ -999,6 +1040,7 @@ export class LifecycleManager {
     llmToken: string | null,
     mintToken: boolean,
     injectProviderSessions = false,
+    installProviderRuntimes = false,
   ): Promise<void> {
     const slot = this.state.getSlot(slotName)!;
     const parsed = await this.provisionStandaloneVm({
@@ -1012,6 +1054,7 @@ export class LifecycleManager {
       llmToken,
       mintToken,
       injectProviderSessions,
+      installProviderRuntimes,
     });
 
     this.state.updateSlot(slotName, (s) => {

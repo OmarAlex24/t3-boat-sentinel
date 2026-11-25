@@ -115,6 +115,19 @@ export type SandboxProviderConfig =
       options?: Record<string, unknown>;
       sizeMap?: Record<string, unknown>;
       sentinelLabel?: string;
+    }
+  | {
+      /** Celesto (celesto.ai) cloud computers over the REST API. No snapshots: T3 installs at boot. */
+      type: "celesto";
+      /** Resolved API key (`provider.apiKey`, else env `CELESTO_API_KEY`); empty when neither is set. */
+      apiKey: string;
+      baseUrl?: string;
+      /** Computer template (default "coding-agent"). */
+      templateId?: string;
+      /** User T3 and every exec run as (default "ohm"; never root, Claude Code refuses root). */
+      user?: string;
+      /** Extra Sentinel size name -> Celesto `size_id` mappings (defaults: default->standard, medium/large->large). */
+      sizeMap?: Record<string, string>;
     };
 
 export interface CloudflareAccessConfig {
@@ -338,6 +351,25 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
         options: parsed.provider.options,
         sizeMap: parsed.provider.sizeMap,
         sentinelLabel: parsed.provider.sentinelLabel,
+      };
+    } else if (parsed.provider.type === "celesto") {
+      const raw = parsed.provider as Record<string, unknown>;
+      const configured = typeof raw.apiKey === "string" ? raw.apiKey.trim() : "";
+      // An unset `${VAR}` placeholder stays literal after expansion: treat it as missing
+      // May stay empty: CLI commands that only call the daemon need no key. `serve` and the first
+      // Celesto API call fail clearly without one.
+      const apiKey = configured && !/^\$\{[A-Z0-9_]+\}$/.test(configured) ? configured : (process.env.CELESTO_API_KEY ?? "").trim();
+      const sizeMap =
+        raw.sizeMap && typeof raw.sizeMap === "object"
+          ? Object.fromEntries(Object.entries(raw.sizeMap as Record<string, unknown>).map(([k, v]) => [k, String(v)]))
+          : undefined;
+      provider = {
+        type: "celesto",
+        apiKey,
+        ...(typeof raw.baseUrl === "string" && raw.baseUrl.trim() ? { baseUrl: raw.baseUrl.trim() } : {}),
+        ...(typeof raw.templateId === "string" && raw.templateId.trim() ? { templateId: raw.templateId.trim() } : {}),
+        ...(typeof raw.user === "string" && raw.user.trim() ? { user: raw.user.trim() } : {}),
+        ...(sizeMap ? { sizeMap } : {}),
       };
     } else {
       provider = { type: "boat" };

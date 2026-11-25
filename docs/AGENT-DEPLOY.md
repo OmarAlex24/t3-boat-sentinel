@@ -45,6 +45,7 @@ bun run sentinel init         # creates sentinel.yaml (0600) with random control
 ```
 - If using Boat, have the user complete `boat onboard` once on the host.
 - If using `@opencoredev/sandbox-sdk`, run `bun add @opencoredev/sandbox-sdk` and set `provider: { type: sandbox-sdk, adapter: <name>, options: {} }` in `sentinel.yaml`.
+- If using Celesto, set `provider: { type: celesto }` and `CELESTO_API_KEY` in sentinel's environment, use a paid plan (`standard` or larger), and read the limits in [Celesto](../README.md#celesto) (no snapshots, uploads inside exec requests, public URLs, no sign-in persistence).
 - Recommended `sentinel.yaml` defaults:
   - `hub: { host: boat.<domain>, label: Boat, maxSandboxes: 20 }`
   - `slots: []`

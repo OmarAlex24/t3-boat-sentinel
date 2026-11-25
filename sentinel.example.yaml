@@ -31,6 +31,17 @@ hub:
 #   type: sandbox-sdk
 #   adapter: daytona
 #   options: {}
+#
+# Or run Hub chats on Celesto (celesto.ai) cloud computers. No snapshots: T3 installs at every boot.
+# Uploads (boot secrets included) travel inside Celesto exec requests, published URLs are public
+# (T3's bearer auth is the only gate) and provider sign-ins are not kept. The Free plan (nano only)
+# is too small for T3. Idle computers keep billing while sentinel is down. See README "Celesto".
+# provider:
+#   type: celesto
+#   apiKey: ${CELESTO_API_KEY}   # optional; falls back to the CELESTO_API_KEY environment variable
+#   templateId: coding-agent
+#   user: ohm
+#   sizeMap: { medium: standard }  # optional; default -> standard, medium/large -> large
 
 # Optional: Origin-side link security hardening (in addition to Cloudflare Zero Trust edge policies).
 # Verifies `Cf-Access-Jwt-Assertion` (RS256 JWKS) on `controlHost` (exempts `/internal/watchdog`, `/health`, and loopback CLI).
