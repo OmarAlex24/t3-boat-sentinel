@@ -29,6 +29,7 @@ import type { ProjectConfig, ProjectKlavConfig, SentinelConfig } from "./config.
 import { HubMcpHandler, formatRpcFailure, type HubSandboxPhase } from "./hub-mcp.ts";
 import { HubShellStore } from "./hub-shell-store.ts";
 import { repositoryIdentityFor } from "./repository-identity.ts";
+import { defaultBranchOfRefs, fallbackVcsRefs, isVcsRefsResult, templateVcsRefs } from "./vcs-refs.ts";
 import {
   ATTACHMENT_UPLOAD_ROUTE_PREFIX,
   ATTACHMENT_UPLOAD_URL_TTL_MS,
@@ -2592,21 +2593,14 @@ export class HubServer {
       (cwd ? this.projectKeyFromWorkdir(cwd) : null);
 
     if (tag === "vcs.listRefs") {
-      const cached = projKey ? this.state.getHub()?.projectTemplates[projKey]?.vcsRefs : undefined;
-      if (cached) {
-        sendRpcExitSuccess(ws, reqId, cached);
+      const template = projKey ? this.state.getHub()?.projectTemplates[projKey] : undefined;
+      // A template stored by an older Hub may no longer have the shape the app decodes
+      if (isVcsRefsResult(template?.vcsRefs)) {
+        sendRpcExitSuccess(ws, reqId, template.vcsRefs);
         return;
       }
-      sendRpcExitSuccess(ws, reqId, {
-        isRepo: true,
-        hasPrimaryRemote: true,
-        nextCursor: null,
-        totalCount: 2,
-        refs: [
-          { name: "main", current: true, isDefault: true, isRemote: false, worktreePath: null },
-          { name: "origin/main", current: false, isDefault: true, isRemote: true, remoteName: "origin", worktreePath: null },
-        ],
-      });
+      const project = projKey ? this.state.getAllProjects(this.config)[projKey] : undefined;
+      sendRpcExitSuccess(ws, reqId, fallbackVcsRefs(template?.defaultBranch ?? null, !!project?.repo));
       return;
     }
 
@@ -3902,16 +3896,19 @@ export class HubServer {
     const providers = templates.serverConfig?.providers;
     const live = this.state.getHubSandbox(sandbox.sandboxId);
     if (live && Array.isArray(providers)) this.observeProviderSessions(live, providers);
-    // Also harvest vcsRefs for this project if missing
+    // Refresh this project's refs from the VM's own T3 (newer than a bake's), keeping what every chat shares
     const project = this.state.getAllProjects(this.config)[sandbox.project];
     const bridge = this.bridges.get(sandbox.sandboxId);
-    if (project && bridge?.isOpen() && !this.state.getHub()?.projectTemplates[sandbox.project]?.vcsRefs) {
+    if (project && bridge?.isOpen()) {
       void bridge.callUnary("vcs.listRefs", { cwd: project.workdir }).then((res) => {
-        if (res._tag === "Success" && res.value) {
+        const vcsRefs = res._tag === "Success" ? templateVcsRefs(res.value) : null;
+        if (vcsRefs) {
+          const defaultBranch = defaultBranchOfRefs(vcsRefs);
           this.state.updateHub((h) => {
             h.projectTemplates[sandbox.project] = {
               ...(h.projectTemplates[sandbox.project] ?? {}),
-              vcsRefs: res.value,
+              vcsRefs,
+              ...(defaultBranch ? { defaultBranch } : {}),
             };
           });
         }

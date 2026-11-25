@@ -22,6 +22,7 @@ import { LifecycleManager } from "./lifecycle.ts";
 import { formatRpcFailure } from "./hub-mcp.ts";
 import { buildPlaceholderThread, failPlaceholderThread, placeholderInputFrom } from "./hub-placeholder.ts";
 import { chatThreadIdOf, threadGoneError } from "./hub.ts";
+import { defaultBranchOfRefs, fallbackVcsRefs, templateVcsRefs } from "./vcs-refs.ts";
 import { normalizeGitRemoteUrl, repositoryIdentityFor } from "./repository-identity.ts";
 import { REPO_SYNC_MARKER, buildRepoSyncScript, parseRepoSyncOutput } from "./repo-sync.ts";
 import {
@@ -552,6 +553,61 @@ describe("LifecycleManager hardening", () => {
     expect(bakeScript()).not.toContain("T3_PREPARE_ACP_AGENTS");
     expect(bakeScript()).not.toContain("T3_INSTALL_PROVIDERS");
     expect(settingsUploads().map((u) => u.local)).toEqual([settingsFile, settingsFile]);
+  });
+
+  test("project bakes record the project as the bake VM's T3 reports it: shell row, refs and default branch", async () => {
+    const config = makeTestConfig();
+    const state = new StateStore(config.stateDir, config);
+    state.ensureHub("Boat", Object.keys(state.getAllProjects(config)));
+    const boat = new MockBoat();
+    const workdir = "/home/user/my-app";
+    const identity = repositoryIdentityFor("git@github.com:acme/my-app.git", workdir);
+    const projectShell = {
+      id: "vm-project-1",
+      title: "my-app",
+      workspaceRoot: workdir,
+      repositoryIdentity: identity,
+      defaultModelSelection: null,
+      scripts: [],
+      createdAt: "2026-11-25T00:00:00.000Z",
+      updatedAt: "2026-11-25T00:00:00.000Z",
+      deletedAt: null,
+    };
+    const vcsRefs = {
+      isRepo: true,
+      hasPrimaryRemote: true,
+      nextCursor: null,
+      totalCount: 3,
+      refs: [
+        { name: "master", current: true, isDefault: true, isRemote: false, worktreePath: null },
+        { name: "release", current: false, isDefault: false, isRemote: false, worktreePath: null },
+        { name: "origin/master", current: false, isDefault: true, isRemote: true, remoteName: "origin", worktreePath: null },
+      ],
+    };
+    boat.execHook = (_id, script) =>
+      script.includes("BAKE_CLEAN=1") && script.includes("BAKE_PROJECT_WORKDIR=")
+        ? Promise.resolve({ exitCode: 0, stdout: JSON.stringify({ t3Version: "t3 v0.1.0", projectShell, vcsRefs, defaultBranch: "master", cleaned: true }), stderr: "" })
+        : undefined;
+    const lifecycle = new LifecycleManager(config, state, boat);
+    const bakeScript = () => boat.execScripts.filter((s) => s.includes("BAKE_CLEAN=1")).at(-1) ?? "";
+
+    await lifecycle.bake("base");
+    expect(bakeScript()).not.toContain("BAKE_PROJECT_WORKDIR");
+    expect(state.getHub()!.projectTemplates["my-app"]).toBeUndefined();
+
+    await lifecycle.bake("my-app");
+    expect(bakeScript()).toContain(`BAKE_PROJECT_WORKDIR='${workdir}'`);
+    // A clean clone's refs: the bake's local default branch is kept, other local branches are not
+    expect(state.getHub()!.projectTemplates["my-app"]).toEqual({ shell: projectShell, vcsRefs: templateVcsRefs(vcsRefs), defaultBranch: "master" });
+    expect(((state.getHub()!.projectTemplates["my-app"]!.vcsRefs as { refs: Array<{ name: string }> }).refs).map((r) => r.name)).toEqual([
+      "master",
+      "origin/master",
+    ]);
+    expect(defaultBranchOfRefs(vcsRefs)).toBe("master");
+    if (t3Contracts) {
+      expect(t3Contracts.decodeWith("OrchestrationProjectShell", projectShell)).toEqual({ ok: true });
+      expect(t3Contracts.decodeSuccess("vcs.listRefs", vcsRefs)).toEqual({ ok: true });
+    }
   });
 
   test("concurrent spawns reserve distinct slots and never clobber an occupied slot unless replace=true", async () => {
@@ -5261,6 +5317,84 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     const report = (failures: Failure[]) =>
       failures.map((f) => `${f.scenario} ${f.tag}: ${f.error.replace(/\s+/g, " ").slice(0, 400)} <- ${JSON.stringify(f.value)?.slice(0, 300)}`);
 
+    test("Boat projects: repository identity and refs from the repo URL, the bake, or a chat VM's T3", async () => {
+      const vm = startFakeVmT3Server("vm-audit-repo");
+      cleanups.push(() => vm.server.stop(true));
+      const repo = "https://github.com/OmarAlex24/webservice_panel.git";
+      const { cfg, handle } = await startHubWithVm(vm, "t3-sentinel-hub-audit-repo-", {
+        patchConfig: (c) => ({ ...c, projects: { ...c.projects, "my-app": { ...c.projects["my-app"], repo } } }),
+      });
+      const client = await connectHubClient(handle, cfg);
+      const a = auditor(client, "repo");
+      const shellProject = async () => {
+        const shell = await a.call("orchestration.subscribeShell", {});
+        expect(shell!.values![0].kind).toBe("snapshot");
+        return (shell!.values![0].snapshot.projects as Array<Record<string, any>>).find((p) => p.workspaceRoot === cwd)!;
+      };
+
+      // No template: the identity a T3 server derives from this remote, so the app offers "Run on → Boat"
+      // for a local checkout of the same repo (matched by canonicalKey, lower case)
+      const derived = await shellProject();
+      expect(derived.repositoryIdentity).toEqual({
+        canonicalKey: "github.com/omaralex24/webservice_panel",
+        locator: { source: "git-remote", remoteName: "origin", remoteUrl: repo },
+        rootPath: cwd,
+        displayName: "OmarAlex24/webservice_panel",
+        provider: "github",
+        owner: "OmarAlex24",
+        name: "webservice_panel",
+      });
+      expect(derived.repositoryIdentity.canonicalKey).toBe(normalizeGitRemoteUrl("git@github.com:OmarAlex24/webservice_panel.git"));
+
+      // No refs listed yet: an empty, schema-valid list rather than a guessed `main`
+      const none = await a.call("vcs.listRefs", { cwd });
+      expect(none!.exit!.value).toEqual({ isRepo: true, hasPrimaryRemote: true, nextCursor: null, totalCount: 0, refs: [] });
+
+      // Refs an older Hub stored in a shape the app no longer decodes are not served
+      handle.state.updateHub((h) => {
+        h.projectTemplates["my-app"] = { vcsRefs: { branches: [{ name: "main" }] } };
+      });
+      expect((await a.call("vcs.listRefs", { cwd }))!.exit!.value.refs).toEqual([]);
+
+      // The bake recorded the default branch (`origin/HEAD`): that branch, locally and on origin
+      handle.state.updateHub((h) => {
+        h.projectTemplates["my-app"] = { defaultBranch: "master" };
+      });
+      const fromBranch = await a.call("vcs.listRefs", { cwd });
+      expect(fromBranch!.exit!.value.refs.map((r: { name: string; isDefault: boolean }) => [r.name, r.isDefault])).toEqual([
+        ["master", true],
+        ["origin/master", true],
+      ]);
+
+      // Captured by the bake or a chat VM: the VM's own answers, as they are
+      const capturedRefs = {
+        isRepo: true,
+        hasPrimaryRemote: true,
+        nextCursor: null,
+        totalCount: 2,
+        refs: [
+          { name: "master", current: true, isDefault: true, isRemote: false, worktreePath: null },
+          { name: "origin/master", current: false, isDefault: true, isRemote: true, remoteName: "origin", worktreePath: null },
+        ],
+      };
+      const capturedIdentity = repositoryIdentityFor("git@github.com:OmarAlex24/webservice_panel.git", cwd);
+      handle.state.updateHub((h) => {
+        h.projectTemplates["my-app"] = {
+          shell: { ...derived, id: "vm-project", title: "webservice_panel", repositoryIdentity: capturedIdentity },
+          vcsRefs: capturedRefs,
+          defaultBranch: "master",
+        };
+      });
+      expect((await a.call("vcs.listRefs", { cwd }))!.exit!.value).toEqual(capturedRefs);
+      const captured = await shellProject();
+      expect(captured).toMatchObject({ id: derived.id, title: "my-app", workspaceRoot: cwd, repositoryIdentity: capturedIdentity });
+      if (t3Contracts) {
+        expect(t3Contracts.decodeWith("OrchestrationProjectShell", derived)).toEqual({ ok: true });
+        expect(t3Contracts.decodeWith("OrchestrationProjectShell", captured)).toEqual({ ok: true });
+      }
+      expect(report(a.failures)).toEqual([]);
+    }, 20_000);
+
     test("environment RPCs with no VM: server config, lifecycle, auth access, shell, terminals, clones, workspace fallbacks", async () => {
       const vm = startFakeVmT3Server("vm-audit-env");
       cleanups.push(() => vm.server.stop(true));
@@ -5299,9 +5433,9 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       await a.call("server.getSettings", {});
       await a.call("server.probe", {});
       await a.call("server.updateSettings", { patch: {} });
+      // No bake or VM has listed this project's refs, and it has no repo: no refs, never a guessed `main`
       const refs = await a.call("vcs.listRefs", { cwd });
-      expect(refs!.exit!.value).toMatchObject({ isRepo: true, hasPrimaryRemote: true, totalCount: 2 });
-      expect(refs!.exit!.value.refs.map((r: { name: string }) => r.name)).toEqual(["main", "origin/main"]);
+      expect(refs!.exit!.value).toEqual({ isRepo: true, hasPrimaryRemote: false, nextCursor: null, totalCount: 0, refs: [] });
       await a.call("projects.listEntries", { cwd });
       await a.call("projects.searchEntries", { cwd, query: "a", limit: 10 });
       expect((await a.call("projects.listIgnoredFiles", { cwd }))!.exit!.value).toEqual({ files: [], truncated: false });
@@ -5844,6 +5978,39 @@ describe("repository identity of Boat projects (T3's RepositoryIdentityResolver)
     expect(identity.locator).toEqual({ source: "git-remote", remoteName: "origin", remoteUrl: "https://github.com/acme/app.git" });
     expect(JSON.stringify(identity)).not.toContain("SECRET");
     expect(identity.canonicalKey).toBe("github.com/acme/app");
+  });
+
+  test("the fallback refs never guess a branch, and decode with the app's schema", () => {
+    expect(fallbackVcsRefs(null, true)).toEqual({ isRepo: true, hasPrimaryRemote: true, nextCursor: null, totalCount: 0, refs: [] });
+    expect((fallbackVcsRefs("master", true).refs as Array<{ name: string }>).map((r) => r.name)).toEqual(["master", "origin/master"]);
+    expect((fallbackVcsRefs("trunk", false).refs as Array<{ name: string }>).map((r) => r.name)).toEqual(["trunk"]);
+    expect(defaultBranchOfRefs(fallbackVcsRefs("master", true))).toBe("master");
+    // A chat VM's refs as a template: no chat branches, worktrees or other chat's current branch
+    const vmRefs = {
+      isRepo: true,
+      hasPrimaryRemote: true,
+      nextCursor: 100,
+      totalCount: 4,
+      refs: [
+        { name: "t3/feature", current: true, isDefault: false, isRemote: false, worktreePath: "/home/user/.t3/worktrees/x" },
+        { name: "master", current: false, isDefault: true, isRemote: false, worktreePath: "/home/user/app" },
+        { name: "origin/master", current: false, isDefault: true, isRemote: true, remoteName: "origin", worktreePath: null },
+        { name: "origin/dev", current: false, isDefault: false, isRemote: true, remoteName: "origin", worktreePath: null },
+      ],
+    };
+    const template = templateVcsRefs(vmRefs)!;
+    expect(template).toMatchObject({ nextCursor: null, totalCount: 3 });
+    expect((template.refs as Array<Record<string, unknown>>).map((r) => [r.name, r.current, r.worktreePath])).toEqual([
+      ["master", true, null],
+      ["origin/master", false, null],
+      ["origin/dev", false, null],
+    ]);
+    expect(templateVcsRefs({ branches: ["main"] })).toBeNull();
+    if (t3Contracts) expect(t3Contracts.decodeSuccess("vcs.listRefs", template)).toEqual({ ok: true });
+    if (!t3Contracts) return;
+    for (const refs of [fallbackVcsRefs(null, true), fallbackVcsRefs("master", true), fallbackVcsRefs("trunk", false)]) {
+      expect(t3Contracts.decodeSuccess("vcs.listRefs", refs)).toEqual({ ok: true });
+    }
   });
 
   (t3Contracts ? test : test.skip)("canonicalKey and remote parsing match the T3 app's own functions", () => {
