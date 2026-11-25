@@ -24,6 +24,7 @@ import type { SlotRecord, StateStore } from "./state.ts";
 import { T3ReleaseResolver } from "./t3-release.ts";
 import { ensureT3Project, launchT3Thread, type LaunchThreadOptions } from "./t3rpc.ts";
 import { templateVcsRefs } from "./vcs-refs.ts";
+import { BAKE_STEPS, formatElapsed, type BakeStep } from "./bake-progress.ts";
 
 const SCRIPTS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "scripts");
 const PROVISION_SCRIPT = join(SCRIPTS_DIR, "provision-base.sh");
@@ -622,7 +623,12 @@ export class LifecycleManager {
    */
   async bake(
     target: string,
-    opts?: { t3Version?: string; t3Channel?: "stable" | "nightly" },
+    opts?: {
+      t3Version?: string;
+      t3Channel?: "stable" | "nightly";
+      /** Called as each step starts; a throwing listener never fails the bake. */
+      onProgress?: (step: BakeStep) => void;
+    },
   ): Promise<{ snapshot: string; t3Version: string }> {
     if (!hasCapability(this.boat, "snapshots") || !this.boat.saveSnapshot || !this.boat.listSnapshots) {
       throw new Error(`Provider "${this.boat.name}" does not support named snapshots (bake is unavailable).`);
@@ -652,12 +658,42 @@ export class LifecycleManager {
       fromSnapshot = this.config.boat.baseSnapshot;
     }
 
+    // One `[bake]` line per finished step, with its duration and the bake's total so far
+    const bakeStartedAt = Date.now();
+    let current: { step: BakeStep; at: number } | null = null;
+    const endStep = (outcome: "done" | "failed") => {
+      if (!current) return;
+      const now = Date.now();
+      console.log(
+        `[bake] ${target}: ${current.step} (${BAKE_STEPS[current.step].label}) ${outcome} in ${formatElapsed(now - current.at)}` +
+          ` · total ${formatElapsed(now - bakeStartedAt)}`,
+      );
+      current = null;
+    };
+    const beginStep = (step: BakeStep) => {
+      endStep("done");
+      current = { step, at: Date.now() };
+      try {
+        opts?.onProgress?.(step);
+      } catch (err) {
+        console.warn(`[bake] ${target}: progress listener failed:`, err);
+      }
+    };
+
     const tempName = `${this.config.boat.sandboxPrefix}bake-${target}-${Date.now().toString(36)}`;
     console.log(`[bake] creating temp VM ${tempName} (from=${fromSnapshot ?? "fresh-ubuntu"}) -> target snapshot "${snapshotName}"`);
-    const tempId = await this.boat.create({ name: tempName, size, fromSnapshot });
+    beginStep("create");
+    let tempId: string;
+    try {
+      tempId = await this.boat.create({ name: tempName, size, fromSnapshot });
+    } catch (err) {
+      endStep("failed");
+      throw err;
+    }
     this.inFlightBakes.add(tempId);
 
     try {
+      beginStep("upload");
       await this.boat.execOk(tempId, "mkdir -p ~/.t3-sentinel && chmod 700 ~/.t3-sentinel", 30);
       await this.boat.upload(tempId, PROVISION_SCRIPT, "~/.t3-sentinel/provision-base.sh");
       await this.boat.upload(tempId, WATCHDOG_SCRIPT, "~/.t3-sentinel/watchdog.mjs");
@@ -679,6 +715,7 @@ export class LifecycleManager {
         await this.boat.upload(tempId, this.config.klav.skillPath, "~/.claude/skills/klav/SKILL.md");
       }
 
+      if ((isBase && this.config.boat.baseBakeCmd) || project?.bakeCmd) beginStep("install");
       if (isBase && this.config.boat.baseBakeCmd) {
         console.log(`[bake] running baseBakeCmd...`);
         await this.boat.execOk(tempId, this.config.boat.baseBakeCmd, 600);
@@ -689,6 +726,7 @@ export class LifecycleManager {
         await this.boat.execOk(tempId, project.bakeCmd, 900);
       }
 
+      beginStep("verify");
       // Upload the settings template for every bake so T3 runs with the real providerInstances: base bakes need it
       // for `prepareAcpAgents` / `installProviders`, and project bakes would otherwise re-probe without those
       // instances and leave the provider status caches inherited from base-t3 stale in the new snapshot.
@@ -752,18 +790,22 @@ export class LifecycleManager {
       }
 
       if (hasCapability(this.boat, "pause") && this.boat.pause) {
+        beginStep("stop");
         await this.boat.pause(tempId);
         // `boat stop` transitions through `archiving` before reaching `stopped`; wait until snapshotable.
         await this.waitUntilStopped(tempId, 180_000);
       }
       console.log(`[bake] saving immutable snapshot "${snapshotName}"...`);
+      beginStep("save");
       await this.boat.saveSnapshot(tempId, snapshotName);
+      endStep("done");
 
       const t3Version = parsed.t3Version ?? "unknown";
       this.state.setBake(target, { snapshot: snapshotName, t3Version, bakedAt: new Date().toISOString() });
       console.log(`[bake] snapshot "${snapshotName}" ready (${t3Version})`);
       return { snapshot: snapshotName, t3Version };
     } finally {
+      endStep("failed");
       this.inFlightBakes.delete(tempId);
       this.state.queueDelete(tempId, `bake-temp:${target}`);
       console.log(`[bake] deleting temporary VM ${tempId}`);

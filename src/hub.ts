@@ -95,6 +95,7 @@ import {
   type HubWakeListener,
 } from "./hub-wake.ts";
 import type { LifecycleManager, WatchdogEventPayload } from "./lifecycle.ts";
+import { PROJECT_CLONE_DETAIL_MAX, bakeProgress, type BakeStep } from "./bake-progress.ts";
 import {
   buildAutoProjectConfig,
   countsTowardHubLimit,
@@ -318,6 +319,16 @@ interface ProjectCloneSnapshotState {
   startedAt: string;
   endedAt: string | null;
   sequence: number;
+}
+
+/** One background bake behind a clone snapshot; only the run in `projectCloneRuns` may write its snapshot. */
+interface ProjectCloneRun {
+  projectKey: string;
+  ticker: ReturnType<typeof setInterval> | null;
+  step: BakeStep | null;
+  stepStartedAt: number;
+  stage: ProjectCloneSnapshotState["stage"];
+  percent: number;
 }
 
 /**
@@ -900,6 +911,12 @@ export class HubServer {
     Set<{ ws: ServerWebSocket<HubWsData>; reqKey: string; reqId: string | number }>
   >();
   private readonly activeProjectClones = new Map<string, ProjectCloneSnapshotState>();
+  /** The live bake run of each clone, by projectId. A replaced or finished run can no longer write. */
+  private readonly projectCloneRuns = new Map<string, ProjectCloneRun>();
+  /** Hub-wide, like T3's own clone tracker: a clone's `sequence` never goes back, across retries too. */
+  private projectCloneSequence = 0;
+  /** How often a running clone's elapsed time is refreshed in T3 (tests shorten it). */
+  projectCloneTickMs = 5_000;
   private readonly destroyingSandboxes = new Set<string>();
   /** Self-update rounds queued or running, by target version: a request for one of them joins it. */
   private readonly selfUpdateRuns = new Map<string, SelfUpdateRun>();
@@ -1100,6 +1117,7 @@ export class HubServer {
     this.shellStore.flush();
     for (const timer of this.pauseRetries.values()) clearTimeout(timer);
     this.pauseRetries.clear();
+    for (const run of this.projectCloneRuns.values()) this.stopProjectCloneTicker(run);
     for (const bridge of this.bridges.values()) {
       bridge.stop();
     }
@@ -5167,74 +5185,98 @@ export class HubServer {
     }
   }
 
+  private stopProjectCloneTicker(run: ProjectCloneRun): void {
+    if (run.ticker) clearInterval(run.ticker);
+    run.ticker = null;
+  }
+
   private startBackgroundProjectBake(
     projectId: string,
     projectKey: string,
     remoteUrl: string,
     destinationPath: string,
   ): void {
+    const previous = this.projectCloneRuns.get(projectId);
+    if (previous) this.stopProjectCloneTicker(previous);
+    const run: ProjectCloneRun = { projectKey, ticker: null, step: null, stepStartedAt: 0, stage: "connecting", percent: 0 };
+    this.projectCloneRuns.set(projectId, run);
     const startedAt = new Date().toISOString();
-    let seq = 1;
-    this.activeProjectClones.set(projectId, {
-      projectId,
-      remoteUrl,
-      destinationPath,
-      repository: null,
+    const write = (
+      next: Pick<ProjectCloneSnapshotState, "phase" | "stage" | "percent" | "detail" | "error" | "endedAt">,
+    ): boolean => {
+      if (this.projectCloneRuns.get(projectId) !== run) return false;
+      this.activeProjectClones.set(projectId, {
+        projectId,
+        remoteUrl,
+        destinationPath,
+        repository: null,
+        ...next,
+        startedAt,
+        sequence: ++this.projectCloneSequence,
+      });
+      this.broadcastProjectClones();
+      return true;
+    };
+    const showStep = () => {
+      if (!run.step) return;
+      const p = bakeProgress(run.step, Date.now() - run.stepStartedAt);
+      run.stage = p.stage;
+      run.percent = Math.max(run.percent, p.percent);
+      write({ phase: "running", stage: p.stage, percent: run.percent, detail: p.detail, error: null, endedAt: null });
+    };
+
+    write({
       phase: "running",
-      stage: "receiving",
-      percent: 25,
-      detail: `Baking immutable Boat snapshot env-${projectKey}...`,
+      stage: "connecting",
+      percent: 0,
+      detail: `Preparing Boat snapshot env-${projectKey}`.slice(0, PROJECT_CLONE_DETAIL_MAX),
       error: null,
-      startedAt,
       endedAt: null,
-      sequence: seq,
     });
-    this.broadcastProjectClones();
+    run.ticker = setInterval(showStep, this.projectCloneTickMs);
 
     void this.lifecycle
-      .bake(projectKey)
-      .then((res) => {
-        this.activeProjectClones.set(projectId, {
-          projectId,
-          remoteUrl,
-          destinationPath,
-          repository: null,
-          phase: "done",
-          stage: "checkout",
-          percent: 100,
-          detail: `Snapshot ${res.snapshot} ready`,
-          error: null,
-          startedAt,
-          endedAt: new Date().toISOString(),
-          sequence: ++seq,
-        });
-        this.broadcastProjectClones();
-        setTimeout(() => {
-          if (this.activeProjectClones.get(projectId)?.phase === "done") {
-            this.activeProjectClones.delete(projectId);
-            this.broadcastProjectClones();
-          }
-        }, 5_000);
+      .bake(projectKey, {
+        onProgress: (step) => {
+          run.step = step;
+          run.stepStartedAt = Date.now();
+          showStep();
+        },
       })
-      .catch((err) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[hub] background bake failed for "${projectKey}":`, msg);
-        this.activeProjectClones.set(projectId, {
-          projectId,
-          remoteUrl,
-          destinationPath,
-          repository: null,
-          phase: "failed",
-          stage: "receiving",
-          percent: null,
-          detail: null,
-          error: msg.slice(0, 1000),
-          startedAt,
-          endedAt: new Date().toISOString(),
-          sequence: ++seq,
-        });
-        this.broadcastProjectClones();
-      });
+      .then(
+        (res) => {
+          this.stopProjectCloneTicker(run);
+          write({
+            phase: "done",
+            stage: "checkout",
+            percent: 100,
+            detail: `Snapshot ${res.snapshot} ready`.slice(0, PROJECT_CLONE_DETAIL_MAX),
+            error: null,
+            endedAt: new Date().toISOString(),
+          });
+          setTimeout(() => {
+            if (this.projectCloneRuns.get(projectId) !== run) return;
+            this.projectCloneRuns.delete(projectId);
+            if (this.activeProjectClones.get(projectId)?.phase === "done") {
+              this.activeProjectClones.delete(projectId);
+              this.broadcastProjectClones();
+            }
+          }, 5_000);
+        },
+        (err) => {
+          this.stopProjectCloneTicker(run);
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[hub] background bake failed for "${projectKey}":`, msg);
+          write({
+            phase: "failed",
+            stage: run.stage,
+            percent: null,
+            detail: null,
+            error: msg.slice(0, 1000),
+            endedAt: new Date().toISOString(),
+          });
+        },
+      );
   }
 
   private findSandboxByCwd(cwd: string): HubSandboxRecord | undefined {

@@ -39,6 +39,7 @@ import { asSandboxProvider, type ProviderCapability, type SandboxProvider } from
 import { ProviderSessionStore } from "./provider-sessions.ts";
 import { ProviderSetupRouter, ProviderStatusBook } from "./hub-providers.ts";
 import { StateStore, buildAutoProjectConfig, normalizeProjectWorkdir } from "./state.ts";
+import { BAKE_STEPS, bakeProgress, formatElapsed, type BakeStep } from "./bake-progress.ts";
 import { T3ReleaseResolver } from "./t3-release.ts";
 import { ATTACHMENT_UPLOAD_URL_TTL_MS, parseUploadRequest } from "./hub-attachments.ts";
 import { loadT3Contracts } from "./testing/t3-contracts.ts";
@@ -4683,6 +4684,120 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     expect(JSON.stringify(vm1.seenMethods)).not.toContain("s3cret-late");
   });
 
+  describe("cloning a repo bakes its Boat snapshot (projectClone.*)", () => {
+    const until = async (cond: () => boolean, timeoutMs = 5_000) => {
+      const start = Date.now();
+      while (!cond()) {
+        if (Date.now() - start > timeoutMs) throw new Error("timed out");
+        await Bun.sleep(10);
+      }
+    };
+    type CloneSnap = {
+      projectId: string;
+      phase: string;
+      stage: string;
+      percent: number | null;
+      detail: string | null;
+      error: string | null;
+      sequence: number;
+    };
+    /** Every list the "clones" stream pushed, oldest first (read in place, never spliced). */
+    const cloneLists = (client: Awaited<ReturnType<typeof connectHubClient>>) =>
+      client.inbox
+        .filter((f) => f._tag === "Chunk" && f.requestId === "clones")
+        .map((f) => ((f.values as CloneSnap[][])[0] ?? []) as CloneSnap[]);
+    /** This clone's snapshots as T3 saw them, oldest first. */
+    const snapsOf = (client: Awaited<ReturnType<typeof connectHubClient>>, projectId: string) =>
+      cloneLists(client).flatMap((list) => list.filter((c) => c.projectId === projectId));
+    const lastOf = (client: Awaited<ReturnType<typeof connectHubClient>>, projectId: string) => {
+      const lists = cloneLists(client);
+      return lists.length ? lists[lists.length - 1].find((c) => c.projectId === projectId) ?? null : undefined;
+    };
+    const startClone = (client: Awaited<ReturnType<typeof connectHubClient>>, id: string, projectId: string, name: string) =>
+      client.request(id, "projectClone.start", {
+        projectId,
+        title: name,
+        createdAt: new Date().toISOString(),
+        remoteUrl: `https://github.com/acme/${name}.git`,
+        destinationPath: `~/${name}`,
+      });
+
+    test("reports each bake step with its elapsed time, a rising integer percent and a monotonic sequence", async () => {
+      const vm = startFakeVmT3Server("vm-clone-progress");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-clone-progress-");
+      handle.hub!.projectCloneTickMs = 15;
+      const client = await connectHubClient(handle, cfg);
+      client.request("clones", "subscribeProjectClones", {});
+      await until(() => cloneLists(client).length > 0);
+
+      // Hold the provider verification step open so the ticker refreshes it a few times
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      cleanups.push(() => release());
+      boat.onBeforeBakeStop = () => gate;
+      const projectId = "33333333-2222-4333-8444-555555555555";
+      startClone(client, "start", projectId, "widget");
+      const exit = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "start");
+      expect((exit.exit as Record<string, unknown>)._tag).toBe("Success");
+
+      const verifying = () => snapsOf(client, projectId).filter((c) => c.detail?.startsWith("Verifying T3 and providers"));
+      await until(() => verifying().length >= 3);
+      release();
+      await until(() => lastOf(client, projectId)?.phase === "done");
+
+      const snaps = snapsOf(client, projectId);
+      // Honest step names, in bake order
+      const labels = [
+        "Creating a temporary Boat VM",
+        "Uploading setup scripts",
+        "Cloning and installing dependencies on a temporary Boat VM",
+        "Verifying T3 and providers",
+        "Stopping the temporary VM",
+        "Saving the Boat snapshot",
+      ];
+      const firstSeen = labels.map((l) => snaps.findIndex((c) => c.detail?.startsWith(`${l} · `)));
+      expect(firstSeen.every((i) => i >= 0)).toBe(true);
+      expect([...firstSeen].sort((a, b) => a - b)).toEqual(firstSeen);
+      expect(snaps[snaps.length - 1]).toMatchObject({ phase: "done", stage: "checkout", percent: 100 });
+      // Integer, rising percent; sequence only ever goes up; detail fits T3's 200 chars
+      const percents = snaps.map((c) => c.percent);
+      expect(percents.every((p) => Number.isInteger(p) && p! >= 0 && p! <= 100)).toBe(true);
+      expect([...percents].sort((a, b) => a! - b!)).toEqual(percents);
+      const seqs = snaps.map((c) => c.sequence);
+      expect(seqs.every((q, i) => i === 0 || q > seqs[i - 1])).toBe(true);
+      expect(snaps.every((c) => (c.detail ?? "").length <= 200)).toBe(true);
+      expect(verifying().every((c) => c.stage === "resolving" && / · \d+s$/.test(c.detail!))).toBe(true);
+      if (t3Contracts) {
+        for (const list of cloneLists(client)) {
+          expect(t3Contracts.decodeSuccess("subscribeProjectClones", list)).toEqual({ ok: true });
+        }
+      }
+      expect(boat.snapshots.has("env-widget")).toBe(true);
+    }, 15_000);
+
+    test("a failed bake shows the step it failed on and stops refreshing", async () => {
+      const vm = startFakeVmT3Server("vm-clone-fail");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-clone-fail-");
+      handle.hub!.projectCloneTickMs = 15;
+      const client = await connectHubClient(handle, cfg);
+      client.request("clones", "subscribeProjectClones", {});
+      await until(() => cloneLists(client).length > 0);
+      boat.execHook = (_id, script) =>
+        script.includes("git clone") ? Promise.resolve({ exitCode: 1, stdout: "", stderr: "repository not found" }) : undefined;
+      const projectId = "44444444-2222-4333-8444-555555555555";
+      startClone(client, "start", projectId, "missing");
+      await until(() => lastOf(client, projectId)?.phase === "failed");
+      expect(lastOf(client, projectId)).toMatchObject({ stage: "receiving", percent: null, error: expect.stringContaining("repository not found") });
+      const pushed = cloneLists(client).length;
+      await Bun.sleep(80);
+      expect(cloneLists(client).length).toBe(pushed);
+      // The temp VM never outlives the failed bake
+      expect(boat.sandboxes.size).toBe(0);
+    }, 15_000);
+  });
+
   describe("preview streams reach the chat's own VM", () => {
     type HubClient = Awaited<ReturnType<typeof connectHubClient>>;
     const until = async (cond: () => boolean, timeoutMs = 5_000) => {
@@ -5264,6 +5379,27 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     expect((relExit.exit as Record<string, unknown>)._tag).toBe("Failure");
     expect(JSON.stringify(relExit.exit)).toContain("absolute path");
     expect(handle.state.getAllProjects(cfg)["relative-app"]).toBeUndefined();
+  });
+
+  test("bake progress: integer percent that rises within and across steps, honest step names, short detail", () => {
+    const steps: BakeStep[] = ["create", "upload", "install", "verify", "stop", "save"];
+    let prev = -1;
+    for (const step of steps) {
+      for (const ms of [0, 1_000, 10_000, 60_000, 300_000, 3_600_000, 86_400_000]) {
+        const p = bakeProgress(step, ms);
+        expect(Number.isInteger(p.percent)).toBe(true);
+        expect(p.percent).toBeGreaterThanOrEqual(prev);
+        expect(p.percent).toBeLessThan(100);
+        expect(p.detail.length).toBeLessThanOrEqual(200);
+        expect(p.detail.startsWith(`${BAKE_STEPS[step].label} · `)).toBe(true);
+        prev = p.percent;
+      }
+    }
+    // A step never claims the next step's share, however long it runs
+    expect(bakeProgress("install", 86_400_000).percent).toBeLessThan(BAKE_STEPS.verify.from);
+    expect(bakeProgress("install", 80_000)).toMatchObject({ stage: "receiving", detail: "Cloning and installing dependencies on a temporary Boat VM · 1m 20s" });
+    expect(formatElapsed(45_400)).toBe("45s");
+    expect(formatElapsed(3_725_000)).toBe("1h 2m");
   });
 
   test("project workdirs expand ~ to the Boat VM home and refuse relative or other-user paths", () => {
