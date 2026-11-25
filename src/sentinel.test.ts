@@ -22,6 +22,7 @@ import { LifecycleManager } from "./lifecycle.ts";
 import { formatRpcFailure } from "./hub-mcp.ts";
 import { buildPlaceholderThread, failPlaceholderThread, placeholderInputFrom } from "./hub-placeholder.ts";
 import { chatThreadIdOf, threadGoneError } from "./hub.ts";
+import { normalizeGitRemoteUrl, repositoryIdentityFor } from "./repository-identity.ts";
 import { REPO_SYNC_MARKER, buildRepoSyncScript, parseRepoSyncOutput } from "./repo-sync.ts";
 import {
   applySettingsOverlay,
@@ -5816,5 +5817,67 @@ describe("hub placeholder thread", () => {
   test("falls back to the awaited launch when the payload lacks what a placeholder needs", () => {
     const { modelSelection: _m, ...withoutModel } = payload;
     expect(placeholderInputFrom("launch", withoutModel, "t1", "p1")).toBeNull();
+  });
+});
+
+describe("repository identity of Boat projects (T3's RepositoryIdentityResolver)", () => {
+  const ssh = "git@github.com:OmarAlex24/webservice_panel.git";
+  const https = "https://github.com/OmarAlex24/webservice_panel.git";
+
+  test("an HTTPS `.git` remote has the canonicalKey T3 computes for the SSH remote of the same repo", () => {
+    const identity = repositoryIdentityFor(https, "/home/user/webservice-panel")!;
+    expect(identity.canonicalKey).toBe("github.com/omaralex24/webservice_panel");
+    expect(identity.canonicalKey).toBe(normalizeGitRemoteUrl(ssh));
+    expect(repositoryIdentityFor(ssh, "/home/user/webservice-panel")!.canonicalKey).toBe(identity.canonicalKey);
+    expect(identity).toMatchObject({ provider: "github", owner: "OmarAlex24", name: "webservice_panel", displayName: "OmarAlex24/webservice_panel" });
+    expect(repositoryIdentityFor("https://gitlab.example.com/group/sub/app.git", "/w")).toMatchObject({
+      canonicalKey: "gitlab.example.com/group/sub/app",
+      provider: "unknown",
+      owner: "group",
+      name: "app",
+    });
+    expect(repositoryIdentityFor("/srv/git/local-only", "/w")).toBeNull();
+  });
+
+  test("a remote's credentials never reach the identity", () => {
+    const identity = repositoryIdentityFor("https://x-access-token:SECRET-tok@github.com/acme/app.git?private_token=SECRET-q", "/w")!;
+    expect(identity.locator).toEqual({ source: "git-remote", remoteName: "origin", remoteUrl: "https://github.com/acme/app.git" });
+    expect(JSON.stringify(identity)).not.toContain("SECRET");
+    expect(identity.canonicalKey).toBe("github.com/acme/app");
+  });
+
+  (t3Contracts ? test : test.skip)("canonicalKey and remote parsing match the T3 app's own functions", () => {
+    const t3Normalize = t3Contracts!.exported("normalizeGitRemoteUrl") as (url: string) => string;
+    const remotes = [
+      ssh,
+      https,
+      "https://github.com/OmarAlex24/webservice_panel",
+      "https://github.com/OmarAlex24/webservice_panel/",
+      "ssh://git@github.com/OmarAlex24/webservice_panel.git",
+      "ssh://git@github.com:22/OmarAlex24/webservice_panel.git",
+      "git://github.com/OmarAlex24/webservice_panel.git",
+      "https://x-access-token:tok@github.com/OmarAlex24/webservice_panel.git",
+      "git@gitlab.com:group/sub/project.git",
+      "https://gitlab.example.com:8443/group/sub/project.git",
+      "git@github.com:Acme/My%20Repo.git",
+      "https://github.com/Acme/My%20Repo",
+      "git@[::1]:acme/app.git",
+      "/srv/git/local-only",
+      "C:/repos/app",
+    ];
+    for (const remote of remotes) expect([remote, normalizeGitRemoteUrl(remote)]).toEqual([remote, t3Normalize(remote)]);
+    // Production: the local "webservices" checkout and the Boat project "webservice-panel"
+    expect(t3Normalize(ssh)).toBe(repositoryIdentityFor(https, "/home/user/webservice-panel")!.canonicalKey as string);
+    expect(t3Contracts!.decodeWith("OrchestrationProjectShell", {
+      id: "p1",
+      title: "webservice-panel",
+      workspaceRoot: "/home/user/webservice-panel",
+      repositoryIdentity: repositoryIdentityFor(https, "/home/user/webservice-panel"),
+      defaultModelSelection: null,
+      scripts: [],
+      createdAt: "2026-11-25T00:00:00.000Z",
+      updatedAt: "2026-11-25T00:00:00.000Z",
+      deletedAt: null,
+    })).toEqual({ ok: true });
   });
 });

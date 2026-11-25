@@ -28,6 +28,7 @@ import {
 import type { ProjectConfig, ProjectKlavConfig, SentinelConfig } from "./config.ts";
 import { HubMcpHandler, formatRpcFailure, type HubSandboxPhase } from "./hub-mcp.ts";
 import { HubShellStore } from "./hub-shell-store.ts";
+import { repositoryIdentityFor } from "./repository-identity.ts";
 import {
   ATTACHMENT_UPLOAD_ROUTE_PREFIX,
   ATTACHMENT_UPLOAD_URL_TTL_MS,
@@ -1267,19 +1268,25 @@ export class HubServer {
         h.projectIds[key] = projectId;
       });
     }
+    // The app offers "Run on Boat" for a local project whose repository identity matches; a VM's
+    // captured identity wins, else it is derived from the project's repo like a T3 server does
+    const derivedIdentity = proj.repo ? repositoryIdentityFor(proj.repo, proj.workdir) : null;
     const cached = hub.projectTemplates[key]?.shell;
     if (cached && typeof cached === "object") {
+      const captured = (cached as { repositoryIdentity?: unknown }).repositoryIdentity;
       return {
         ...cached,
         id: projectId,
         title: key,
         workspaceRoot: proj.workdir,
+        ...(!captured && derivedIdentity ? { repositoryIdentity: derivedIdentity } : {}),
       };
     }
     return {
       id: projectId,
       title: key,
       workspaceRoot: proj.workdir,
+      ...(derivedIdentity ? { repositoryIdentity: derivedIdentity } : {}),
       defaultModelSelection: null,
       scripts: [],
       createdAt: now,
