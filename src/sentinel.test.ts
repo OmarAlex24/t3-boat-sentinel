@@ -1418,7 +1418,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
 
   describe("persisted provider sessions (Antigravity sign-in sync)", () => {
     const AG_HASH = createHash("sha256").update("antigravity").digest("hex");
-    const AG_STAGED = `~/.t3-sentinel/provider-sessions/providers/antigravity/${AG_HASH}/antigravity-acp/antigravity-oauth-token`;
+    const AG_STAGED = `~/.t3-sentinel/provider-sessions/.t3/userdata/providers/antigravity/${AG_HASH}/antigravity-acp/antigravity-oauth-token`;
     const agToken = (access: string, expiry: string) =>
       JSON.stringify({ token: { access_token: access, refresh_token: "1//refresh-SECRET", expiry } });
     const agProviders = (status: string) => [
@@ -1804,6 +1804,279 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       expect(await ok.json()).toEqual({ ok: true, instanceId: "antigravity", removed: false });
       const bad = await call({ instanceId: "../etc" });
       expect(bad.status).toBe(400);
+    });
+  });
+
+  describe("persisted provider sessions (Devin sign-in sync)", () => {
+    const DEVIN_ID = "acpRegistry_devin";
+    const FLAG_HASH = createHash("sha256").update(JSON.stringify(DEVIN_ID)).digest("hex");
+    const CREDS_VM = ".local/share/devin/credentials.toml";
+    const FLAG_VM = `.t3/caches/acp-auth-${FLAG_HASH}.json`;
+    const devinCreds = (key: string) =>
+      `api_key = "${key}"\napi_server_url = "https://server.example"\ndevin_api_url = "https://api.example"\n`;
+    const devinFlag = JSON.stringify({ binding: "b".repeat(43), authenticated: true });
+    const devinProviders = (status: string) => [
+      { instanceId: "claudeAgent", driver: "claudeAgent", enabled: true, installed: true },
+      { instanceId: DEVIN_ID, driver: "acpRegistry", enabled: true, installed: true, auth: { status } },
+    ];
+    const storedDir = (dir: string) => join(dir, "credentials", DEVIN_ID);
+
+    /** A fixture home stands in for the VM: listings run for real against it, files come over `download`. */
+    function fixtureVm(files: Record<string, string>) {
+      const home = mkdtempSync(join(tmpdir(), "t3-sentinel-devin-vmhome-"));
+      cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+      for (const [rel, content] of Object.entries(files)) {
+        mkdirSync(dirname(join(home, rel)), { recursive: true });
+        writeFileSync(join(home, rel), content);
+      }
+      const execs: Array<{ script: string; stdout: string; stderr: string }> = [];
+      const downloads: string[] = [];
+      const exec = async (_id: string, script: string) => {
+        const p = Bun.spawnSync(["bash", "-c", script], { env: { ...process.env, HOME: home } });
+        const res = { exitCode: p.exitCode, stdout: p.stdout.toString(), stderr: p.stderr.toString() };
+        execs.push({ script, ...res });
+        return res;
+      };
+      const download = async (_id: string, remotePath: string, localPath: string) => {
+        downloads.push(remotePath);
+        writeFileSync(localPath, readFileSync(join(home, remotePath.replace(/^~\//, ""))));
+      };
+      return { home, execs, downloads, exec, download };
+    }
+
+    function storeWith(opts: { settings?: unknown; files: Record<string, string> }) {
+      const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-devin-"));
+      cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+      const base = makeTestConfig(0);
+      let settingsFile: string | undefined;
+      if (opts.settings) {
+        settingsFile = join(dir, "t3-settings.json");
+        writeFileSync(settingsFile, JSON.stringify(opts.settings));
+      }
+      const cfg: SentinelConfig = {
+        ...base,
+        stateDir: dir,
+        t3: { ...base.t3, settingsFile, persistProviderSessions: [DEVIN_ID] },
+      };
+      const vm = fixtureVm(opts.files);
+      const provider = { name: "fake", capabilities: new Set(), exec: vm.exec, download: vm.download } as unknown as SandboxProvider;
+      return { dir, cfg, vm, store: new ProviderSessionStore(cfg, provider) };
+    }
+
+    const devinSettings = (config: Record<string, unknown>) => ({
+      providerInstances: { [DEVIN_ID]: { driver: "acpRegistry", enabled: true, config } },
+    });
+
+    test("captures credentials.toml and T3's sign-in marker over download (names only in exec), stages both, forgets both", async () => {
+      const { dir, vm, store } = storeWith({
+        settings: devinSettings({ agentId: "devin", distribution: "auto" }),
+        files: { [CREDS_VM]: devinCreds("cog_FIRST-SECRET"), [FLAG_VM]: devinFlag },
+      });
+      await store.capture("vm-1", DEVIN_ID);
+
+      expect(readFileSync(join(storedDir(dir), "credentials.toml"), "utf8")).toBe(devinCreds("cog_FIRST-SECRET"));
+      expect(readFileSync(join(storedDir(dir), "acp-auth.json"), "utf8")).toBe(devinFlag);
+      expect(statSync(join(storedDir(dir), "credentials.toml")).mode & 0o777).toBe(0o600);
+      expect(statSync(storedDir(dir)).mode & 0o777).toBe(0o700);
+      expect(vm.downloads.sort()).toEqual([`~/${CREDS_VM}`, `~/${FLAG_VM}`].sort());
+      expect(vm.execs.length).toBe(1);
+      expect(vm.execs[0].stdout).toMatch(/^(?:(?:credentials\.toml|acp-auth\.json) \d+\n){2}$/);
+      expect(vm.execs[0].script).not.toMatch(/\b(base64|cat|head|tail|xxd|od|dd|less|more|strings|openssl)\b/);
+      for (const e of vm.execs) expect(`${e.script}\n${e.stdout}\n${e.stderr}`).not.toContain("SECRET");
+
+      // Not an expiring token: a later capture with different bytes replaces it
+      writeFileSync(join(vm.home, CREDS_VM), devinCreds("cog_SECOND-SECRET"));
+      await store.capture("vm-2", DEVIN_ID);
+      expect(readFileSync(join(storedDir(dir), "credentials.toml"), "utf8")).toBe(devinCreds("cog_SECOND-SECRET"));
+
+      // New VMs get both files at the same paths under $HOME
+      const staged = store.stagedCredentials();
+      expect(staged.map((s) => s.remotePath).sort()).toEqual(
+        [`~/.t3-sentinel/provider-sessions/${CREDS_VM}`, `~/.t3-sentinel/provider-sessions/${FLAG_VM}`].sort(),
+      );
+      expect(staged.find((s) => s.remotePath.endsWith("credentials.toml"))?.remoteDir).toBe(
+        "~/.t3-sentinel/provider-sessions/.local/share/devin",
+      );
+      expect(store.listStored()).toEqual([DEVIN_ID]);
+
+      expect(store.forget(DEVIN_ID)).toEqual({ removed: true });
+      expect(existsSync(storedDir(dir))).toBe(false);
+      expect(store.stagedCredentials()).toEqual([]);
+    });
+
+    test("the sign-in marker alone is never stored or staged", async () => {
+      const { dir, vm, store } = storeWith({
+        settings: devinSettings({ agentId: "devin" }),
+        files: { [FLAG_VM]: devinFlag },
+      });
+      await store.capture("vm-1", DEVIN_ID);
+      expect(vm.downloads).toEqual([]);
+      expect(existsSync(storedDir(dir))).toBe(false);
+
+      // A leftover marker without credentials (e.g. a partial copy) is not staged into new VMs
+      mkdirSync(storedDir(dir), { recursive: true, mode: 0o700 });
+      writeFileSync(join(storedDir(dir), "acp-auth.json"), devinFlag, { mode: 0o600 });
+      expect(store.stagedCredentials()).toEqual([]);
+      expect(store.listStored()).toEqual([]);
+    });
+
+    test("a marker that fails to copy never blocks storing credentials.toml", async () => {
+      const { dir, vm, store } = storeWith({
+        settings: devinSettings({ agentId: "devin" }),
+        files: { [CREDS_VM]: devinCreds("cog_ONLY-SECRET"), [FLAG_VM]: devinFlag },
+      });
+      const download = vm.download;
+      (store as unknown as { boat: { download: typeof download } }).boat.download = async (id, remote, local) => {
+        if (remote.includes("acp-auth-")) throw new Error("file changed during copy");
+        return download(id, remote, local);
+      };
+      await store.capture("vm-1", DEVIN_ID);
+      expect(readFileSync(join(storedDir(dir), "credentials.toml"), "utf8")).toBe(devinCreds("cog_ONLY-SECRET"));
+      expect(existsSync(join(storedDir(dir), "acp-auth.json"))).toBe(false);
+      expect(store.stagedCredentials().map((c) => c.remotePath)).toEqual([`~/.t3-sentinel/provider-sessions/${CREDS_VM}`]);
+    });
+
+    test("only the devin ACP agent is supported: other registry agents and local agents are skipped without exec", async () => {
+      for (const config of [{ agentId: "cline" }, { agentId: "devin", source: "local", commandPath: "/usr/bin/devin" }]) {
+        const { dir, vm, store } = storeWith({
+          settings: devinSettings(config),
+          files: { [CREDS_VM]: devinCreds("cog_X-SECRET") },
+        });
+        const warn = console.warn;
+        const warnings: string[] = [];
+        console.warn = (...args: unknown[]) => void warnings.push(args.map(String).join(" "));
+        try {
+          await store.capture("vm-1", DEVIN_ID);
+        } finally {
+          console.warn = warn;
+        }
+        expect(vm.execs.length).toBe(0);
+        expect(existsSync(storedDir(dir))).toBe(false);
+        expect(warnings.some((w) => w.includes("is not supported"))).toBe(true);
+      }
+    });
+
+    test("Hub: captures on an authenticated report, stages into the next VM before provision-base, a sign-out deletes it", async () => {
+      // No settings file: the driver comes from the VM's provider status, the agent from T3's default instance ID
+      const vm = startFakeVmT3Server("vm-devin", {
+        configSnapshot: { providers: devinProviders("authenticated"), settings: {} },
+      });
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat, dir } = await startHubWithVm(vm, "t3-sentinel-devin-hub-", {
+        persistProviderSessions: [DEVIN_ID],
+      });
+      const fixture = fixtureVm({ [CREDS_VM]: devinCreds("cog_HUB-SECRET"), [FLAG_VM]: devinFlag });
+      const original = boat.exec.bind(boat);
+      boat.exec = async (id: string, script: string) =>
+        script.includes("credentials.toml") && script.includes("wc -c") ? fixture.exec(id, script) : original(id, script);
+      boat.download = fixture.download;
+
+      const client = await connectHubClient(handle, cfg);
+      client.request("cfg", "subscribeServerConfig", {});
+      await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "cfg");
+      await launchThreadOnHub(client, "thread-devin-capture");
+      const start = Date.now();
+      while (!existsSync(join(storedDir(dir), "credentials.toml"))) {
+        if (Date.now() - start > 5_000) throw new Error("Devin credentials were not captured");
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      await handle.lifecycle.providerSessions.settle();
+      expect(readFileSync(join(storedDir(dir), "credentials.toml"), "utf8")).toBe(devinCreds("cog_HUB-SECRET"));
+      expect(existsSync(join(storedDir(dir), "acp-auth.json"))).toBe(true);
+      expect(readFileSync(join(dir, "state.json"), "utf8")).not.toContain("SECRET");
+
+      // A fresh VM gets both files staged before provision-base.sh runs
+      const order: string[] = [];
+      boat.upload = async (...args: unknown[]) => void order.push(`upload:${String(args[2])}`);
+      const execWithOrder = boat.exec;
+      boat.exec = async (id: string, script: string) => {
+        if (script.includes("provision-base.sh")) order.push("provision");
+        return execWithOrder(id, script);
+      };
+      const res = await handle.lifecycle.provisionStandaloneVm({
+        sandboxId: "sb-next",
+        watchdogSlotKey: "slot",
+        environmentId: "env",
+        label: "Boat",
+        projectName: "my-app",
+        project: undefined,
+        watchdogSecret: "w",
+        llmToken: null,
+        mintToken: false,
+        injectProviderSessions: true,
+      });
+      expect(res.injectedProviderSessions).toEqual([DEVIN_ID]);
+      const credsUpload = order.indexOf(`upload:~/.t3-sentinel/provider-sessions/${CREDS_VM}`);
+      expect(credsUpload).toBeGreaterThanOrEqual(0);
+      expect(order.indexOf(`upload:~/.t3-sentinel/provider-sessions/${FLAG_VM}`)).toBeGreaterThanOrEqual(0);
+      expect(credsUpload).toBeLessThan(order.indexOf("provision"));
+
+      // Signing out of Devin in T3 (ACP registry logout) deletes the stored copy
+      client.request("logout", "server.logoutAcpRegistry", { instanceId: DEVIN_ID });
+      const exit = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "logout");
+      expect((exit.exit as { _tag: string })._tag).toBe("Success");
+      expect(existsSync(storedDir(dir))).toBe(false);
+    });
+
+    test("provision-base.sh installs staged files at the same path under $HOME; the bake wipes and refuses Devin sign-ins", () => {
+      const script = readFileSync(join(import.meta.dir, "..", "scripts", "provision-base.sh"), "utf8");
+      const home = mkdtempSync(join(tmpdir(), "t3-sentinel-devin-install-"));
+      cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+      const staging = join(home, ".t3-sentinel", "provider-sessions");
+      const stage = (rel: string, content: string) => {
+        mkdirSync(dirname(join(staging, rel)), { recursive: true });
+        writeFileSync(join(staging, rel), content);
+      };
+      const agRel = `.t3/userdata/providers/antigravity/${"a".repeat(64)}/antigravity-acp/antigravity-oauth-token`;
+      stage(CREDS_VM, devinCreds("cog_INSTALL"));
+      stage(FLAG_VM, devinFlag);
+      stage(agRel, "ya29.INSTALL");
+      // Layout staged by a sentinel from before this change (relative to ~/.t3/userdata)
+      const legacyRel = `providers/antigravity/${"b".repeat(64)}/antigravity-acp/antigravity-oauth-token`;
+      stage(legacyRel, "ya29.LEGACY");
+
+      const install = script.slice(script.indexOf('staged_sessions="$sentinel_dir/provider-sessions"'));
+      const loop = install.slice(0, install.indexOf("\nfi\n") + 4);
+      const run = Bun.spawnSync(
+        ["bash", "-c", `set -euo pipefail; sentinel_dir="$HOME/.t3-sentinel"; userdata_dir="$HOME/.t3/userdata"; restart_t3=0\n${loop}\necho "restart=$restart_t3"`],
+        { env: { ...process.env, HOME: home } },
+      );
+      expect(run.stderr.toString()).toBe("");
+      expect(run.stdout.toString().trim()).toBe("restart=1");
+      for (const [rel, content] of [
+        [CREDS_VM, devinCreds("cog_INSTALL")],
+        [FLAG_VM, devinFlag],
+        [agRel, "ya29.INSTALL"],
+        [`.t3/userdata/${legacyRel}`, "ya29.LEGACY"],
+      ]) {
+        expect(readFileSync(join(home, rel), "utf8")).toBe(content);
+        expect(statSync(join(home, rel)).mode & 0o777).toBe(0o600);
+      }
+      expect(existsSync(staging)).toBe(false);
+      expect(existsSync(join(home, "providers"))).toBe(false);
+
+      // Bake: the wipe covers Devin's credentials and T3's ACP sign-in markers...
+      const wipe = script.slice(script.indexOf("wipe_userdata() {"), script.indexOf("\n  }\n", script.indexOf("wipe_userdata() {")));
+      expect(wipe).toContain('"$HOME/.local/share/devin/credentials.toml"');
+      expect(wipe).toContain('"$HOME"/.t3/caches/acp-auth-*.json');
+      // ...and the leak check finds them, without flagging Antigravity's own acp-auth-state.json
+      const leakStart = script.indexOf('leaked="$({');
+      const leak = script.slice(leakStart, script.indexOf('} 2>/dev/null || true)"', leakStart) + '} 2>/dev/null || true)"'.length);
+      mkdirSync(join(home, ".t3/userdata/providers/antigravity/x/antigravity-acp/cache"), { recursive: true });
+      writeFileSync(join(home, ".t3/userdata/providers/antigravity/x/antigravity-acp/cache/acp-auth-state.json"), "{}");
+      const check = () =>
+        Bun.spawnSync(["bash", "-c", `sentinel_dir="$HOME/.t3-sentinel"; userdata_dir="$HOME/.t3/userdata"\n${leak}\nprintf '%s' "$leaked"`], {
+          env: { ...process.env, HOME: home },
+        })
+          .stdout.toString()
+          .split("\n")
+          .filter(Boolean)
+          .map((p) => p.slice(home.length + 1))
+          .sort();
+      const legacyInstalled = `.t3/userdata/${legacyRel}`;
+      expect(check()).toEqual([CREDS_VM, FLAG_VM, agRel, legacyInstalled].sort());
+      for (const rel of [CREDS_VM, FLAG_VM, agRel, legacyInstalled]) rmSync(join(home, rel));
+      expect(check()).toEqual([]);
     });
   });
 
