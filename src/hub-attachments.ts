@@ -88,8 +88,8 @@ export function replayUploadRequest(staged: StagedAttachment): Record<string, un
   };
 }
 
-/** Headers for serving a staged upload's bytes (T3 serves uploaded bytes the same way). */
-export function stagedAssetHeaders(staged: StagedAttachment): Record<string, string> {
+/** Headers for serving a staged upload's (or a sleeping chat's cached attachment's) bytes, as T3 serves uploaded bytes. */
+export function stagedAssetHeaders(staged: { name: string; mimeType: string }): Record<string, string> {
   const headers: Record<string, string> = {
     "content-type": staged.mimeType,
     "cache-control": "private, max-age=3600",
