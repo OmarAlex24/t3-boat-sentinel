@@ -160,6 +160,9 @@ interface LocalThreadSub {
   servedSnapshot: boolean;
 }
 
+/** Commands that close a chat; for a chat still booting (or whose VM failed to start) they cancel the launch. */
+const CLOSING_COMMANDS = new Set(["thread.archive", "thread.delete", "thread.settle", "thread.auto-settle"]);
+
 /** Commands that only record what the user did; answered at once and sent once the VM is up. */
 const BOOKKEEPING_COMMANDS = new Set([
   "thread.visit",
@@ -2043,7 +2046,7 @@ export class HubServer {
         return;
       }
       const pending = this.pendingThreads.get(tid);
-      if (pending && (cmdType === "thread.archive" || cmdType === "thread.delete")) {
+      if (pending && CLOSING_COMMANDS.has(cmdType)) {
         sendRpcExitSuccess(ws, reqId, { sequence: this.cancelPendingLaunch(pending, cmdType) });
         return;
       }
@@ -3067,7 +3070,14 @@ export class HubServer {
         `[hub] spawning fresh VM ${sandboxName} via ${this.boat.name} for project="${projectKey}" thread=${threadId} (snapshot=${snapshotToUse ?? "base-image"})`,
       );
       lap("prepare");
-      sandboxId = await this.boat.create({ name: sandboxName, size, fromSnapshot: snapshotToUse });
+      // The reaper deletes prefixed VMs it doesn't know; hold it off until create() returns the ID
+      const pendingCreate = `pending-create:${sandboxName}`;
+      this.lifecycle.trackInFlightSandbox(pendingCreate);
+      try {
+        sandboxId = await this.boat.create({ name: sandboxName, size, fromSnapshot: snapshotToUse });
+      } finally {
+        this.lifecycle.untrackInFlightSandbox(pendingCreate);
+      }
       this.lifecycle.trackInFlightSandbox(sandboxId);
       lap("create");
 

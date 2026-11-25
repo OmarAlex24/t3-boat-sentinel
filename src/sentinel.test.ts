@@ -1718,6 +1718,31 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       expect(handle.state.listHubSandboxes()).toHaveLength(0);
     });
 
+    test("settling a chat whose VM failed to start closes it instead of returning the start error", async () => {
+      const vm = startFakeVmT3Server("vm-settle-failed");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-settle-failed-");
+      boat.create = async () => {
+        throw new Error("boat new failed: not found (404)");
+      };
+      const client = await connectHubClient(handle, cfg);
+      const hubProjectId = await subscribeHubShell(client);
+
+      client.request("launch", "orchestration.launchThread", clientLaunchPayload("thread-s", hubProjectId));
+      expect(exitOf(await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "launch"))._tag).toBe("Success");
+      await client.waitForFrame(shellThreadUpdate("thread-s", (t) => t.status === "failed"));
+
+      client.request("settle", "orchestration.dispatchCommand", { type: "thread.settle", commandId: "cmd-settle", threadId: "thread-s" });
+      expect(exitOf(await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "settle"))._tag).toBe("Success");
+      const removed = await client.waitForFrame(
+        (f) =>
+          f._tag === "Chunk" &&
+          f.requestId === "shell" &&
+          (f.values as Array<{ kind?: string; threadId?: string }>).some((v) => v.kind === "thread.removed" && v.threadId === "thread-s"),
+      );
+      expect(removed).toBeTruthy();
+    });
+
     test("counts booting chats toward maxSandboxes and refuses the launch over the limit", async () => {
       const vm = startFakeVmT3Server("vm-cap");
       cleanups.push(() => vm.server.stop(true));
@@ -4225,6 +4250,41 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     expect(reaperRanDuringSpawn).toBe(true);
     expect(sb.phase).toBe("running");
     expect(boat.deleted).not.toContain(sb.sandboxId);
+  });
+
+  test("reaperTick never kills a Hub VM that exists while create() has not returned its ID yet", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-reaper-create-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+
+    const vm = startFakeVmT3Server("vm-reaper-create");
+    cleanups.push(() => vm.server.stop(true));
+
+    const boat = new MockBoat();
+    boat.snapshots.add("env-my-app");
+    boat.upstreamBaseUrl = vm.url;
+
+    const cfg: SentinelConfig = {
+      ...makeTestConfig(0),
+      stateDir: dir,
+      hub: { host: "boat.boat.example.com", label: "Boat", maxSandboxes: 5 },
+    };
+    const handle = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+    cleanups.push(() => handle.stop());
+
+    // `boat new` lists the VM under its prefixed name while it is still starting; the reaper ticks then
+    const origCreate = boat.create.bind(boat);
+    let createdId = "";
+    boat.create = async (name: string, size: string, fromSnapshot?: string) => {
+      createdId = await origCreate(name, size, fromSnapshot);
+      await handle.lifecycle.reaperTick();
+      return createdId;
+    };
+
+    const sb = await handle.hub!.spawnSandboxForThread("my-app", "thread-reaper-create");
+    expect(createdId).not.toBe("");
+    expect(boat.deleted).not.toContain(createdId);
+    expect(sb.sandboxId).toBe(createdId);
+    expect(sb.phase).toBe("running");
   });
 
   test("server.updateServerWithProgress rebakes base-t3 + project snapshots and streams progress to T3 Desktop", async () => {
