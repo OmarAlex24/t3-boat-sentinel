@@ -334,6 +334,19 @@ export class ProviderSessionStore {
     }
   }
 
+  /**
+   * A sign-in just succeeded on this VM: capture its credentials even if the VM already reported the
+   * instance as authenticated (a re-sign-in replaces the token, and `observe` only captures on a
+   * transition). An explicit sign-in also lifts a suppression left by an earlier sign-out.
+   */
+  captureAfterSignIn(sandboxId: string, instanceId: string): void {
+    if (!this.enabled.has(instanceId)) return;
+    const k = key(sandboxId, instanceId);
+    this.suppressed.delete(k);
+    this.lastStatus.set(k, "authenticated");
+    this.scheduleCapture(sandboxId, instanceId);
+  }
+
   private scheduleCapture(sandboxId: string, instanceId: string): void {
     const k = key(sandboxId, instanceId);
     const existing = this.timers.get(k);

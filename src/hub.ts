@@ -28,6 +28,14 @@ import {
 import type { ProjectConfig, ProjectKlavConfig, SentinelConfig } from "./config.ts";
 import { HubMcpHandler, formatRpcFailure, type HubSandboxPhase } from "./hub-mcp.ts";
 import { HubShellStore } from "./hub-shell-store.ts";
+import {
+  ProviderSetupRouter,
+  ProviderStatusBook,
+  providerSetupBusyDetail,
+  succeededSignIn,
+  threadRunLoad,
+  type VmRunLoad,
+} from "./hub-providers.ts";
 import { repositoryIdentityFor } from "./repository-identity.ts";
 import { defaultBranchOfRefs, fallbackVcsRefs, isVcsRefsResult, templateVcsRefs } from "./vcs-refs.ts";
 import {
@@ -158,6 +166,8 @@ interface PendingUpstreamCall {
   onExit?: (exit: { _tag: "Success"; value: unknown } | { _tag: "Failure"; cause: unknown }) => void;
   /** Called instead of failing the client's request when the VM connection is lost before the call ends. */
   onLost?: () => void;
+  /** Sees each chunk's values before they are relayed to the client. */
+  onValues?: (values: unknown[]) => void;
 }
 
 /**
@@ -639,6 +649,7 @@ class HubVmBridge {
     headers: unknown = [],
     onExit?: PendingUpstreamCall["onExit"],
     onLost?: PendingUpstreamCall["onLost"],
+    onValues?: PendingUpstreamCall["onValues"],
   ): string {
     const upReqId = `hub-f-${++this.reqCounter}`;
     const rewrittenPayload = rewriteProjectIds(payload, this.sandbox.hubProjectId, this.sandbox.vmProjectId);
@@ -650,6 +661,7 @@ class HubVmBridge {
       tag,
       onExit,
       onLost,
+      onValues,
     });
     clientWs.data.upstreamRequests.set(String(clientReqId), { sandboxId: this.sandbox.sandboxId, upReqId });
     this.sendRaw({ _tag: "Request", id: upReqId, tag, payload: rewrittenPayload, headers });
@@ -709,6 +721,13 @@ class HubVmBridge {
       if (call.onChunk) {
         call.onChunk(frame.values);
         return;
+      }
+      if (call.onValues) {
+        try {
+          call.onValues(frame.values);
+        } catch (err) {
+          console.warn("[hub] upstream chunk hook failed:", err instanceof Error ? err.message : err);
+        }
       }
       if (call.clientWs && call.clientReqId) {
         const rewritten =
@@ -794,6 +813,17 @@ export class HubServer {
   private readonly worktreeToSandbox = new Map<string, string>();
   /** Each active chat's sidebar row; stored on disk (`shellStore`) while the chat has a sandbox. */
   private readonly threadShells = new Map<string, Record<string, unknown>>();
+  /** Each VM's latest provider report; keeps a less informed VM from erasing another's confirmed status. */
+  private readonly providerBook = new ProviderStatusBook();
+  /** The VM each client's provider setup flow runs on, per instance. */
+  private readonly providerSetupRouter = new ProviderSetupRouter();
+  /** Provider setup streams forwarded per client socket, so a flow that moves VM takes them along. */
+  private readonly providerStreams = new WeakMap<
+    ServerWebSocket<HubWsData>,
+    Map<string, { rawId: string | number; tag: string; payload: unknown; headers: unknown; instanceId: string }>
+  >();
+  /** `${sandboxId}\0${instanceId}\0${flowId}` of sign-ins already captured. */
+  private readonly capturedSignIns = new Set<string>();
   private readonly shellStore: HubShellStore;
   private readonly inFlightSpawns = new Map<string, Promise<HubSandboxRecord>>();
   private readonly inFlightWakes = new Map<string, Promise<HubSandboxRecord>>();
@@ -1044,8 +1074,9 @@ export class HubServer {
   }
 
   /**
-   * Forwards a provider setup stream to a VM. If that VM goes away, the stream moves to another open
-   * VM, or falls back to the idle snapshot when none is open.
+   * Forwards a provider setup stream to a VM, which becomes the client's VM for that instance's
+   * setup. If that VM goes away, the stream moves to another open VM (chosen like a new flow), or
+   * falls back to the idle snapshot when none is open.
    */
   private forwardProviderStream(
     bridge: HubVmBridge,
@@ -1056,18 +1087,187 @@ export class HubServer {
     headers: unknown,
   ): void {
     const lostSandboxId = bridge.sandbox.sandboxId;
-    bridge.forwardToClient(ws, reqId, tag, payload, headers, undefined, () => {
-      if (!this.clients.has(ws)) return;
-      // A stopping bridge still reports open while it fails its calls, so skip it by id
-      const next = Array.from(this.bridges.values()).find(
-        (b) => b.sandbox.sandboxId !== lostSandboxId && b.sandbox.phase === "running" && b.isOpen(),
-      );
-      if (next) {
-        this.forwardProviderStream(next, ws, reqId, tag, payload, headers);
-      } else {
-        this.serveProviderStreamLocally(ws, reqId, tag, payload);
+    const instanceId = providerInstanceIdOf(payload);
+    if (instanceId) {
+      this.providerSetupRouter.bind(ws.data.clientId, instanceId, lostSandboxId);
+      let streams = this.providerStreams.get(ws);
+      if (!streams) this.providerStreams.set(ws, (streams = new Map()));
+      streams.set(String(reqId), { rawId: reqId, tag, payload, headers, instanceId });
+    }
+    // The stream's first chunk is the VM's current state, which can be a sign-in that finished long
+    // ago (even one signed out since): only a `succeeded` that follows another phase is a new sign-in
+    let sawUnfinished = false;
+    const onValues =
+      tag === "provider.auth.subscribe"
+        ? (values: unknown[]) => {
+            for (const value of values) {
+              if (!succeededSignIn(value)) sawUnfinished = true;
+              else if (sawUnfinished) this.noteSignIns(lostSandboxId, [value]);
+            }
+          }
+        : undefined;
+    bridge.forwardToClient(
+      ws,
+      reqId,
+      tag,
+      payload,
+      headers,
+      undefined,
+      () => {
+        if (!this.clients.has(ws)) return;
+        // A stopping bridge still reports open while it fails its calls, so skip it by id
+        const open = (id: string) => id !== lostSandboxId && this.bridges.get(id)?.isOpen() === true;
+        const route = instanceId
+          ? this.providerSetupRouter.route(
+              ws.data.clientId,
+              instanceId,
+              tag,
+              this.liveSandboxIds().filter(open),
+              (id) => this.vmRunLoad(id, instanceId),
+              true,
+            )
+          : null;
+        const nextId =
+          route?.kind === "vm"
+            ? route.sandboxId
+            : Array.from(this.bridges.values()).find((b) => b.sandbox.phase === "running" && open(b.sandbox.sandboxId))
+                ?.sandbox.sandboxId;
+        const next = nextId ? this.bridges.get(nextId) : undefined;
+        if (next) {
+          this.forwardProviderStream(next, ws, reqId, tag, payload, headers);
+        } else {
+          this.serveProviderStreamLocally(ws, reqId, tag, payload);
+        }
+      },
+      onValues,
+    );
+  }
+
+  /**
+   * Moves the client's setup streams for an instance to the VM its setup command just went to, so
+   * the panel follows the flow it started there.
+   */
+  private rehomeProviderStreams(ws: ServerWebSocket<HubWsData>, instanceId: string, bridge: HubVmBridge): void {
+    const streams = this.providerStreams.get(ws);
+    if (!streams) return;
+    for (const [key, s] of streams) {
+      const ref = ws.data.upstreamRequests.get(key);
+      if (!ref) {
+        streams.delete(key); // ended, interrupted, or served locally
+        continue;
       }
+      if (s.instanceId !== instanceId || ref.sandboxId === bridge.sandbox.sandboxId) continue;
+      ws.data.upstreamRequests.delete(key);
+      this.bridges.get(ref.sandboxId)?.sendInterrupt(ref.upReqId);
+      this.forwardProviderStream(bridge, ws, s.rawId, s.tag, s.payload, s.headers);
+    }
+  }
+
+  /** Running VMs that are not being destroyed, oldest first. */
+  private liveSandboxIds(): string[] {
+    return this.state
+      .listHubSandboxes()
+      .filter((s) => s.phase === "running" && !this.destroyingSandboxes.has(s.sandboxId))
+      .map((s) => s.sandboxId);
+  }
+
+  private isLiveSandbox(sandboxId: string): boolean {
+    return this.state.getHubSandbox(sandboxId)?.phase === "running" && !this.destroyingSandboxes.has(sandboxId);
+  }
+
+  /** Whether chats on this VM are running a turn: on this provider instance, or on any. */
+  private vmRunLoad(sandboxId: string, instanceId: string): VmRunLoad {
+    const load: VmRunLoad = { onInstance: false, any: false };
+    for (const [threadId, row] of this.threadShells) {
+      if (this.threadToSandbox.get(threadId) !== sandboxId) continue;
+      const t = threadRunLoad(row, instanceId);
+      load.onInstance ||= t.onInstance;
+      load.any ||= t.any;
+    }
+    return load;
+  }
+
+  /**
+   * Provider setup for one instance: the client's VM for that instance, never a VM where a chat
+   * runs a turn on it (T3 restarts the provider on sign-in, which interrupts that turn). See
+   * `ProviderSetupRouter`. Returns false when no VM runs, for the no-VM answers.
+   */
+  private async routeProviderSetup(
+    ws: ServerWebSocket<HubWsData>,
+    reqId: string | number,
+    tag: string,
+    payload: unknown,
+    headers: unknown,
+  ): Promise<boolean> {
+    const instanceId = providerInstanceIdOf(payload);
+    if (!instanceId) return false;
+    const isStream = PROVIDER_SETUP_STREAMS.has(tag);
+    // Decided synchronously: frames are handled concurrently, and `subscribe` + `start` must agree
+    const route = this.providerSetupRouter.route(
+      ws.data.clientId,
+      instanceId,
+      tag,
+      this.liveSandboxIds(),
+      (id) => this.vmRunLoad(id, instanceId),
+      isStream,
+    );
+    if (route.kind === "none") return false;
+    const operation = tag.replace(/^provider\./, "");
+    if (route.kind === "busy") {
+      console.log(`[hub] ${tag} for ${instanceId} refused: every running VM has a chat running a turn on it`);
+      sendRpcExitFail(ws, reqId, { _tag: "ProviderSetupError", instanceId, operation, detail: providerSetupBusyDetail(tag) });
+      return true;
+    }
+    const sb = this.state.getHubSandbox(route.sandboxId);
+    let bridge: HubVmBridge | null = null;
+    try {
+      if (sb) bridge = await this.ensureBridgeOpen(sb);
+    } catch {
+      bridge = null;
+    }
+    if (!bridge) {
+      if (isStream) {
+        this.serveProviderStreamLocally(ws, reqId, tag, payload);
+      } else {
+        sendRpcExitFail(ws, reqId, {
+          _tag: "ProviderSetupError",
+          instanceId,
+          operation,
+          detail: "The Boat VM for provider setup did not answer. Try again.",
+        });
+      }
+      return true;
+    }
+    if (isStream) {
+      this.forwardProviderStream(bridge, ws, reqId, tag, payload, headers);
+      return true;
+    }
+    this.rehomeProviderStreams(ws, instanceId, bridge);
+    const signOut = this.signOutHook(tag, payload);
+    const sandboxId = bridge.sandbox.sandboxId;
+    bridge.forwardToClient(ws, reqId, tag, payload, headers, (exit) => {
+      signOut?.(exit);
+      if (exit._tag === "Success") this.noteSignIns(sandboxId, [exit.value]);
     });
+    return true;
+  }
+
+  /**
+   * A `ProviderAuthState` reporting a finished sign-in on a VM: capture that VM's credentials now,
+   * even if it was already signed in, so new VMs get the new copy. Once per flow.
+   */
+  private noteSignIns(sandboxId: string, values: unknown[]): void {
+    for (const value of values) {
+      const signIn = succeededSignIn(value);
+      if (!signIn || !this.lifecycle.providerSessions.isEnabled(signIn.instanceId)) continue;
+      if (signIn.flowId !== null) {
+        const key = `${sandboxId}\0${signIn.instanceId}\0${signIn.flowId}`;
+        if (this.capturedSignIns.has(key)) continue;
+        this.capturedSignIns.add(key);
+      }
+      console.log(`[sessions] ${signIn.instanceId} sign-in succeeded on ${sandboxId}; capturing its session`);
+      this.lifecycle.providerSessions.captureAfterSignIn(sandboxId, signIn.instanceId);
+    }
   }
 
   /**
@@ -1121,10 +1321,13 @@ export class HubServer {
   private signOutHook(tag: string, payload: unknown): PendingUpstreamCall["onExit"] {
     if (!PROVIDER_LOGOUT_METHODS.has(tag)) return undefined;
     const instanceId = (payload as { instanceId?: unknown } | null)?.instanceId;
-    if (typeof instanceId !== "string" || !this.lifecycle.providerSessions.isEnabled(instanceId)) return undefined;
+    if (typeof instanceId !== "string") return undefined;
+    const persisted = this.lifecycle.providerSessions.isEnabled(instanceId);
     return (exit) => {
       if (exit._tag !== "Success") return;
-      this.lifecycle.providerSessions.forget(instanceId);
+      // No other VM's earlier sign-in vouches for the instance anymore
+      this.providerBook.forgetInstance(instanceId);
+      if (persisted) this.lifecycle.providerSessions.forget(instanceId);
     };
   }
 
@@ -1995,7 +2198,15 @@ export class HubServer {
       return;
     }
 
-    // 9. Generic fallback -> forward to any running VM if available, else return clean empty/error
+    // 9. Provider setup names no chat: the client's VM for that instance, never one running a turn on it
+    if (
+      (PROVIDER_SETUP_STREAMS.has(tag) || PROVIDER_SETUP_COMMANDS.has(tag)) &&
+      (await this.routeProviderSetup(ws, reqId, tag, payload, headers))
+    ) {
+      return;
+    }
+
+    // 10. Generic fallback -> forward to any running VM if available, else return clean empty/error
     const live = this.anyRunningSandbox();
     if (live) {
       try {
@@ -3692,6 +3903,8 @@ export class HubServer {
       await this.lifecycle.providerSessions.pullBeforeDestroy(sandboxId).catch(() => {});
     }
     this.lifecycle.providerSessions.forgetSandbox(sandboxId);
+    this.providerBook.forgetSandbox(sandboxId);
+    this.providerSetupRouter.forgetSandbox(sandboxId);
 
     this.bridges.get(sandboxId)?.stop();
     this.bridges.delete(sandboxId);
@@ -3914,7 +4127,8 @@ export class HubServer {
   /**
    * Replaces only `serverConfig.providers` in Hub state and broadcasts it. No-op when unchanged or
    * when no config was harvested yet (the bridge folds live statuses into its first harvest).
-   * With several VMs the last writer wins.
+   * A VM's list goes through `ProviderStatusBook.merge` first, so a less informed VM does not erase
+   * a status another live VM confirmed.
    */
   private applyProviderStatuses(providers: unknown[]): boolean {
     const current = this.state.getHub()?.serverConfig;
@@ -3932,8 +4146,13 @@ export class HubServer {
   private handleVmProviderStatuses(sandboxId: string, providers: unknown[]): void {
     const sb = this.state.getHubSandbox(sandboxId);
     if (!sb) return;
-    this.applyProviderStatuses(providers);
+    this.applyProviderStatuses(this.mergeVmProviders(sandboxId, providers));
     this.observeProviderSessions(sb, providers);
+  }
+
+  /** Records a VM's provider list and returns it merged with what other live VMs confirmed. */
+  private mergeVmProviders(sandboxId: string, providers: unknown[]): unknown[] {
+    return this.providerBook.merge(sandboxId, providers, (id) => this.isLiveSandbox(id));
   }
 
   /** Feeds a booted VM's provider list to the session store (capture on `authenticated`). */
@@ -3943,11 +4162,16 @@ export class HubServer {
     this.lifecycle.providerSessions.observe(sb.sandboxId, providers, sb.createdAt);
   }
 
-  /** Re-checks one provider on the VM it was injected into and caches the answer. Never throws. */
+  /**
+   * Re-checks one provider on the VM it was injected into and caches the answer. Never throws.
+   * `refreshModels` makes T3 open a short session, which is what checks the sign-in: Antigravity's
+   * plain health check never does, so without it the VM keeps reporting "not checked yet" (auth
+   * `unknown`, no models) until a chat starts a session there.
+   */
   private refreshInjectedProvider(sandboxId: string, instanceId: string): void {
     const bridge = this.bridges.get(sandboxId);
     if (!bridge) return;
-    const input = { instanceId };
+    const input = { instanceId, refreshModels: true };
     void bridge
       .callUnary("server.refreshProviders", input, 150_000)
       .then((exit) => {
@@ -3957,7 +4181,7 @@ export class HubServer {
         }
         if (!this.state.getHubSandbox(sandboxId)) return;
         const value = exit.value as Record<string, unknown>;
-        this.cacheRefreshedProviders(input, value);
+        this.cacheRefreshedProviders(sandboxId, input, value);
         if (Array.isArray(value.providers)) {
           const sb = this.state.getHubSandbox(sandboxId);
           if (sb) this.observeProviderSessions(sb, value.providers);
@@ -3982,15 +4206,23 @@ export class HubServer {
     const exit = await bridge.callUnary("server.refreshProviders", input, 150_000);
     if (exit._tag !== "Success" || !exit.value || typeof exit.value !== "object") return null;
     const value = exit.value as Record<string, unknown>;
-    this.cacheRefreshedProviders(input, value);
-    return value;
+    return this.cacheRefreshedProviders(bridge.sandbox.sandboxId, input, value);
   }
 
-  /** Merges a `server.refreshProviders` reply into the Hub's cached provider list. */
-  private cacheRefreshedProviders(input: Record<string, unknown>, value: Record<string, unknown>): void {
-    const replied = value.providers;
+  /**
+   * Merges a `server.refreshProviders` reply from a VM into the Hub's cached provider list. Returns
+   * the reply with that VM's list merged like a status report (`mergeVmProviders`).
+   */
+  private cacheRefreshedProviders(
+    sandboxId: string,
+    input: Record<string, unknown>,
+    value: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const raw = value.providers;
     // An empty reply (omitProviders / modelCatalogOnly) and per-cwd snapshots are not the machine list
-    if (Array.isArray(replied) && replied.length > 0 && input.cwd === undefined) {
+    if (Array.isArray(raw) && raw.length > 0 && input.cwd === undefined) {
+      const replied = this.mergeVmProviders(sandboxId, raw);
+      if (replied !== raw) value = { ...value, providers: replied };
       const cached = this.state.getHub()?.serverConfig?.providers;
       let next: unknown[] = replied;
       if (typeof input.instanceId === "string" && Array.isArray(cached)) {
@@ -4007,6 +4239,7 @@ export class HubServer {
       }
       this.applyProviderStatuses(next);
     }
+    return value;
   }
 
   private handleTemplatesHarvested(
@@ -4014,12 +4247,18 @@ export class HubServer {
     templates: { serverConfig?: Record<string, unknown>; lifecycleEvents?: unknown[]; vcsRefs?: unknown },
   ): void {
     let changed = false;
+    // The harvested list is this VM's report: merged like any other, so it does not erase another VM's
+    let serverConfig = templates.serverConfig;
+    if (serverConfig && Array.isArray(serverConfig.providers)) {
+      const merged = this.mergeVmProviders(sandbox.sandboxId, serverConfig.providers);
+      if (merged !== serverConfig.providers) serverConfig = { ...serverConfig, providers: merged };
+    }
     this.state.updateHub((h) => {
-      if (templates.serverConfig) {
+      if (serverConfig) {
         const replayed = this.replayedSettings.get(sandbox.sandboxId);
         h.serverConfig = replayed
-          ? { ...templates.serverConfig, settings: replayed }
-          : this.withSettingsOverlay(templates.serverConfig, h.settingsOverlay);
+          ? { ...serverConfig, settings: replayed }
+          : this.withSettingsOverlay(serverConfig, h.settingsOverlay);
         changed = true;
       }
       if (templates.lifecycleEvents && templates.lifecycleEvents.length > 0) {
