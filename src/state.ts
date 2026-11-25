@@ -492,6 +492,34 @@ export function normalizeGitRepo(input: string): { remoteUrl: string; derivedNam
   return { remoteUrl, derivedName };
 }
 
+/** Home of the `user` account every Boat VM runs T3 as. */
+export const BOAT_VM_HOME = "/home/user";
+
+/**
+ * The absolute path a project lives at inside its Boat VMs. Clients such as T3's "Add to another machine"
+ * send `~/repo`; the workdir is single-quoted into shell commands, where `~` would not expand, so it is
+ * expanded here against the VM user's home. Relative paths and other users' homes (`~bob/...`) are refused.
+ */
+export function normalizeProjectWorkdir(input: string): string {
+  const raw = input.trim();
+  let path: string;
+  if (raw === "~" || raw.startsWith("~/")) {
+    path = `${BOAT_VM_HOME}${raw.slice(1)}`;
+  } else if (raw.startsWith("~")) {
+    throw new Error(`Invalid project folder "${raw}": only ~ (the Boat VM user's home) can be expanded`);
+  } else if (raw.startsWith("/")) {
+    path = raw;
+  } else {
+    throw new Error(`Invalid project folder "${raw}": use an absolute path or one under ~/`);
+  }
+  path = path.replace(/\/{2,}/g, "/").replace(/\/+$/, "");
+  if (!path) throw new Error(`Invalid project folder "${raw}": the filesystem root cannot be a project folder`);
+  if (path.split("/").some((seg) => seg === "." || seg === "..")) {
+    throw new Error(`Invalid project folder "${raw}": "." and ".." are not allowed`);
+  }
+  return path;
+}
+
 export function buildAutoProjectConfig(input: AutoProjectInput): { name: string; project: ProjectConfig } {
   const { remoteUrl, derivedName } = normalizeGitRepo(input.repo);
   const name = (input.name?.trim() || derivedName)
@@ -501,7 +529,7 @@ export function buildAutoProjectConfig(input: AutoProjectInput): { name: string;
   if (!name || name === "base") {
     throw new Error(`Invalid project name "${name || input.name}"`);
   }
-  const workdir = input.workdir?.trim() || `/home/user/${name}`;
+  const workdir = input.workdir?.trim() ? normalizeProjectWorkdir(input.workdir) : `${BOAT_VM_HOME}/${name}`;
   const qUrl = `'${remoteUrl.replace(/'/g, `'\\''`)}'`;
   const qDir = `'${workdir.replace(/'/g, `'\\''`)}'`;
   const bakeCmd = [

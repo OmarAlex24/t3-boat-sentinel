@@ -38,7 +38,7 @@ import { CelestoProvider, SandboxSdkProvider, createSandboxProvider, type Extern
 import { asSandboxProvider, type ProviderCapability, type SandboxProvider } from "./providers/types.ts";
 import { ProviderSessionStore } from "./provider-sessions.ts";
 import { ProviderSetupRouter, ProviderStatusBook } from "./hub-providers.ts";
-import { StateStore } from "./state.ts";
+import { StateStore, buildAutoProjectConfig, normalizeProjectWorkdir } from "./state.ts";
 import { T3ReleaseResolver } from "./t3-release.ts";
 import { ATTACHMENT_UPLOAD_URL_TTL_MS, parseUploadRequest } from "./hub-attachments.ts";
 import { loadT3Contracts } from "./testing/t3-contracts.ts";
@@ -5213,6 +5213,77 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     );
     expect(cloneDone).toBeTruthy();
     expect(boat.snapshots.has("env-cloned-app")).toBe(true);
+
+    // T3's "Add to another machine" sends `~/repo`: it lands in the VM user's home, never in a dir named `~`
+    ws.send(JSON.stringify({
+      _tag: "Request",
+      id: 7,
+      tag: "projectClone.start",
+      payload: {
+        projectId: "proj-tilde-1",
+        title: "tilde-app",
+        createdAt: new Date().toISOString(),
+        remoteUrl: "https://github.com/OmarAlex24/tilde-app.git",
+        destinationPath: "~/tilde-app/",
+      },
+      headers: [],
+    }));
+    const tildeExit = await waitForFrame((f) => f._tag === "Exit" && f.requestId === 7);
+    expect((tildeExit.exit as { _tag: string; value: { cwd: string } })._tag).toBe("Success");
+    expect((tildeExit.exit as { value: { cwd: string } }).value.cwd).toBe("/home/user/tilde-app");
+    const tildeProject = handle.state.getAllProjects(cfg)["tilde-app"];
+    expect(tildeProject.workdir).toBe("/home/user/tilde-app");
+    expect(tildeProject.bakeCmd).toContain("git clone 'https://github.com/OmarAlex24/tilde-app.git' '/home/user/tilde-app'");
+    expect(tildeProject.bootCmd).toContain("'/home/user/tilde-app'");
+    expect(`${tildeProject.bakeCmd}\n${tildeProject.bootCmd}`).not.toContain("~");
+    await waitForFrame(
+      (f) =>
+        f._tag === "Chunk" &&
+        f.requestId === 2 &&
+        ((f.values as Array<Array<{ projectId?: string; phase?: string; destinationPath?: string }>>)[0] ?? []).some(
+          (c) => c.projectId === "proj-tilde-1" && c.phase === "done" && c.destinationPath === "/home/user/tilde-app",
+        ),
+    );
+    expect(boat.execScripts.some((s) => s.includes("'/home/user/tilde-app'"))).toBe(true);
+
+    // A relative folder is refused, and nothing is registered
+    ws.send(JSON.stringify({
+      _tag: "Request",
+      id: 8,
+      tag: "projectClone.start",
+      payload: {
+        projectId: "proj-relative-1",
+        title: "relative-app",
+        createdAt: new Date().toISOString(),
+        remoteUrl: "https://github.com/OmarAlex24/relative-app.git",
+        destinationPath: "relative-app",
+      },
+      headers: [],
+    }));
+    const relExit = await waitForFrame((f) => f._tag === "Exit" && f.requestId === 8);
+    expect((relExit.exit as Record<string, unknown>)._tag).toBe("Failure");
+    expect(JSON.stringify(relExit.exit)).toContain("absolute path");
+    expect(handle.state.getAllProjects(cfg)["relative-app"]).toBeUndefined();
+  });
+
+  test("project workdirs expand ~ to the Boat VM home and refuse relative or other-user paths", () => {
+    expect(normalizeProjectWorkdir("~")).toBe("/home/user");
+    expect(normalizeProjectWorkdir("~/foo")).toBe("/home/user/foo");
+    expect(normalizeProjectWorkdir(" ~/foo/bar/ ")).toBe("/home/user/foo/bar");
+    expect(normalizeProjectWorkdir("/srv//app/")).toBe("/srv/app");
+    expect(() => normalizeProjectWorkdir("foo")).toThrow(/absolute path/);
+    expect(() => normalizeProjectWorkdir("./foo")).toThrow(/absolute path/);
+    expect(() => normalizeProjectWorkdir("~bob/foo")).toThrow(/only ~/);
+    expect(() => normalizeProjectWorkdir("/")).toThrow(/root/);
+    expect(() => normalizeProjectWorkdir("~/a/../b")).toThrow(/not allowed/);
+
+    const { project } = buildAutoProjectConfig({ repo: "acme/foo", workdir: "~/foo" });
+    expect(project.workdir).toBe("/home/user/foo");
+    expect(project.bakeCmd).toContain("'/home/user/foo'");
+    expect(project.bootCmd).toContain("'/home/user/foo'");
+    expect(`${project.bakeCmd}\n${project.bootCmd}`).not.toContain("~");
+    expect(buildAutoProjectConfig({ repo: "acme/foo" }).project.workdir).toBe("/home/user/foo");
+    expect(() => buildAutoProjectConfig({ repo: "acme/foo", workdir: "foo" })).toThrow(/absolute path/);
   });
 
   test("modular SandboxSdkProvider works without snapshots, forwards private preview Cookie headers, and degrades pause gracefully", async () => {
