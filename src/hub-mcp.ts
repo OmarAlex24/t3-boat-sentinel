@@ -1742,22 +1742,43 @@ function extractPullRequestsFromObject(...objs: Array<Record<string, unknown> | 
   return out;
 }
 
-function formatRpcFailure(cause: unknown): string {
-  if (!cause) return "unknown error";
-  if (typeof cause === "string") return cause;
-  if (typeof cause === "object") {
-    const obj = cause as Record<string, unknown>;
-    if (obj.error && typeof obj.error === "object") {
-      const err = obj.error as Record<string, unknown>;
-      if (typeof err.message === "string") return err.message;
-      if (typeof err.reason === "string") return err.reason;
+/**
+ * Text for a failed RPC Exit's `cause`. T3 Code 0.1.12+ (Effect 4) sends the cause as an array of
+ * reasons (`Fail` with `error`, `Die` with `defect`, `Interrupt`); older VMs sent one object.
+ */
+export function formatRpcFailure(cause: unknown): string {
+  if (cause === null || cause === undefined || cause === "") return "unknown error";
+  if (Array.isArray(cause)) {
+    const parts = [...new Set(cause.map(describeCauseReason).filter((p) => p !== ""))];
+    return parts.length > 0 ? parts.join("; ") : "unknown error";
+  }
+  return describeCauseReason(cause) || "unknown error";
+}
+
+function describeCauseReason(reason: unknown): string {
+  if (typeof reason === "string") return reason;
+  if (!reason || typeof reason !== "object") return "";
+  const obj = reason as Record<string, unknown>;
+  if (obj._tag === "Interrupt") return "interrupted";
+  if ("error" in obj) return describeErrorValue(obj.error); // Fail
+  if ("defect" in obj) return describeErrorValue(obj.defect); // Die
+  return describeErrorValue(obj);
+}
+
+function describeErrorValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    // `detail`: ProviderSetupError; `reason`: ServerSelfUpdateError
+    for (const key of ["message", "detail", "reason"]) {
+      const text = obj[key];
+      if (typeof text === "string" && text.trim()) return text;
     }
-    if (typeof obj.message === "string") return obj.message;
   }
   try {
-    return JSON.stringify(cause).slice(0, 300);
+    return (JSON.stringify(value) ?? String(value)).slice(0, 300);
   } catch {
-    return String(cause);
+    return String(value);
   }
 }
 
