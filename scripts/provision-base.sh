@@ -195,11 +195,22 @@ t3_services_stop() {
 restart_t3=0
 installed_ver="$("$t3" --version 2>/dev/null || true)"
 
+# Runs the T3 installer with the given env assignments; on failure shows the end of its log
+install_t3() {
+  if ! curl -fsSL https://t3.codes/install.sh | env "$@" sh >"$sentinel_dir/install.log" 2>&1; then
+    echo "[provision] T3 install failed; end of $sentinel_dir/install.log:" >&2
+    tail -n 20 "$sentinel_dir/install.log" >&2 || true
+    exit 1
+  fi
+}
+
+# Sentinel passes an exact T3_VERSION on providers without snapshots, so the installer downloads
+# that release directly instead of listing releases through the rate-limited GitHub API
 if [ ! -x "$t3" ]; then
   if [ "$T3_VERSION" = "latest" ]; then
-    curl -fsSL https://t3.codes/install.sh | T3CODE_CHANNEL="$T3_CHANNEL" sh >"$sentinel_dir/install.log" 2>&1
+    install_t3 T3CODE_CHANNEL="$T3_CHANNEL"
   else
-    curl -fsSL https://t3.codes/install.sh | T3CODE_VERSION="$T3_VERSION" sh >"$sentinel_dir/install.log" 2>&1
+    install_t3 T3CODE_VERSION="$T3_VERSION"
   fi
   restart_t3=1
 elif [ "$T3_VERSION" = "latest" ]; then
@@ -207,7 +218,7 @@ elif [ "$T3_VERSION" = "latest" ]; then
   new_ver="$("$t3" --version 2>/dev/null || true)"
   [ "$installed_ver" = "$new_ver" ] || restart_t3=1
 elif [ "$installed_ver" != "t3 v$T3_VERSION" ]; then
-  curl -fsSL https://t3.codes/install.sh | T3CODE_VERSION="$T3_VERSION" sh >"$sentinel_dir/install.log" 2>&1
+  install_t3 T3CODE_VERSION="$T3_VERSION"
   restart_t3=1
 fi
 

@@ -16,6 +16,7 @@ import { CelestoProvider, SandboxSdkProvider, createSandboxProvider, type Extern
 import { asSandboxProvider, type ProviderCapability, type SandboxProvider } from "./providers/types.ts";
 import { ProviderSessionStore } from "./provider-sessions.ts";
 import { StateStore } from "./state.ts";
+import { T3ReleaseResolver } from "./t3-release.ts";
 
 class MockBoat implements BoatClient {
   sandboxes = new Map<string, BoatSandbox>();
@@ -336,6 +337,65 @@ describe("LifecycleManager hardening", () => {
     expect(boatLike.provision.script).not.toContain("T3_INSTALL_PROVIDERS");
     expect(boatLike.provision.script).not.toContain("T3_PREPARE_ACP_AGENTS");
     expect(boatLike.provision.timeout).toBe(300);
+  });
+
+  test("t3.version latest: exact version for providers without snapshots, unchanged with snapshots", async () => {
+    const vm = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch() {
+        return Response.json({ projects: [{ id: "vm-p1", title: "my-app", workspaceRoot: "/home/user/my-app" }], threads: [] });
+      },
+    });
+    cleanups.push(() => vm.stop(true));
+
+    const run = async (opts: { snapshots: boolean; githubStatus?: number }) => {
+      const base = makeTestConfig(0);
+      const cfg: SentinelConfig = { ...base, t3: { ...base.t3, version: "latest", channel: "nightly" } };
+      const boat = new MockBoat();
+      boat.snapshots.add("env-my-app");
+      boat.upstreamBaseUrl = `http://127.0.0.1:${vm.port}`;
+      const legacy = asSandboxProvider(boat);
+      const scripts: string[] = [];
+      const provider: SandboxProvider = {
+        ...legacy,
+        name: "test-provider",
+        capabilities: new Set<ProviderCapability>(opts.snapshots ? ["pause", "snapshots"] : ["pause"]),
+        ...(opts.snapshots ? {} : { listSnapshots: undefined, saveSnapshot: undefined }),
+        execOk: (id, script, timeout) => {
+          scripts.push(script);
+          return legacy.execOk(id, script, timeout);
+        },
+      };
+      const githubCalls: string[] = [];
+      const t3Releases = new T3ReleaseResolver({
+        env: {},
+        log: () => {},
+        fetch: async (url) => {
+          githubCalls.push(url);
+          if (opts.githubStatus) return new Response("{}", { status: opts.githubStatus });
+          return Response.json([{ tag_name: "v0.1.11" }, { tag_name: "v0.1.12-nightly.20261124.5209" }]);
+        },
+      });
+      const state = new StateStore(cfg.stateDir, cfg);
+      const lifecycle = new LifecycleManager(cfg, state, provider, undefined, { t3Releases });
+      await lifecycle.spawn("my-app", { slot: "boat-1" });
+      const provision = scripts.find((s) => s.includes("bash ~/.t3-sentinel/provision-base.sh"))!;
+      return { provision, githubCalls };
+    };
+
+    const celestoLike = await run({ snapshots: false });
+    expect(celestoLike.provision).toContain("T3_VERSION='0.1.12-nightly.20261124.5209'");
+    expect(celestoLike.githubCalls).toHaveLength(1);
+
+    const boatLike = await run({ snapshots: true });
+    expect(boatLike.provision).toContain("T3_VERSION='latest'");
+    expect(boatLike.githubCalls).toHaveLength(0);
+
+    // Lookup failure: the VM falls back to the installer's own channel lookup
+    const fallback = await run({ snapshots: false, githubStatus: 403 });
+    expect(fallback.provision).toContain("T3_VERSION='latest'");
+    expect(fallback.provision).toContain("T3_CHANNEL='nightly'");
   });
 
   test("reaper never kills an in-flight bake VM; env-* always bakes from base-t3", async () => {

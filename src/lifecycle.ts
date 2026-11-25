@@ -13,6 +13,7 @@ import type { ProjectConfig, SentinelConfig } from "./config.ts";
 import type { KlavClient } from "./klav.ts";
 import { ProviderSessionStore, STAGED_SESSIONS_DIR } from "./provider-sessions.ts";
 import type { SlotRecord, StateStore } from "./state.ts";
+import { T3ReleaseResolver } from "./t3-release.ts";
 import { ensureT3Project, launchT3Thread, type LaunchThreadOptions } from "./t3rpc.ts";
 
 const SCRIPTS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "scripts");
@@ -60,15 +61,31 @@ export class LifecycleManager {
   private readonly boat: SandboxProvider;
   /** Provider sign-ins synced across chat VMs (`t3.persistProviderSessions`). */
   readonly providerSessions: ProviderSessionStore;
+  /** Exact T3 versions for providers without snapshots (`t3.version: latest`). */
+  private readonly t3Releases: T3ReleaseResolver;
 
   constructor(
     private readonly config: SentinelConfig,
     private readonly state: StateStore,
     provider: SandboxProvider | LegacyBoatClient,
     private readonly klav?: KlavClient,
+    opts: { t3Releases?: T3ReleaseResolver } = {},
   ) {
     this.boat = asSandboxProvider(provider);
     this.providerSessions = new ProviderSessionStore(config, this.boat);
+    this.t3Releases = opts.t3Releases ?? new T3ReleaseResolver();
+  }
+
+  /**
+   * `T3_VERSION` for `provision-base.sh`. Providers with snapshots get `t3.version` unchanged (the
+   * baked image already carries T3). Providers without them install T3 on every VM, so `latest`
+   * becomes an exact version looked up here once, keeping the VM off the rate-limited GitHub API.
+   */
+  async provisionT3Version(): Promise<string> {
+    const version = this.config.t3.version;
+    const supportsSnapshots = hasCapability(this.boat, "snapshots") && typeof this.boat.listSnapshots === "function";
+    if (supportsSnapshots || version !== "latest") return version;
+    return this.t3Releases.resolve(version, this.config.t3.channel);
   }
 
   getProvider(): SandboxProvider {
@@ -982,7 +999,7 @@ export class LifecycleManager {
     }
 
     const envVars = [
-      `T3_VERSION=${shellQuote(this.config.t3.version)}`,
+      `T3_VERSION=${shellQuote(await this.provisionT3Version())}`,
       `T3_CHANNEL=${shellQuote(this.config.t3.channel)}`,
       `SLOT_ENV_ID=${shellQuote(environmentId)}`,
       `SLOT_LABEL=${shellQuote(label)}`,
