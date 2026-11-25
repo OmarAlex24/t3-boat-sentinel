@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { ClientCredentialRecord } from "./auth.ts";
 import type { ProjectConfig, SentinelConfig } from "./config.ts";
+import { normalizeSettingsOverlay, type HubSettingsOverlay } from "./hub-settings.ts";
 
 export type SlotPhase = "empty" | "provisioning" | "running" | "waking" | "sleeping" | "destroying";
 
@@ -103,6 +104,11 @@ export interface HubStateRecord {
   projectTemplates: Record<string, HubProjectTemplate>;
   /** Written only after a whole self-update round succeeds, so a partial failure is retried. */
   selfUpdate: HubSelfUpdateRecord | null;
+  /**
+   * The user's settings changes made through the Hub (`server.updateSettings`), replayed on every
+   * VM after spawn, resume and reconnect. May hold credentials the user typed; never logged.
+   */
+  settingsOverlay: HubSettingsOverlay | null;
 }
 
 export interface PersistedState {
@@ -206,6 +212,7 @@ export class StateStore {
         lifecycleEvents: Array.isArray(prevHub?.lifecycleEvents) ? prevHub.lifecycleEvents : null,
         projectTemplates: prevHub?.projectTemplates ?? {},
         selfUpdate: prevHub?.selfUpdate ?? null,
+        settingsOverlay: normalizeSettingsOverlay(prevHub?.settingsOverlay),
       };
     }
 
@@ -305,6 +312,7 @@ export class StateStore {
         lifecycleEvents: null,
         projectTemplates: {},
         selfUpdate: null,
+        settingsOverlay: null,
       };
       this.save();
     }
