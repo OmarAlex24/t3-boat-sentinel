@@ -119,7 +119,7 @@ export type SandboxProviderConfig =
   | {
       /** Celesto (celesto.ai) cloud computers over the REST API. No snapshots: T3 installs at boot. */
       type: "celesto";
-      /** Resolved API key (`provider.apiKey`, else env `CELESTO_API_KEY`). */
+      /** Resolved API key (`provider.apiKey`, else env `CELESTO_API_KEY`); empty when neither is set. */
       apiKey: string;
       baseUrl?: string;
       /** Computer template (default "coding-agent"). */
@@ -356,10 +356,9 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
       const raw = parsed.provider as Record<string, unknown>;
       const configured = typeof raw.apiKey === "string" ? raw.apiKey.trim() : "";
       // An unset `${VAR}` placeholder stays literal after expansion: treat it as missing
+      // May stay empty: CLI commands that only call the daemon need no key. `serve` and the first
+      // Celesto API call fail clearly without one.
       const apiKey = configured && !/^\$\{[A-Z0-9_]+\}$/.test(configured) ? configured : (process.env.CELESTO_API_KEY ?? "").trim();
-      if (!apiKey) {
-        throw new Error("Celesto provider needs an API key: set provider.apiKey or the CELESTO_API_KEY environment variable");
-      }
       const sizeMap =
         raw.sizeMap && typeof raw.sizeMap === "object"
           ? Object.fromEntries(Object.entries(raw.sizeMap as Record<string, unknown>).map(([k, v]) => [k, String(v)]))

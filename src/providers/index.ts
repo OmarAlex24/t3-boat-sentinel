@@ -5,7 +5,7 @@ import { SandboxSdkProvider } from "./sandbox-sdk.ts";
 import type { SandboxProvider } from "./types.ts";
 
 export { BoatProvider } from "./boat.ts";
-export { CelestoProvider, type CelestoProviderOptions } from "./celesto.ts";
+export { CELESTO_MISSING_KEY_MESSAGE, CelestoProvider, type CelestoProviderOptions } from "./celesto.ts";
 export { SandboxSdkProvider, type ExternalSdkProviderLike, type SandboxSdkProviderConfig } from "./sandbox-sdk.ts";
 export {
   asSandboxProvider,

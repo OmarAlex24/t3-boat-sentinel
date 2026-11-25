@@ -22,6 +22,9 @@ export const CELESTO_UPLOAD_CHUNK_CHARS = 9_000;
 /** Celesto rejects an exec `timeout` above 300 seconds. */
 export const CELESTO_MAX_EXEC_TIMEOUT_SECS = 300;
 
+export const CELESTO_MISSING_KEY_MESSAGE =
+  "Celesto provider needs an API key: set provider.apiKey or the CELESTO_API_KEY environment variable";
+
 /** Raw Celesto size ids (`size_id`), passed through unchanged. */
 const CELESTO_SIZE_IDS = new Set(["nano", "small", "standard", "large"]);
 /**
@@ -118,10 +121,8 @@ export class CelestoProvider implements SandboxProvider {
   private readonly creating = new Set<string>();
 
   constructor(opts: CelestoProviderOptions) {
-    if (!opts.apiKey || opts.apiKey.trim().length === 0) {
-      throw new Error("Celesto provider needs an API key: set provider.apiKey or the CELESTO_API_KEY environment variable");
-    }
-    this.apiKey = opts.apiKey.trim();
+    // Checked lazily (`requireApiKey`) so commands that never reach Celesto work without a key
+    this.apiKey = (opts.apiKey ?? "").trim();
     this.baseUrl = (opts.baseUrl ?? CELESTO_DEFAULT_BASE_URL).replace(/\/+$/, "");
     this.templateId = opts.templateId ?? CELESTO_DEFAULT_TEMPLATE;
     this.user = opts.user ?? CELESTO_DEFAULT_USER;
@@ -138,11 +139,17 @@ export class CelestoProvider implements SandboxProvider {
 
   // ---------------------------------------------------------------- HTTP
 
+  /** Throws when no API key is configured. Every Celesto API call goes through it. */
+  requireApiKey(): void {
+    if (!this.apiKey) throw new Error(CELESTO_MISSING_KEY_MESSAGE);
+  }
+
   private async request<T>(
     method: string,
     path: string,
     opts: { body?: unknown; headers?: Record<string, string>; timeoutMs?: number; redactBody?: boolean } = {},
   ): Promise<{ status: number; data: T }> {
+    this.requireApiKey();
     const timeoutMs = opts.timeoutMs ?? 30_000;
     const init: RequestInit & { timeout?: number | boolean } = {
       method,
@@ -229,6 +236,8 @@ export class CelestoProvider implements SandboxProvider {
     if (opts.fromSnapshot) {
       throw new Error("Celesto provider does not support snapshots");
     }
+    // Before the registry write: a keyless POST would leave an entry to retry and recover forever
+    this.requireApiKey();
     const idempotencyKey = randomUUID();
     const sizeId = this.resolveSize(opts.size);
     // Recorded BEFORE the POST so a crash mid-create still leaves a key to recover the id with

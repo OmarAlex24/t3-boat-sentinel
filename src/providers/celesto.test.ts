@@ -161,11 +161,27 @@ function setup(opts: { user?: string } = {}) {
 }
 
 describe("CelestoProvider", () => {
-  test("declares pause only and refuses an empty API key", () => {
+  test("declares pause only; a missing API key fails on the first API call, not at construction", async () => {
     const { provider } = setup();
     expect([...provider.capabilities]).toEqual(["pause"]);
     expect("download" in provider).toBe(false);
-    expect(() => new CelestoProvider({ apiKey: "  ", stateDir: "/tmp" })).toThrow(/CELESTO_API_KEY/);
+
+    const stateDir = mkdtempSync(join(tmpdir(), "t3s-celesto-nokey-"));
+    dirs.push(stateDir);
+    const calls: string[] = [];
+    const keyless = new CelestoProvider({
+      apiKey: "  ",
+      stateDir,
+      fetch: async (url) => {
+        calls.push(url);
+        return new Response("{}");
+      },
+    });
+    await expect(keyless.info("c1")).rejects.toThrow(/CELESTO_API_KEY/);
+    await expect(keyless.create({ name: "t3s-hub-x", size: "default" })).rejects.toThrow(/CELESTO_API_KEY/);
+    expect(calls).toHaveLength(0);
+    // create refused before recording anything to recover later
+    expect(keyless.registryEntries()).toEqual([]);
   });
 
   test("create sends Idempotency-Key + size_id and never cpus or RAM, then waits for running", async () => {

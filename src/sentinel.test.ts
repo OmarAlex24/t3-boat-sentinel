@@ -246,15 +246,15 @@ describe("Celesto provider config", () => {
     return path;
   }
 
-  test("reads the API key from config or CELESTO_API_KEY and fails clearly without either", () => {
+  test("reads the API key from config or CELESTO_API_KEY; without either, config still loads", () => {
     const prev = process.env.CELESTO_API_KEY;
     try {
       delete process.env.CELESTO_API_KEY;
-      expect(() => loadConfig(writeYaml("provider:\n  type: celesto\n"))).toThrow(/CELESTO_API_KEY/);
+      expect(loadConfig(writeYaml("provider:\n  type: celesto\n")).provider).toEqual({ type: "celesto", apiKey: "" });
       // An unset ${VAR} placeholder counts as missing
-      expect(() => loadConfig(writeYaml("provider:\n  type: celesto\n  apiKey: ${CELESTO_KEY_UNSET_X}\n"))).toThrow(
-        /CELESTO_API_KEY/,
-      );
+      const unset = loadConfig(writeYaml("provider:\n  type: celesto\n  apiKey: ${CELESTO_KEY_UNSET_X}\n"));
+      expect(unset.provider).toEqual({ type: "celesto", apiKey: "" });
+      expect(createSandboxProvider(unset)).toBeInstanceOf(CelestoProvider);
 
       process.env.CELESTO_API_KEY = "cel_from_env";
       const fromEnv = loadConfig(writeYaml("provider:\n  type: celesto\n  user: ohm\n  sizeMap: { medium: standard }\n"));
@@ -268,6 +268,39 @@ describe("Celesto provider config", () => {
     } finally {
       if (prev === undefined) delete process.env.CELESTO_API_KEY;
       else process.env.CELESTO_API_KEY = prev;
+    }
+  });
+
+  test("CLI: daemon-only commands work without a Celesto key; serve refuses to start", async () => {
+    const seen: string[] = [];
+    const daemon = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch(req) {
+        seen.push(new URL(req.url).pathname);
+        return Response.json({ ok: true });
+      },
+    });
+    try {
+      const cfgPath = writeYaml("provider:\n  type: celesto\n");
+      const env: Record<string, string> = { ...(process.env as Record<string, string>), SENTINEL_CONFIG: cfgPath, SENTINEL_URL: `http://127.0.0.1:${daemon.port}` };
+      delete env.CELESTO_API_KEY;
+      const cli = async (...args: string[]) => {
+        const proc = Bun.spawn([process.execPath, join(import.meta.dir, "index.ts"), ...args], { env, stdout: "pipe", stderr: "pipe" });
+        const [code, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+        return { code, stderr };
+      };
+      for (const args of [["token", "hub", "x"], ["revoke", "hub"], ["forget-session", "antigravity"]]) {
+        const res = await cli(...args);
+        expect({ args, code: res.code, stderr: res.stderr }).toEqual({ args, code: 0, stderr: "" });
+      }
+      expect(seen).toEqual(["/api/token", "/api/revoke", "/api/forget-session"]);
+
+      const serve = await cli("serve");
+      expect(serve.code).not.toBe(0);
+      expect(serve.stderr).toContain("CELESTO_API_KEY");
+    } finally {
+      daemon.stop(true);
     }
   });
 });
