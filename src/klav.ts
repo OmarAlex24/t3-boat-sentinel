@@ -396,3 +396,154 @@ export class KlavCliProvider implements KlavClient {
     }
   }
 }
+
+/**
+ * Port `klav-forward` answers on inside the VM. Not `KlavGlobalConfig.proxyPort`: that is the port of
+ * `klav-proxy serve` on the issuer host.
+ */
+export const KLAV_FORWARD_PORT = 8790;
+
+/** What one probe of the VM found; collected by a script, judged here so the decision is testable. */
+export interface ForwarderFacts {
+  /** Exit code of `klav-forward down`; `null` when it was not run or `klav-forward` is missing. */
+  downExit: number | null;
+  /** Something listens on 127.0.0.1:{@link KLAV_FORWARD_PORT}. */
+  listening: boolean;
+  /** PID recorded in `~/.klav-forward/state.json`, when one is there. */
+  statePid: number | null;
+  /** `/proc/<statePid>/comm`, when that process exists. */
+  comm: string | null;
+  /** `statePid` holds the listening socket on 127.0.0.1:{@link KLAV_FORWARD_PORT}. */
+  pidOwnsListener: boolean;
+}
+
+export type ForwarderVerdict =
+  | { action: "none" }
+  | { action: "stop"; pid: number }
+  | { action: "refuse"; reason: string };
+
+const FORWARD_PORT_HEX = KLAV_FORWARD_PORT.toString(16).toUpperCase().padStart(4, "0");
+
+/** Shell lines that set `inodes` to the socket inodes listening on 127.0.0.1:8790 (no `ss` needed). */
+const LISTENER_INODES = [
+  `inodes="$(awk 'NR>1 && toupper($2)=="0100007F:${FORWARD_PORT_HEX}" && $4=="0A" {print $10}' /proc/net/tcp 2>/dev/null)"`,
+];
+
+/** Shell lines that set `owns=1` when `$pid` holds one of `$inodes`. */
+const PID_OWNS_LISTENER = [
+  `owns=0`,
+  `for ino in $inodes; do`,
+  `  if ls -l "/proc/$pid/fd" 2>/dev/null | grep -qF "socket:[$ino]"; then owns=1; fi`,
+  `done`,
+];
+
+/**
+ * Runs `klav-forward down` (bounded, output discarded: it never carries the package or the env), then
+ * prints only facts as `key=value` lines. Never prints the state file, the package or `klav-forward env`.
+ */
+export function forwarderProbeScript(downTimeoutSecs = 20): string {
+  return [
+    `# t3s:klav-forward-probe`,
+    `set +e`,
+    `if command -v klav-forward >/dev/null 2>&1; then`,
+    `  if command -v timeout >/dev/null 2>&1; then timeout ${downTimeoutSecs} klav-forward down >/dev/null 2>&1; else klav-forward down >/dev/null 2>&1; fi`,
+    `  echo "down_exit=$?"`,
+    `fi`,
+    ...LISTENER_INODES,
+    `if [ -n "$inodes" ]; then echo "listening=1"; else echo "listening=0"; fi`,
+    // The forwarder's own PID is the top-level "pid" key (seen on production VMs)
+    `pid="$(grep -oE '"pid"[[:space:]]*:[[:space:]]*[0-9]+' "$HOME/.klav-forward/state.json" 2>/dev/null | head -n1 | grep -oE '[0-9]+$')"`,
+    `echo "state_pid=$pid"`,
+    `if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then`,
+    `  echo "comm=$(cat "/proc/$pid/comm" 2>/dev/null)"`,
+    ...PID_OWNS_LISTENER.map((l) => `  ${l}`),
+    `  echo "owns_listener=$owns"`,
+    `fi`,
+    `exit 0`,
+  ].join("\n");
+}
+
+export function parseForwarderProbe(stdout: string): ForwarderFacts {
+  const kv = new Map<string, string>();
+  for (const line of stdout.split(/\r?\n/)) {
+    const m = line.trim().match(/^([a-z_]+)=(.*)$/);
+    if (m) kv.set(m[1]!, m[2]!.trim());
+  }
+  const int = (v: string | undefined) => (v !== undefined && /^\d+$/.test(v) ? Number(v) : null);
+  return {
+    downExit: int(kv.get("down_exit")),
+    listening: kv.get("listening") === "1",
+    statePid: int(kv.get("state_pid")),
+    comm: kv.get("comm") || null,
+    pidOwnsListener: kv.get("owns_listener") === "1",
+  };
+}
+
+/**
+ * Stops a forwarder only when it is provably the one the Hub started: the PID from its state file is a
+ * `klav-forward` process that itself listens on 127.0.0.1:8790. Anything else on the port is left alone.
+ */
+export function judgeForwarder(f: ForwarderFacts): ForwarderVerdict {
+  if (!f.listening) return { action: "none" };
+  if (f.statePid === null || f.statePid <= 1) {
+    return { action: "refuse", reason: `port ${KLAV_FORWARD_PORT} is in use and ~/.klav-forward/state.json names no process` };
+  }
+  if (f.comm !== "klav-forward") {
+    return { action: "refuse", reason: `port ${KLAV_FORWARD_PORT} is in use and the recorded PID is not a klav-forward process` };
+  }
+  if (!f.pidOwnsListener) {
+    return { action: "refuse", reason: `port ${KLAV_FORWARD_PORT} is held by another process than the recorded klav-forward` };
+  }
+  return { action: "stop", pid: f.statePid };
+}
+
+/** Re-checks the PID right before signalling it (it may have exited or been reused), then TERM, then KILL. */
+export function forwarderStopScript(pid: number, termTimeoutSecs = 10): string {
+  if (!Number.isInteger(pid) || pid <= 1) throw new Error(`refusing to stop PID ${pid}`);
+  const polls = Math.max(1, Math.round(termTimeoutSecs * 5));
+  return [
+    `# t3s:klav-forward-stop`,
+    `set +e`,
+    `pid=${pid}`,
+    `if [ "$(cat "/proc/$pid/comm" 2>/dev/null)" != "klav-forward" ]; then echo "stop=mismatch"; exit 0; fi`,
+    ...LISTENER_INODES,
+    ...PID_OWNS_LISTENER,
+    `if [ "$owns" != "1" ]; then echo "stop=mismatch"; exit 0; fi`,
+    `kill -TERM "$pid" 2>/dev/null`,
+    `for _ in $(seq 1 ${polls}); do [ -d "/proc/$pid" ] || { echo "stop=term"; exit 0; }; sleep 0.2; done`,
+    `kill -KILL "$pid" 2>/dev/null`,
+    `for _ in $(seq 1 25); do [ -d "/proc/$pid" ] || { echo "stop=kill"; exit 0; }; sleep 0.2; done`,
+    `echo "stop=alive"`,
+    `exit 0`,
+  ].join("\n");
+}
+
+export type ForwarderReleaseOutcome = "clear" | "stopped";
+
+/**
+ * Leaves 127.0.0.1:8790 free in a VM: `klav-forward down`, and when a leftover forwarder still answers
+ * because `down` cannot reach it (another version's control socket), stops it itself, but only after
+ * {@link judgeForwarder} verified it. Throws, with a message free of secrets, when the port stays taken.
+ */
+export async function releaseVmForwarder(
+  boat: Pick<SandboxProvider, "exec">,
+  sandboxId: string,
+  opts: { termTimeoutSecs?: number } = {},
+): Promise<ForwarderReleaseOutcome> {
+  const probe = await boat.exec(sandboxId, forwarderProbeScript(), 60);
+  const facts = parseForwarderProbe(probe.stdout);
+  const verdict = judgeForwarder(facts);
+  if (verdict.action === "none") return "clear";
+  if (verdict.action === "refuse") throw new Error(`klav-forward cleanup: ${verdict.reason}; nothing was stopped`);
+
+  const termTimeoutSecs = opts.termTimeoutSecs ?? 10;
+  const res = await boat.exec(sandboxId, forwarderStopScript(verdict.pid, termTimeoutSecs), termTimeoutSecs + 30);
+  const outcome = res.stdout.match(/stop=(term|kill|mismatch|alive)/)?.[1] ?? "unknown";
+  if (outcome === "term" || outcome === "kill") {
+    console.log(
+      `[klav-forward] stopped leftover forwarder (pid ${verdict.pid}, ${outcome === "term" ? "TERM" : "KILL"}) in ${sandboxId}; \`klav-forward down\` exited ${facts.downExit ?? "n/a"}`,
+    );
+    return "stopped";
+  }
+  throw new Error(`klav-forward cleanup: leftover forwarder pid ${verdict.pid} was not stopped (${outcome})`);
+}

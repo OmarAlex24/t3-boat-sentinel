@@ -9,7 +9,15 @@ import { SlotAuth, hashToken } from "./auth.ts";
 import type { BoatClient, BoatExecResult, BoatSandbox, ResumeResult } from "./boat.ts";
 import { expandEnvPlaceholders, loadConfig, type SentinelConfig } from "./config.ts";
 import { createSentinelServer, type SentinelServerHandle } from "./index.ts";
-import type { KlavClient } from "./klav.ts";
+import {
+  forwarderProbeScript,
+  forwarderStopScript,
+  judgeForwarder,
+  parseForwarderProbe,
+  type ForwarderFacts,
+  type KlavClient,
+} from "./klav.ts";
+import { HubWakeCooldownError, redactForLog, wakeBackoffMs } from "./hub-wake.ts";
 import { LifecycleManager } from "./lifecycle.ts";
 import { formatRpcFailure } from "./hub-mcp.ts";
 import { buildPlaceholderThread, failPlaceholderThread, placeholderInputFrom } from "./hub-placeholder.ts";
@@ -1838,6 +1846,54 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
         error: { _tag: "OrchestrationV2DispatchCommandError", commandId: "cmd-m", commandType: "message.dispatch" },
       });
       expect(String(exit.cause[0].error!.message)).toContain("klav-forward is not listening");
+    });
+
+    test("during the backoff after a failed wake, chat requests fail at once with the redacted reason and never resume", async () => {
+      const { client, boat, handle, sandboxId } = await sleepingChat("vm-backoff");
+      let resumeCalls = 0;
+      const origResume = boat.resume.bind(boat);
+      boat.resume = async (id: string) => {
+        resumeCalls++;
+        return origResume(id);
+      };
+      boat.resumeError = new Error("boat resume failed: KLAV_SANDBOX=ksb1_onetimepackagesecret capacity unavailable");
+
+      client.request("sub", "orchestration.subscribeThread", { threadId: "thread-zz" });
+      const failed = await client.waitForFrame(threadChunk("sub", (n) => n?.outcome === "failed"));
+      const notice = noticeOf(failed)!;
+      expect(notice.detail).toContain("capacity unavailable");
+      expect(notice.detail).not.toContain("ksb1_onetimepackagesecret");
+      expect(resumeCalls).toBe(1);
+      const retryAfter = handle.state.getHubSandbox(sandboxId)!.wakeFailure!.retryAfter;
+      expect(Date.parse(retryAfter)).toBeGreaterThan(Date.now());
+
+      // A chat-scoped command and a re-opened chat during the cooldown: a clear failure at once, no resume
+      const started = Date.now();
+      client.request("msg", "orchestration.dispatchCommand", {
+        type: "message.dispatch",
+        commandId: "cmd-b",
+        threadId: "thread-zz",
+        messageId: "m-b",
+        text: "still there?",
+        attachments: [],
+      });
+      client.request("term", "terminal.open", { threadId: "thread-zz", terminalId: "t-1" });
+      client.request("sub2", "orchestration.subscribeThread", { threadId: "thread-zz" });
+      const msg = (await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "msg", 1_000)).exit as {
+        _tag: string;
+        cause: Array<{ error?: Record<string, unknown> }>;
+      };
+      expect(msg._tag).toBe("Failure");
+      expect(String(msg.cause[0].error!.message)).toContain(`next try after ${retryAfter}`);
+      expect(String(msg.cause[0].error!.message)).not.toContain("ksb1_onetimepackagesecret");
+      const term = (await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "term", 1_000)).exit as { _tag: string };
+      expect(term._tag).toBe("Failure");
+      const reopened = noticeOf(await client.waitForFrame(threadChunk("sub2", (n) => n?.outcome === "failed"), 1_000))!;
+      expect(reopened.summary).toContain(`next try is allowed after ${retryAfter}`);
+      expect(reopened.detail).toContain("capacity unavailable");
+      expect(Date.now() - started).toBeLessThan(1_000);
+      await Bun.sleep(50);
+      expect(resumeCalls).toBe(1);
     });
 
     test("automations follow the VMs: no failure when the VM sleeps, back on the next VM that opens", async () => {
@@ -4349,6 +4405,401 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     expect(added.structuredContent.ok).toBe(true);
     expect(added.structuredContent.fallbackReady).toBe(true);
     expect((added.structuredContent.repositoryIdentity as { owner: string; name: string }).name).toBe("new-svc");
+  });
+
+  describe("sleep and wake with Klav proxy mode", () => {
+    /** Forwarder the fake VM reports; `null` fields mean "absent". */
+    type FakeForwarder = { listening: boolean; statePid: number | null; comm: string | null; owns: boolean; downExit: number };
+
+    class KlavVmBoat extends MockBoat {
+      forwarder: FakeForwarder = { listening: false, statePid: null, comm: null, owns: false, downExit: 0 };
+      stopScripts: string[] = [];
+      failHostPublic = false;
+      constructor(readonly log: string[]) {
+        super();
+      }
+      override async exec(id: string, script: string): Promise<BoatExecResult> {
+        if (script.includes("t3s:klav-forward-probe")) {
+          this.log.push("vm:klav-forward-down");
+          const f = this.forwarder;
+          const lines = [`down_exit=${f.downExit}`, `listening=${f.listening ? 1 : 0}`, `state_pid=${f.statePid ?? ""}`];
+          if (f.statePid !== null && f.comm !== null) lines.push(`comm=${f.comm}`, `owns_listener=${f.owns ? 1 : 0}`);
+          return { exitCode: 0, stdout: `${lines.join("\n")}\n`, stderr: "" };
+        }
+        if (script.includes("t3s:klav-forward-stop")) {
+          this.stopScripts.push(script);
+          this.log.push(`vm:stop-forwarder:${script.match(/^pid=(\d+)$/m)?.[1]}`);
+          this.forwarder = { listening: false, statePid: null, comm: null, owns: false, downExit: 0 };
+          return { exitCode: 0, stdout: "stop=term\n", stderr: "" };
+        }
+        return super.exec(id, script);
+      }
+      override async stop(id: string): Promise<void> {
+        this.log.push("pause");
+        return super.stop(id);
+      }
+      override async resume(id: string): Promise<ResumeResult> {
+        this.log.push("resume");
+        return super.resume(id);
+      }
+      override async hostPublic(id: string): Promise<string> {
+        if (this.failHostPublic) throw new Error("boat port failed for https://sb.boat.test/x?_token=t3s_secretportauthvalue");
+        return super.hostPublic(id);
+      }
+    }
+
+    class FakeKlav implements KlavClient {
+      seq = 0;
+      failProvision: string | null = null;
+      constructor(readonly log: string[]) {}
+      async provisionForSandbox() {
+        this.log.push("klav:start");
+        if (this.failProvision) throw new Error(this.failProvision);
+        const agentName = `ksb-new-${++this.seq}`;
+        return { agentName, project: "dev" };
+      }
+      async revokeForSandbox(handle: string) {
+        this.log.push(`klav:stop:${handle}`);
+      }
+    }
+
+    async function startKlavHub() {
+      const vm = startFakeVmT3Server("klav");
+      cleanups.push(() => vm.server.stop(true));
+      const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-klav-wake-"));
+      cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+      const log: string[] = [];
+      const boat = new KlavVmBoat(log);
+      boat.upstreamBaseUrl = vm.url;
+      boat.sandboxes.set("sb-k", { id: "sb-k", name: "t3s-k", state: "running", stoppedAt: null });
+      const klav = new FakeKlav(log);
+      const base = makeTestConfig(0);
+      const cfg: SentinelConfig = {
+        ...base,
+        stateDir: dir,
+        hub: { host: "boat.boat.example.com", label: "Boat", maxSandboxes: 5 },
+        klav: { mode: "proxy", proxyPort: 18790, defaultTtl: "8h", defaultAllow: [], defaultDeny: [], defaultExpires: "8h" },
+        projects: { "my-app": { ...base.projects["my-app"]!, klav: { profiles: ["dev"] } } },
+      };
+      const handle = createSentinelServer(cfg, boat, { startBackgroundLoops: false, klav });
+      cleanups.push(() => handle.stop());
+      const hub = handle.hub!;
+      hub.wakeBackoffBaseMs = 60_000;
+      hub.forwarderTermTimeoutSecs = 1;
+      const now = new Date().toISOString();
+      handle.state.setHubSandbox({
+        sandboxId: "sb-k",
+        project: "my-app",
+        hubProjectId: "hub-proj",
+        vmProjectId: vm.vmProjectId,
+        snapshot: "env-my-app",
+        size: "default",
+        upstreamUrl: vm.url,
+        upstreamHeaders: null,
+        upstreamToken: "upstream-secret-token",
+        watchdogSecret: "wd-secret",
+        llmToken: null,
+        klavAgentName: "ksb-old",
+        threadIds: ["thread-k"],
+        worktreePaths: [],
+        phase: "running",
+        createdAt: now,
+        lastActiveAt: now,
+        lastHeartbeatAt: now,
+        sleepingSince: null,
+      });
+      const events: Array<{ type: string; step?: string; reason?: string }> = [];
+      hub.onWakeTransition((e) => events.push(e));
+      return { boat, klav, hub, handle, log, events };
+    }
+
+    /** Captures console output for the duration of `fn`. */
+    async function captureLogs<T>(fn: () => Promise<T>): Promise<{ lines: string[]; result: T | undefined; error: unknown }> {
+      const lines: string[] = [];
+      const orig = { log: console.log, warn: console.warn, error: console.error };
+      const sink = (...args: unknown[]) => lines.push(args.map((a) => (a instanceof Error ? a.message : String(a))).join(" "));
+      console.log = sink;
+      console.warn = sink;
+      console.error = sink;
+      try {
+        return { lines, result: await fn(), error: undefined };
+      } catch (error) {
+        return { lines, result: undefined, error };
+      } finally {
+        Object.assign(console, orig);
+      }
+    }
+
+    test("sleep stops klav-forward and ends the Klav sandbox before pausing", async () => {
+      const { hub, handle, log } = await startKlavHub();
+      await hub.sleepHubSandbox("sb-k");
+      expect(log).toEqual(["vm:klav-forward-down", "klav:stop:ksb-old", "pause"]);
+      const sb = handle.state.getHubSandbox("sb-k")!;
+      expect(sb.phase).toBe("sleeping");
+      expect(sb.klavAgentName).toBeNull();
+      expect(sb.llmToken).toBeNull();
+    });
+
+    test("concurrent idle events pause once", async () => {
+      const { hub, log } = await startKlavHub();
+      await Promise.all([hub.sleepHubSandbox("sb-k"), hub.sleepHubSandbox("sb-k")]);
+      expect(log.filter((l) => l === "pause")).toHaveLength(1);
+      expect(log.filter((l) => l === "klav:stop:ksb-old")).toHaveLength(1);
+    });
+
+    test("wake provisions a fresh Klav sandbox after the forwarder is released", async () => {
+      const { hub, handle, log, events } = await startKlavHub();
+      await hub.sleepHubSandbox("sb-k");
+      log.length = 0;
+      const [a, b] = await Promise.all([hub.wakeHubSandbox("sb-k"), hub.wakeHubSandbox("sb-k")]);
+      expect(a).toBe(b);
+      expect(log).toEqual(["resume", "vm:klav-forward-down", "klav:start"]);
+      const sb = handle.state.getHubSandbox("sb-k")!;
+      expect(sb.phase).toBe("running");
+      expect(sb.klavAgentName).toBe("ksb-new-1");
+      expect(sb.wakeFailure ?? null).toBeNull();
+      expect(events.map((e) => e.type)).toEqual(["wake-start", "wake-success"]);
+    });
+
+    test("wake ends a Klav sandbox left by a pause the Hub did not make", async () => {
+      const { hub, handle, log } = await startKlavHub();
+      handle.state.updateHubSandbox("sb-k", (s) => {
+        s.phase = "sleeping";
+        s.sleepingSince = new Date().toISOString();
+      });
+      await hub.wakeHubSandbox("sb-k");
+      expect(log).toEqual(["resume", "klav:stop:ksb-old", "vm:klav-forward-down", "klav:start"]);
+      expect(handle.state.getHubSandbox("sb-k")!.klavAgentName).toBe("ksb-new-1");
+    });
+
+    test("a leftover forwarder `down` cannot reach is stopped only when verified as klav-forward on 8790", async () => {
+      const { hub, handle, boat, log } = await startKlavHub();
+      await hub.sleepHubSandbox("sb-k");
+      log.length = 0;
+      // What production hit: `down` exits 1, the old forwarder still answers on 8790
+      boat.forwarder = { listening: true, statePid: 4242, comm: "klav-forward", owns: true, downExit: 1 };
+      await hub.wakeHubSandbox("sb-k");
+      expect(log).toEqual(["resume", "vm:klav-forward-down", "vm:stop-forwarder:4242", "klav:start"]);
+      expect(boat.stopScripts[0]).toContain('kill -TERM "$pid"');
+      expect(boat.stopScripts[0]).toContain('kill -KILL "$pid"');
+      expect(boat.stopScripts[0]).toContain('!= "klav-forward"');
+      expect(handle.state.getHubSandbox("sb-k")!.phase).toBe("running");
+    });
+
+    test("a process on 8790 that is not the recorded klav-forward is never stopped, and no Klav sandbox is minted", async () => {
+      const { hub, handle, boat, log, events } = await startKlavHub();
+      await hub.sleepHubSandbox("sb-k");
+      log.length = 0;
+      boat.forwarder = { listening: true, statePid: 4242, comm: "node", owns: true, downExit: 1 };
+      await expect(hub.wakeHubSandbox("sb-k")).rejects.toThrow(/klav-forward-cleanup/);
+      expect(boat.stopScripts).toHaveLength(0);
+      expect(log).toEqual(["resume", "vm:klav-forward-down", "pause"]);
+      const sb = handle.state.getHubSandbox("sb-k")!;
+      expect(sb.phase).toBe("sleeping");
+      expect(sb.wakeFailure?.step).toBe("klav-forward-cleanup");
+      expect(sb.wakeFailure?.vmPaused).toBe(true);
+      expect(events.map((e) => e.type)).toEqual(["wake-start", "wake-failure"]);
+    });
+
+    test("judgeForwarder stops only a verified klav-forward that owns 127.0.0.1:8790", () => {
+      const f = (over: Partial<ForwarderFacts>): ForwarderFacts => ({
+        downExit: 1,
+        listening: true,
+        statePid: 4242,
+        comm: "klav-forward",
+        pidOwnsListener: true,
+        ...over,
+      });
+      expect(judgeForwarder(f({}))).toEqual({ action: "stop", pid: 4242 });
+      expect(judgeForwarder(f({ listening: false, statePid: null, comm: null }))).toEqual({ action: "none" });
+      expect(judgeForwarder(f({ comm: "node" })).action).toBe("refuse");
+      expect(judgeForwarder(f({ pidOwnsListener: false })).action).toBe("refuse");
+      expect(judgeForwarder(f({ statePid: null, comm: null })).action).toBe("refuse");
+      expect(judgeForwarder(f({ statePid: 1 })).action).toBe("refuse");
+      expect(() => forwarderStopScript(1)).toThrow();
+      expect(parseForwarderProbe("down_exit=1\nlistening=1\nstate_pid=77\ncomm=klav-forward\nowns_listener=1\n")).toEqual({
+        downExit: 1,
+        listening: true,
+        statePid: 77,
+        comm: "klav-forward",
+        pidOwnsListener: true,
+      });
+      // The probe only prints facts: never the state file, the package or `klav-forward env`
+      const probe = forwarderProbeScript();
+      expect(probe).toContain("klav-forward down >/dev/null 2>&1");
+      expect(probe).not.toContain("klav-forward env");
+      expect(probe).not.toMatch(/cat "\$HOME\/\.klav-forward\/state\.json"/);
+      expect(probe).toContain("0100007F:2256");
+    });
+
+    test("a failed wake backs off: no resume and no Klav sandbox during the cooldown, the VM is paused again", async () => {
+      const { hub, handle, boat, log, events } = await startKlavHub();
+      await hub.sleepHubSandbox("sb-k");
+      log.length = 0;
+      boat.failHostPublic = true;
+      await expect(hub.wakeHubSandbox("sb-k")).rejects.toThrow(/expose-port/);
+      // The new Klav sandbox is ended and the VM goes back to sleep
+      expect(log).toEqual(["resume", "vm:klav-forward-down", "klav:start", "vm:klav-forward-down", "klav:stop:ksb-new-1", "pause"]);
+      const sb = handle.state.getHubSandbox("sb-k")!;
+      expect(sb.phase).toBe("sleeping");
+      expect(sb.klavAgentName).toBeNull();
+      expect(sb.wakeFailure).toMatchObject({ step: "expose-port", attempts: 1, vmPaused: true });
+
+      log.length = 0;
+      for (let i = 0; i < 5; i++) {
+        await expect(hub.wakeHubSandbox("sb-k")).rejects.toBeInstanceOf(HubWakeCooldownError);
+      }
+      expect(log).toEqual([]);
+      expect(events.filter((e) => e.type === "wake-start")).toHaveLength(1);
+
+      // After the cooldown the next wake runs and clears the failure
+      boat.failHostPublic = false;
+      handle.state.updateHubSandbox("sb-k", (s) => {
+        s.wakeFailure!.retryAfter = new Date(Date.now() - 1).toISOString();
+      });
+      await hub.wakeHubSandbox("sb-k");
+      expect(log).toEqual(["resume", "vm:klav-forward-down", "klav:start"]);
+      expect(handle.state.getHubSandbox("sb-k")!.wakeFailure).toBeNull();
+    });
+
+    test("the backoff doubles per consecutive failure up to its cap", () => {
+      expect(wakeBackoffMs(1, 30_000, 900_000)).toBe(30_000);
+      expect(wakeBackoffMs(2, 30_000, 900_000)).toBe(60_000);
+      expect(wakeBackoffMs(4, 30_000, 900_000)).toBe(240_000);
+      expect(wakeBackoffMs(40, 30_000, 900_000)).toBe(900_000);
+    });
+
+    test("a failed wake logs one line with the step and a reason free of secrets", async () => {
+      const { hub, handle, klav, events } = await startKlavHub();
+      await hub.sleepHubSandbox("sb-k");
+      klav.failProvision =
+        "remote command failed (exit 1): KLAV_SANDBOX=ksb1_onetimepackagevalue123 export OPENAI_BASE_URL='http://127.0.0.1:8790/v1?token=fwdsecret' " +
+        "Authorization: Bearer t3llm_abcdefghijklmnopqrstuvwxyz0123 klav-forward: cannot reach it through its control socket";
+      const { lines, error } = await captureLogs(() => hub.wakeHubSandbox("sb-k"));
+      expect(error).toBeInstanceOf(Error);
+      const failureLines = lines.filter((l) => l.includes("wake of sandbox"));
+      expect(failureLines).toHaveLength(1);
+      expect(failureLines[0]).toContain("step klav-provision");
+      expect(failureLines[0]).toContain("control socket");
+      const everything = [...lines, String((error as Error).message), JSON.stringify(events), JSON.stringify(handle.state.getHubSandbox("sb-k"))];
+      for (const secret of ["ksb1_onetimepackagevalue123", "fwdsecret", "t3llm_abcdefghijklmnopqrstuvwxyz0123", "/v1?token"]) {
+        for (const text of everything) expect(text).not.toContain(secret);
+      }
+      // Cooldown rejections log nothing
+      const again = await captureLogs(() => hub.wakeHubSandbox("sb-k"));
+      expect(again.error).toBeInstanceOf(HubWakeCooldownError);
+      expect(again.lines).toEqual([]);
+    });
+
+    test("redactForLog drops tokens, env values, URL paths and long opaque strings", () => {
+      const out = redactForLog(
+        new Error("failed: ANTHROPIC_AUTH_TOKEN=abc https://h.example.com/p/secret?x=1 ksb1_zzz tskey-auth-abc token: hunter2 " + "A".repeat(40)),
+      );
+      for (const leak of ["abc", "/p/secret", "x=1", "ksb1_zzz", "tskey-auth", "hunter2", "A".repeat(40)]) {
+        expect(out).not.toContain(leak);
+      }
+      expect(out).toContain("https://h.example.com");
+      expect(redactForLog('{"token":"tok-123","api_key": "k-456"}')).not.toMatch(/tok-123|k-456/);
+      expect(out.length).toBeLessThanOrEqual(241);
+    });
+
+    test("a failure after the VM is marked running rolls back: bridge stopped, Klav sandbox ended, token dropped, VM paused", async () => {
+      const { hub, handle, boat, log, events } = await startKlavHub();
+      await hub.sleepHubSandbox("sb-k");
+      log.length = 0;
+      hub.wakeBridgeTimeoutMs = 150;
+      boat.upstreamBaseUrl = "http://127.0.0.1:9"; // nothing answers: the bridge never opens
+      await expect(hub.wakeHubSandbox("sb-k")).rejects.toThrow(/at bridge/);
+      expect(log).toEqual(["resume", "vm:klav-forward-down", "klav:start", "vm:klav-forward-down", "klav:stop:ksb-new-1", "pause"]);
+      const sb = handle.state.getHubSandbox("sb-k")!;
+      expect(sb).toMatchObject({ phase: "sleeping", klavAgentName: null, llmToken: null });
+      expect(sb.wakeFailure).toMatchObject({ step: "bridge", vmPaused: true });
+      expect(events.map((e) => e.type)).toEqual(["wake-start", "wake-failure"]);
+    });
+
+    test("a revoke that fails before sleep keeps the name, and the wake ends that sandbox", async () => {
+      const { hub, handle, klav, log } = await startKlavHub();
+      const origRevoke = klav.revokeForSandbox.bind(klav);
+      klav.revokeForSandbox = async (h: string) => {
+        await origRevoke(h);
+        throw new Error("klav sandbox stop failed");
+      };
+      await captureLogs(() => hub.sleepHubSandbox("sb-k"));
+      expect(handle.state.getHubSandbox("sb-k")!.klavAgentName).toBe("ksb-old");
+      klav.revokeForSandbox = origRevoke;
+      log.length = 0;
+      await hub.wakeHubSandbox("sb-k");
+      expect(log).toEqual(["resume", "klav:stop:ksb-old", "vm:klav-forward-down", "klav:start"]);
+    });
+
+    test("a resume that throws on a VM a failed wake left running still counts it as running", async () => {
+      const { hub, handle, boat } = await startKlavHub();
+      await hub.sleepHubSandbox("sb-k");
+      hub.pauseRetryMs = 60_000;
+      boat.failHostPublic = true;
+      boat.stop = async () => {
+        throw new Error("boat stop failed");
+      };
+      await captureLogs(() => hub.wakeHubSandbox("sb-k"));
+      expect(handle.state.getHubSandbox("sb-k")!.wakeFailure?.vmPaused).toBe(false);
+      handle.state.updateHubSandbox("sb-k", (s) => {
+        s.wakeFailure!.retryAfter = new Date(Date.now() - 1).toISOString();
+      });
+      boat.resume = async () => {
+        throw new Error("sandbox is already running");
+      };
+      const { error } = await captureLogs(() => hub.wakeHubSandbox("sb-k"));
+      expect(String(error)).toContain("at resume");
+      expect(handle.state.getHubSandbox("sb-k")!.wakeFailure).toMatchObject({ step: "resume", attempts: 2, vmPaused: false });
+    });
+
+    test("a VM the failed wake could not pause again is paused by a retry", async () => {
+      const { hub, handle, boat, log } = await startKlavHub();
+      await hub.sleepHubSandbox("sb-k");
+      hub.pauseRetryMs = 20;
+      boat.failHostPublic = true;
+      const origStop = boat.stop.bind(boat);
+      let failPause = true;
+      boat.stop = async (id: string) => {
+        if (failPause) throw new Error("boat stop failed");
+        return origStop(id);
+      };
+      await expect(hub.wakeHubSandbox("sb-k")).rejects.toThrow();
+      expect(handle.state.getHubSandbox("sb-k")!.wakeFailure?.vmPaused).toBe(false);
+      failPause = false;
+      log.length = 0;
+      await Bun.sleep(80);
+      expect(log).toEqual(["pause"]);
+      expect(handle.state.getHubSandbox("sb-k")!.wakeFailure?.vmPaused).toBe(true);
+    });
+
+    test("providers without pause keep running: sleep makes no Klav or forwarder call", async () => {
+      const log: string[] = [];
+      const inner = asSandboxProvider(new MockBoat());
+      const noPause: SandboxProvider = { ...inner, name: "no-pause", capabilities: new Set<ProviderCapability>(), pause: undefined, resume: undefined };
+      const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-klav-nopause-"));
+      cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+      const base = makeTestConfig(0);
+      const cfg: SentinelConfig = {
+        ...base,
+        stateDir: dir,
+        hub: { host: "boat.boat.example.com", label: "Boat", maxSandboxes: 5 },
+        klav: { mode: "proxy", proxyPort: 18790, defaultTtl: "8h", defaultAllow: [], defaultDeny: [], defaultExpires: "8h" },
+        projects: { "my-app": { ...base.projects["my-app"]!, klav: { profiles: ["dev"] } } },
+      };
+      const handle = createSentinelServer(cfg, noPause, { startBackgroundLoops: false, klav: new FakeKlav(log) });
+      cleanups.push(() => handle.stop());
+      const now = new Date().toISOString();
+      handle.state.setHubSandbox({
+        sandboxId: "sb-np", project: "my-app", hubProjectId: "p", vmProjectId: "v", snapshot: "base-image", size: "default",
+        upstreamUrl: "http://127.0.0.1:1", upstreamToken: "t", watchdogSecret: "w", llmToken: null, klavAgentName: "ksb-live",
+        threadIds: [], worktreePaths: [], phase: "running", createdAt: now, lastActiveAt: now, lastHeartbeatAt: now, sleepingSince: null,
+      });
+      await captureLogs(() => handle.hub!.sleepHubSandbox("sb-np"));
+      expect(log).toEqual([]);
+      expect(handle.state.getHubSandbox("sb-np")!.klavAgentName).toBe("ksb-live");
+      expect(handle.state.getHubSandbox("sb-np")!.phase).toBe("running");
+    });
   });
 });
 
