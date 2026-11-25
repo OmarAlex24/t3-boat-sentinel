@@ -33,8 +33,8 @@ import { ensureT3Project } from "./t3rpc.ts";
 export interface HubWsData {
   kind: "hub";
   clientId: string;
-  /** Streams this downstream client is subscribed to locally on the Hub: String(id) -> { rawId, tag }. */
-  localStreams: Map<string, { rawId: string | number; tag: string }>;
+  /** Streams this downstream client is subscribed to locally on the Hub: String(id) -> { rawId, tag, payload? }. */
+  localStreams: Map<string, { rawId: string | number; tag: string; payload?: unknown }>;
   /** Active upstream-forwarded RPC requests owned by this client: String(clientReqId) -> { sandboxId, upReqId }. */
   upstreamRequests: Map<string, { sandboxId: string; upReqId: string }>;
 }
@@ -66,6 +66,8 @@ interface PendingUpstreamCall {
   tag?: string;
   /** Called with the upstream Exit before it is relayed to the client. */
   onExit?: (exit: { _tag: "Success"; value: unknown } | { _tag: "Failure"; cause: unknown }) => void;
+  /** Called instead of failing the client's request when the VM connection is lost before the call ends. */
+  onLost?: () => void;
 }
 
 interface StagedAttachment {
@@ -111,6 +113,26 @@ const WORKSPACE_ROUTED_PREFIXES = ["vcs.", "git.", "projects.", "review."];
 
 /** Sign-out RPCs (`{ instanceId }` payload); a successful one forgets the stored provider session. */
 const PROVIDER_LOGOUT_METHODS = new Set(["provider.auth.logout", "server.logoutAcpRegistry"]);
+
+/**
+ * Provider setup streams the Settings → Providers panel opens on every visit. With no VM running
+ * the Hub answers them with an idle snapshot; a VM bridge that opens later takes them over.
+ */
+const PROVIDER_SETUP_STREAMS = new Set(["provider.install.subscribe", "provider.auth.subscribe"]);
+/** Provider setup commands whose error union is `ProviderSetupError | EnvironmentAuthorizationError`. */
+const PROVIDER_SETUP_COMMANDS = new Set([
+  "provider.auth.start",
+  "provider.auth.respond",
+  "provider.auth.complete",
+  "provider.auth.cancel",
+  "provider.auth.removeMethod",
+  "provider.auth.logout",
+  "provider.install.start",
+  "provider.install.cancel",
+  "provider.install.remove",
+]);
+const NO_VM_PROVIDER_SETUP_DETAIL =
+  "Provider setup runs inside a Boat chat VM, and none is running. Start a thread on Boat, then try again.";
 
 const KEEP_OPEN_SUBSCRIPTIONS = new Set([
   "subscribePreviewEvents",
@@ -189,6 +211,7 @@ class HubVmBridge {
       templates: { serverConfig?: Record<string, unknown>; lifecycleEvents?: unknown[]; vcsRefs?: unknown },
     ) => void,
     private readonly onProviderStatuses: (sandboxId: string, providers: unknown[]) => void = () => {},
+    private readonly onOpen: (sandboxId: string) => void = () => {},
   ) {}
 
   start(): void {
@@ -215,7 +238,10 @@ class HubVmBridge {
     for (const [upId, call] of this.pending) {
       this.pending.delete(upId);
       if (call.resolve) {
-        call.resolve({ _tag: "Failure", cause: { _tag: "Fail", error: { message: "Sandbox stopped" } } });
+        call.resolve({ _tag: "Failure", cause: hubDefectCause("Sandbox stopped") });
+      } else if (call.onLost && call.clientWs && call.clientReqId !== undefined) {
+        call.clientWs.data.upstreamRequests.delete(String(call.clientReqId));
+        call.onLost();
       } else if (call.clientWs && call.clientReqId) {
         sendRpcExitFailure(call.clientWs, call.clientReqId, "Sandbox stopped");
       }
@@ -296,6 +322,8 @@ class HubVmBridge {
       // real ServerConfig / lifecycle / vcsRefs in background from its first snapshot.
       const firstConfig = this.subscribeServerConfig();
       void this.harvestTemplates(ws, firstConfig);
+
+      this.onOpen(this.sandbox.sandboxId);
     });
 
     ws.addEventListener("message", (ev) => {
@@ -318,11 +346,14 @@ class HubVmBridge {
         if (upId === this.shellReqId) continue;
         if (upId === this.configReqId) {
           // Settle a still-waiting first-snapshot promise; reconnect re-subscribes
-          call.resolve?.({ _tag: "Failure", cause: { _tag: "Fail", error: { message: "Upstream VM disconnected" } } });
+          call.resolve?.({ _tag: "Failure", cause: hubDefectCause("Upstream VM disconnected") });
           continue;
         }
         if (call.resolve) {
-          call.resolve({ _tag: "Failure", cause: { _tag: "Fail", error: { message: "Upstream VM disconnected" } } });
+          call.resolve({ _tag: "Failure", cause: hubDefectCause("Upstream VM disconnected") });
+        } else if (call.onLost && call.clientWs && call.clientReqId !== undefined) {
+          call.clientWs.data.upstreamRequests.delete(String(call.clientReqId));
+          call.onLost();
         } else if (call.clientWs && call.clientReqId) {
           sendRpcExitFailure(call.clientWs, call.clientReqId, "Upstream VM disconnected");
         }
@@ -455,13 +486,13 @@ class HubVmBridge {
   ): Promise<{ _tag: "Success"; value: unknown } | { _tag: "Failure"; cause: unknown }> {
     return new Promise((resolve) => {
       if (!this.isOpen()) {
-        return resolve({ _tag: "Failure", cause: { _tag: "Fail", error: { message: "VM not connected" } } });
+        return resolve({ _tag: "Failure", cause: hubDefectCause("VM not connected") });
       }
       const upReqId = `hub-u-${++this.reqCounter}`;
       const timer = setTimeout(() => {
         this.pending.delete(upReqId);
         this.sendRaw({ _tag: "Interrupt", requestId: upReqId });
-        resolve({ _tag: "Failure", cause: { _tag: "Fail", error: { message: `${tag} timed out` } } });
+        resolve({ _tag: "Failure", cause: hubDefectCause(`${tag} timed out`) });
       }, timeoutMs);
       this.pending.set(upReqId, {
         tag,
@@ -481,6 +512,7 @@ class HubVmBridge {
     payload: unknown,
     headers: unknown = [],
     onExit?: PendingUpstreamCall["onExit"],
+    onLost?: PendingUpstreamCall["onLost"],
   ): string {
     const upReqId = `hub-f-${++this.reqCounter}`;
     const rewrittenPayload = rewriteProjectIds(payload, this.sandbox.hubProjectId, this.sandbox.vmProjectId);
@@ -491,6 +523,7 @@ class HubVmBridge {
       hubProjectId: this.sandbox.hubProjectId,
       tag,
       onExit,
+      onLost,
     });
     clientWs.data.upstreamRequests.set(String(clientReqId), { sandboxId: this.sandbox.sandboxId, upReqId });
     this.sendRaw({ _tag: "Request", id: upReqId, tag, payload: rewrittenPayload, headers });
@@ -638,7 +671,7 @@ export class HubServer {
         callVmUnary: async (sandboxId, tag, payload, timeoutMs) => {
           const sb = this.state.getHubSandbox(sandboxId);
           if (!sb || sb.phase !== "running") {
-            return { _tag: "Failure", cause: { _tag: "Fail", error: { message: `Sandbox ${sandboxId} is not running` } } };
+            return { _tag: "Failure", cause: hubDefectCause(`Sandbox ${sandboxId} is not running`) };
           }
           const bridge = await this.ensureBridgeOpen(sb);
           return bridge.callUnary(tag, payload, timeoutMs);
@@ -713,6 +746,69 @@ export class HubServer {
    * For a sign-out of a synced provider instance, returns a hook that forgets the stored session
    * once the VM confirms it. A mere `unauthenticated` status never deletes it (it can be transient).
    */
+  /**
+   * Answers a provider setup stream with an idle snapshot and keeps it open, so the panel shows a
+   * settled state (not "Checking…" or an error) while no VM runs. A bridge that opens later takes
+   * the stream over (`adoptLocalProviderStreams`).
+   */
+  private serveProviderStreamLocally(
+    ws: ServerWebSocket<HubWsData>,
+    reqId: string | number,
+    tag: string,
+    payload: unknown,
+  ): void {
+    if (!this.clients.has(ws)) return;
+    const instanceId = providerInstanceIdOf(payload);
+    if (!instanceId) {
+      sendRpcExitFailure(ws, reqId, `Invalid instanceId for ${tag}`);
+      return;
+    }
+    ws.data.upstreamRequests.delete(String(reqId));
+    ws.data.localStreams.set(String(reqId), { rawId: reqId, tag, payload });
+    const providers = this.buildHubServerConfig().providers;
+    sendRpcFrame(ws, { _tag: "Chunk", requestId: reqId, values: [idleProviderSetupState(tag, instanceId, providers)] });
+  }
+
+  /**
+   * Forwards a provider setup stream to a VM. If that VM goes away, the stream moves to another open
+   * VM, or falls back to the idle snapshot when none is open.
+   */
+  private forwardProviderStream(
+    bridge: HubVmBridge,
+    ws: ServerWebSocket<HubWsData>,
+    reqId: string | number,
+    tag: string,
+    payload: unknown,
+    headers: unknown,
+  ): void {
+    const lostSandboxId = bridge.sandbox.sandboxId;
+    bridge.forwardToClient(ws, reqId, tag, payload, headers, undefined, () => {
+      if (!this.clients.has(ws)) return;
+      // A stopping bridge still reports open while it fails its calls, so skip it by id
+      const next = Array.from(this.bridges.values()).find(
+        (b) => b.sandbox.sandboxId !== lostSandboxId && b.sandbox.phase === "running" && b.isOpen(),
+      );
+      if (next) {
+        this.forwardProviderStream(next, ws, reqId, tag, payload, headers);
+      } else {
+        this.serveProviderStreamLocally(ws, reqId, tag, payload);
+      }
+    });
+  }
+
+  /** Hands provider setup streams the Hub answered locally to a VM whose bridge just opened. */
+  private adoptLocalProviderStreams(sandboxId: string): void {
+    const bridge = this.bridges.get(sandboxId);
+    if (!bridge?.isOpen()) return;
+    for (const client of this.clients) {
+      for (const [key, sub] of client.data.localStreams) {
+        if (!PROVIDER_SETUP_STREAMS.has(sub.tag)) continue;
+        client.data.localStreams.delete(key);
+        this.forwardProviderStream(bridge, client, sub.rawId, sub.tag, sub.payload, []);
+      }
+    }
+  }
+
   private signOutHook(tag: string, payload: unknown): PendingUpstreamCall["onExit"] {
     if (!PROVIDER_LOGOUT_METHODS.has(tag)) return undefined;
     const instanceId = (payload as { instanceId?: unknown } | null)?.instanceId;
@@ -1175,10 +1271,11 @@ export class HubServer {
         ws.data.upstreamRequests.delete(reqKey);
         this.bridges.get(ref.sandboxId)?.sendInterrupt(ref.upReqId);
       }
+      // A real T3 server ends an interrupted request with an Interrupt cause
       sendRpcFrame(ws, {
         _tag: "Exit",
         requestId: rawReqId,
-        exit: { _tag: "Success", value: undefined },
+        exit: { _tag: "Failure", cause: [{ _tag: "Interrupt", fiberId: null }] },
       });
       return;
     }
@@ -1459,10 +1556,31 @@ export class HubServer {
     if (live) {
       try {
         const bridge = await this.ensureBridgeOpen(live);
-        bridge.forwardToClient(ws, reqId, tag, payload, headers, this.signOutHook(tag, payload));
+        if (PROVIDER_SETUP_STREAMS.has(tag)) {
+          this.forwardProviderStream(bridge, ws, reqId, tag, payload, headers);
+        } else {
+          bridge.forwardToClient(ws, reqId, tag, payload, headers, this.signOutHook(tag, payload));
+        }
         return;
       } catch {
         // fall through
+      }
+    }
+    if (PROVIDER_SETUP_STREAMS.has(tag)) {
+      this.serveProviderStreamLocally(ws, reqId, tag, payload);
+      return;
+    }
+    if (PROVIDER_SETUP_COMMANDS.has(tag)) {
+      const instanceId = providerInstanceIdOf(payload);
+      if (instanceId) {
+        // Typed, so the panel shows this text instead of a generic "Provider setup failed."
+        sendRpcExitFail(ws, reqId, {
+          _tag: "ProviderSetupError",
+          instanceId,
+          operation: tag.replace(/^provider\./, ""),
+          detail: NO_VM_PROVIDER_SETUP_DETAIL,
+        });
+        return;
       }
     }
     if (tag.startsWith("pullRequests.") || tag.startsWith("peerLinks.") || tag.startsWith("sourceControl.")) {
@@ -2193,6 +2311,7 @@ export class HubServer {
       (sandboxId, token) => this.urlTokenToSandbox.set(token, sandboxId),
       (sandbox, templates) => this.handleTemplatesHarvested(sandbox, templates),
       (sandboxId, providers) => this.handleVmProviderStatuses(sandboxId, providers),
+      (sandboxId) => this.adoptLocalProviderStreams(sandboxId),
     );
     this.bridges.set(sb.sandboxId, bridge);
     bridge.start();
@@ -2571,12 +2690,9 @@ export class HubServer {
       }
       console.log(`[hub] golden snapshots updated to T3 ${targetVersion}`);
     } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err);
-      sendRpcFrame(ws, {
-        _tag: "Exit",
-        requestId: reqId,
-        exit: { _tag: "Failure", cause: { _tag: "Fail", error: { _tag: "ServerSelfUpdateError", reason } } },
-      });
+      // ServerSelfUpdateError is in both update RPCs' error unions; its `reason` must be non-empty
+      const reason = (err instanceof Error ? err.message : String(err)).trim() || "Golden snapshot rebake failed";
+      sendRpcExitFail(ws, reqId, { _tag: "ServerSelfUpdateError", reason });
     }
   }
 
@@ -2772,16 +2888,84 @@ function sendRpcExitSuccess(ws: ServerWebSocket<HubWsData>, requestId: string | 
   sendRpcFrame(ws, {
     _tag: "Exit",
     requestId,
-    exit: { _tag: "Success", value },
+    // JSON drops an undefined key, and the client's Exit codec requires `value` (null for void and stream exits)
+    exit: { _tag: "Success", value: value === undefined ? null : value },
   });
 }
 
+/**
+ * One reason of an Effect 4 `Cause` as `RpcServer` encodes it: T3 Code 0.1.12+ sends a failure's
+ * cause as an array of these. A `Fail` error is decoded with the RPC's own error schema, so a
+ * Hub-only error type is rejected; a `Die` defect accepts any string.
+ */
+export type RpcCauseReason =
+  | { _tag: "Fail"; error: Record<string, unknown> }
+  | { _tag: "Die"; defect: unknown }
+  | { _tag: "Interrupt"; fiberId: number | null };
+
+/** Cause for a failure whose error is in no RPC's error union, as a real T3 server sends for an unknown tag. */
+export function hubDefectCause(message: string): RpcCauseReason[] {
+  return [{ _tag: "Die", defect: message }];
+}
+
+/** Ends a request with an untyped failure (`Die`): the client decodes it for every RPC. */
 function sendRpcExitFailure(ws: ServerWebSocket<HubWsData>, requestId: string | number, message: string): void {
   sendRpcFrame(ws, {
     _tag: "Exit",
     requestId,
-    exit: { _tag: "Failure", cause: { _tag: "Fail", error: { _tag: "HubError", message } } },
+    exit: { _tag: "Failure", cause: hubDefectCause(message) },
   });
+}
+
+/** Ends a request with a typed failure; `error._tag` must be in that RPC's error union. */
+function sendRpcExitFail(ws: ServerWebSocket<HubWsData>, requestId: string | number, error: Record<string, unknown>): void {
+  sendRpcFrame(ws, {
+    _tag: "Exit",
+    requestId,
+    exit: { _tag: "Failure", cause: [{ _tag: "Fail", error }] satisfies RpcCauseReason[] },
+  });
+}
+
+const PROVIDER_SLUG_PATTERN = /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/;
+
+/** The `instanceId` of a provider setup payload, if it is a valid provider slug. */
+function providerInstanceIdOf(payload: unknown): string | null {
+  const id = (payload as { instanceId?: unknown } | null)?.instanceId;
+  return typeof id === "string" && PROVIDER_SLUG_PATTERN.test(id) ? id : null;
+}
+
+/**
+ * The state a T3 server reports for a provider with no setup in progress: `ProviderAuthState` for
+ * `provider.auth.subscribe`, `ProviderInstallState` for `provider.install.subscribe`. Fields
+ * only a VM knows (runtime version, sign-in methods) are left unknown.
+ */
+export function idleProviderSetupState(tag: string, instanceId: string, providers: unknown): Record<string, unknown> {
+  if (tag === "provider.auth.subscribe") {
+    return {
+      instanceId,
+      phase: "idle",
+      flowId: null,
+      authorizationUrl: null,
+      expiresAt: null,
+      message: null,
+      interaction: null,
+    };
+  }
+  const cached = Array.isArray(providers)
+    ? (providers as Array<{ instanceId?: unknown; driver?: unknown } | null>).find((p) => p?.instanceId === instanceId)
+    : undefined;
+  const driver = typeof cached?.driver === "string" && PROVIDER_SLUG_PATTERN.test(cached.driver) ? cached.driver : instanceId;
+  return {
+    driver,
+    operationId: null,
+    phase: "idle",
+    downloadedBytes: 0,
+    totalBytes: null,
+    version: null,
+    installedVersion: null,
+    canRemove: false,
+    message: null,
+  };
 }
 
 function extractThreadId(payload: unknown): string | null {

@@ -11,6 +11,7 @@ import { expandEnvPlaceholders, loadConfig, type SentinelConfig } from "./config
 import { createSentinelServer, type SentinelServerHandle } from "./index.ts";
 import type { KlavClient } from "./klav.ts";
 import { LifecycleManager } from "./lifecycle.ts";
+import { formatRpcFailure } from "./hub-mcp.ts";
 import { handleMcpRequest } from "./mcp.ts";
 import { CelestoProvider, SandboxSdkProvider, createSandboxProvider, type ExternalSdkProviderLike } from "./providers/index.ts";
 import { asSandboxProvider, type ProviderCapability, type SandboxProvider } from "./providers/types.ts";
@@ -926,6 +927,17 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
             );
             return;
           }
+          if (frame.tag === "provider.install.subscribe" || frame.tag === "provider.auth.subscribe") {
+            // Like a real VM: one snapshot, stream stays open
+            ws.sendText(
+              JSON.stringify({
+                _tag: "Chunk",
+                requestId: frame.id,
+                values: [{ instanceId: frame.payload?.instanceId, phase: "idle", fromVm: vmTag }],
+              }),
+            );
+            return;
+          }
           if (frame.tag === "server.refreshProviders" && opts.refreshProviders) {
             ws.sendText(
               JSON.stringify({
@@ -1240,6 +1252,141 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
 
     expect(handle.state.getHub()?.serverConfig?.providers).toEqual(refreshed);
     await client.waitForFrame(providerStatusesChunk("cfg", "acpRegistry_devin", true));
+  });
+
+  test("Hub-built failures use the Effect 4 wire shape: an array cause, Die for Hub errors, value:null on void success", async () => {
+    const vm = startFakeVmT3Server("vm-wire");
+    cleanups.push(() => vm.server.stop(true));
+    const { cfg, handle } = await startHubWithVm(vm, "t3-sentinel-hub-wire-");
+    const client = await connectHubClient(handle, cfg);
+
+    // No VM running: the generic fallback fails with a Die whose defect is the text (like a real
+    // T3 server's "Unknown request tag"); a Fail with a Hub-only error type would not decode.
+    client.request("unknown", "no.such.method", {});
+    const unknown = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "unknown");
+    expect(unknown.exit).toEqual({
+      _tag: "Failure",
+      cause: [{ _tag: "Die", defect: "No active Boat sandbox to handle no.such.method; start a thread first." }],
+    });
+
+    // Void success keeps the `value` key (the client's Exit codec requires it)
+    client.request("activity", "server.reportClientActivity", {});
+    const activity = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "activity");
+    expect(activity.exit).toEqual({ _tag: "Success", value: null });
+    expect("value" in (activity.exit as Record<string, unknown>)).toBe(true);
+
+    // An interrupted request ends with an Interrupt cause, as a real T3 server ends it
+    client.request("life", "subscribeServerLifecycle", {});
+    await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "life");
+    client.ws.send(JSON.stringify({ _tag: "Interrupt", requestId: "life" }));
+    const interrupted = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "life");
+    expect(interrupted.exit).toEqual({ _tag: "Failure", cause: [{ _tag: "Interrupt", fiberId: null }] });
+  });
+
+  test("provider setup streams with no VM: idle snapshot kept open, handed to a VM when one starts, idle again when it goes", async () => {
+    const vm = startFakeVmT3Server("vm-setup");
+    cleanups.push(() => vm.server.stop(true));
+    const { cfg, handle } = await startHubWithVm(vm, "t3-sentinel-hub-setup-");
+    handle.state.updateHub((h) => {
+      h.serverConfig = {
+        providers: [{ instanceId: "antigravity", driver: "antigravity", enabled: true, installed: true }],
+        settings: {},
+      };
+    });
+    const client = await connectHubClient(handle, cfg);
+
+    client.request("inst", "provider.install.subscribe", { instanceId: "antigravity" });
+    client.request("auth", "provider.auth.subscribe", { instanceId: "antigravity" });
+    const inst = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "inst");
+    expect((inst.values as unknown[])[0]).toEqual({
+      driver: "antigravity",
+      operationId: null,
+      phase: "idle",
+      downloadedBytes: 0,
+      totalBytes: null,
+      version: null,
+      installedVersion: null,
+      canRemove: false,
+      message: null,
+    });
+    const auth = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "auth");
+    expect((auth.values as unknown[])[0]).toEqual({
+      instanceId: "antigravity",
+      phase: "idle",
+      flowId: null,
+      authorizationUrl: null,
+      expiresAt: null,
+      message: null,
+      interaction: null,
+    });
+
+    // Setup commands fail with the RPC's own error type, so the panel can show the text
+    client.request("start", "provider.install.start", { instanceId: "antigravity" });
+    const start = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "start");
+    const startCause = (start.exit as { cause: Array<{ _tag: string; error: Record<string, unknown> }> }).cause;
+    expect(startCause).toHaveLength(1);
+    expect(startCause[0]._tag).toBe("Fail");
+    expect(startCause[0].error).toMatchObject({ _tag: "ProviderSetupError", instanceId: "antigravity", operation: "install.start" });
+    expect(String(startCause[0].error.detail)).toContain("Start a thread on Boat");
+
+    // A payload with no valid instanceId gets a Die, like the real server's decode failure
+    client.request("bad", "provider.install.subscribe", {});
+    const bad = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "bad");
+    expect((bad.exit as { cause: Array<{ _tag: string }> }).cause[0]._tag).toBe("Die");
+
+    // The idle streams stay open
+    await new Promise((r) => setTimeout(r, 100));
+    expect(client.inbox.some((f) => f._tag === "Exit" && (f.requestId === "inst" || f.requestId === "auth"))).toBe(false);
+
+    // A VM starts: its bridge takes both streams over on the same request ids
+    await launchThreadOnHub(client, "thread-setup");
+    const fromVmInst = await client.waitForFrame(
+      (f) => f._tag === "Chunk" && f.requestId === "inst" && (f.values as Array<{ fromVm?: string }>)[0]?.fromVm === "vm-setup",
+    );
+    expect((fromVmInst.values as Array<{ instanceId?: string }>)[0].instanceId).toBe("antigravity");
+    await client.waitForFrame(
+      (f) => f._tag === "Chunk" && f.requestId === "auth" && (f.values as Array<{ fromVm?: string }>)[0]?.fromVm === "vm-setup",
+    );
+    expect(vm.seenMethods.filter((m) => m.tag === "provider.install.subscribe").map((m) => m.payload)).toEqual([
+      { instanceId: "antigravity" },
+    ]);
+
+    // The VM goes away: the streams fall back to the idle snapshot instead of a red error
+    vm.server.stop(true);
+    const backToIdle = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "inst");
+    expect((backToIdle.values as Array<Record<string, unknown>>)[0]).toMatchObject({ driver: "antigravity", phase: "idle" });
+    await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "auth");
+    expect(client.inbox.some((f) => f._tag === "Exit" && (f.requestId === "inst" || f.requestId === "auth"))).toBe(false);
+  });
+
+  test("provider setup streams move to another running VM when theirs goes away", async () => {
+    const vm = startFakeVmT3Server("vm-setup-2");
+    cleanups.push(() => vm.server.stop(true));
+    const { cfg, handle } = await startHubWithVm(vm, "t3-sentinel-hub-setup-2-");
+    const client = await connectHubClient(handle, cfg);
+    const fromVm = (id: string) => (f: Record<string, unknown>) =>
+      f._tag === "Chunk" && f.requestId === id && (f.values as Array<{ fromVm?: string }>)[0]?.fromVm === "vm-setup-2";
+
+    await launchThreadOnHub(client, "thread-a");
+    const sandboxA = handle.state.listHubSandboxes()[0].sandboxId;
+    client.request("inst", "provider.install.subscribe", { instanceId: "antigravity" });
+    await client.waitForFrame(fromVm("inst"));
+    // Second chat: a second VM (launchThreadOnHub's "shell" subscription is already open)
+    client.request("launch-b", "orchestration.launchThread", {
+      threadId: "thread-b",
+      projectId: handle.state.getHub()!.projectIds["my-app"],
+      title: "Second",
+      workspaceStrategy: { type: "root" },
+    });
+    const launchB = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "launch-b");
+    expect((launchB.exit as { _tag: string })._tag).toBe("Success");
+    expect(handle.state.listHubSandboxes().filter((s) => s.phase === "running")).toHaveLength(2);
+
+    await handle.hub!.destroyHubSandbox(sandboxA, "test");
+    // Re-subscribed on the other VM (both fake VMs share one server here), not answered idle by the Hub
+    await client.waitForFrame(fromVm("inst"));
+    expect(vm.seenMethods.filter((m) => m.tag === "provider.install.subscribe")).toHaveLength(2);
+    expect(client.inbox.some((f) => f.requestId === "inst")).toBe(false);
   });
 
   test("server.refreshProviders with no live VM returns the Hub's cached providers", async () => {
@@ -2726,5 +2873,38 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     expect(added.structuredContent.ok).toBe(true);
     expect(added.structuredContent.fallbackReady).toBe(true);
     expect((added.structuredContent.repositoryIdentity as { owner: string; name: string }).name).toBe("new-svc");
+  });
+});
+
+describe("formatRpcFailure", () => {
+  test("reads Effect 4 array causes from 0.1.12+ VMs", () => {
+    expect(formatRpcFailure([{ _tag: "Die", defect: "Unknown request tag: x" }])).toBe("Unknown request tag: x");
+    expect(formatRpcFailure([{ _tag: "Die", defect: { name: "Error", message: "boom" } }])).toBe("boom");
+    expect(
+      formatRpcFailure([
+        { _tag: "Fail", error: { _tag: "ProviderSetupError", instanceId: "antigravity", operation: "subscribe", detail: "No provider" } },
+      ]),
+    ).toBe("No provider");
+    expect(formatRpcFailure([{ _tag: "Fail", error: { _tag: "ServerSelfUpdateError", reason: "bake failed" } }])).toBe(
+      "bake failed",
+    );
+    expect(formatRpcFailure([{ _tag: "Interrupt", fiberId: 3 }])).toBe("interrupted");
+    expect(
+      formatRpcFailure([
+        { _tag: "Fail", error: { message: "first" } },
+        { _tag: "Die", defect: "second" },
+        { _tag: "Die", defect: "second" },
+      ]),
+    ).toBe("first; second");
+    expect(formatRpcFailure([])).toBe("unknown error");
+  });
+
+  test("still reads strings and the older single-object cause", () => {
+    expect(formatRpcFailure("plain text")).toBe("plain text");
+    expect(formatRpcFailure({ _tag: "Fail", error: { _tag: "HubError", message: "legacy" } })).toBe("legacy");
+    expect(formatRpcFailure({ _tag: "Die", defect: "legacy defect" })).toBe("legacy defect");
+    expect(formatRpcFailure({ message: "bare" })).toBe("bare");
+    expect(formatRpcFailure(null)).toBe("unknown error");
+    expect(formatRpcFailure({ _tag: "Fail", error: { code: 7 } })).toBe('{"code":7}');
   });
 });
