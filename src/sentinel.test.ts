@@ -3769,6 +3769,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       });
       // The probe only prints facts: never the state file, the package or `klav-forward env`
       const probe = forwarderProbeScript();
+      expect(probe).toContain("klav-forward down >/dev/null 2>&1");
       expect(probe).not.toContain("klav-forward env");
       expect(probe).not.toMatch(/cat "\$HOME\/\.klav-forward\/state\.json"/);
       expect(probe).toContain("0100007F:2256");
@@ -3841,7 +3842,58 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
         expect(out).not.toContain(leak);
       }
       expect(out).toContain("https://h.example.com");
+      expect(redactForLog('{"token":"tok-123","api_key": "k-456"}')).not.toMatch(/tok-123|k-456/);
       expect(out.length).toBeLessThanOrEqual(241);
+    });
+
+    test("a failure after the VM is marked running rolls back: bridge stopped, Klav sandbox ended, token dropped, VM paused", async () => {
+      const { hub, handle, boat, log, events } = await startKlavHub();
+      await hub.sleepHubSandbox("sb-k");
+      log.length = 0;
+      hub.wakeBridgeTimeoutMs = 150;
+      boat.upstreamBaseUrl = "http://127.0.0.1:9"; // nothing answers: the bridge never opens
+      await expect(hub.wakeHubSandbox("sb-k")).rejects.toThrow(/at bridge/);
+      expect(log).toEqual(["resume", "vm:klav-forward-down", "klav:start", "vm:klav-forward-down", "klav:stop:ksb-new-1", "pause"]);
+      const sb = handle.state.getHubSandbox("sb-k")!;
+      expect(sb).toMatchObject({ phase: "sleeping", klavAgentName: null, llmToken: null });
+      expect(sb.wakeFailure).toMatchObject({ step: "bridge", vmPaused: true });
+      expect(events.map((e) => e.type)).toEqual(["wake-start", "wake-failure"]);
+    });
+
+    test("a revoke that fails before sleep keeps the name, and the wake ends that sandbox", async () => {
+      const { hub, handle, klav, log } = await startKlavHub();
+      const origRevoke = klav.revokeForSandbox.bind(klav);
+      klav.revokeForSandbox = async (h: string) => {
+        await origRevoke(h);
+        throw new Error("klav sandbox stop failed");
+      };
+      await captureLogs(() => hub.sleepHubSandbox("sb-k"));
+      expect(handle.state.getHubSandbox("sb-k")!.klavAgentName).toBe("ksb-old");
+      klav.revokeForSandbox = origRevoke;
+      log.length = 0;
+      await hub.wakeHubSandbox("sb-k");
+      expect(log).toEqual(["resume", "klav:stop:ksb-old", "vm:klav-forward-down", "klav:start"]);
+    });
+
+    test("a resume that throws on a VM a failed wake left running still counts it as running", async () => {
+      const { hub, handle, boat } = await startKlavHub();
+      await hub.sleepHubSandbox("sb-k");
+      hub.pauseRetryMs = 60_000;
+      boat.failHostPublic = true;
+      boat.stop = async () => {
+        throw new Error("boat stop failed");
+      };
+      await captureLogs(() => hub.wakeHubSandbox("sb-k"));
+      expect(handle.state.getHubSandbox("sb-k")!.wakeFailure?.vmPaused).toBe(false);
+      handle.state.updateHubSandbox("sb-k", (s) => {
+        s.wakeFailure!.retryAfter = new Date(Date.now() - 1).toISOString();
+      });
+      boat.resume = async () => {
+        throw new Error("sandbox is already running");
+      };
+      const { error } = await captureLogs(() => hub.wakeHubSandbox("sb-k"));
+      expect(String(error)).toContain("at resume");
+      expect(handle.state.getHubSandbox("sb-k")!.wakeFailure).toMatchObject({ step: "resume", attempts: 2, vmPaused: false });
     });
 
     test("a VM the failed wake could not pause again is paused by a retry", async () => {

@@ -59,7 +59,10 @@ export function redactForLog(err: unknown, maxLength = 240): string {
   });
   s = s.replace(SECRET_PREFIXES, "[redacted]");
   s = s.replace(/\b([A-Z][A-Z0-9_]{1,})=("[^"]*"|'[^']*'|\S+)/g, "$1=[redacted]");
-  s = s.replace(/\b(bearer|token|secret|password|passwd|authorization|api[_-]?key)(\s*[:=]\s*|\s+)("[^"]*"|'[^']*'|\S+)/gi, "$1$2[redacted]");
+  s = s.replace(
+    /\b(bearer|token|secret|password|passwd|authorization|api[_-]?key)("?\s*[:=]\s*|\s+)("[^"]*"|'[^']*'|\S+)/gi,
+    "$1$2[redacted]",
+  );
   s = s.replace(/[A-Za-z0-9+/_\-]{32,}={0,2}/g, "[redacted]");
   s = s.replace(/\s+/g, " ").trim();
   return s.length > maxLength ? `${s.slice(0, maxLength)}…` : s;

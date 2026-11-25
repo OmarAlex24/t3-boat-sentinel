@@ -451,7 +451,8 @@ export function forwarderProbeScript(downTimeoutSecs = 20): string {
     `fi`,
     ...LISTENER_INODES,
     `if [ -n "$inodes" ]; then echo "listening=1"; else echo "listening=0"; fi`,
-    `pid="$(grep -oE '"pid"[[:space:]]*:[[:space:]]*[0-9]+' "$HOME/.klav-forward/state.json" 2>/dev/null | head -n1 | grep -oE '[0-9]+$')"`,
+    // Any key ending in "pid" (pid, daemon_pid...): the name and listener checks below are the real guard
+    `pid="$(grep -oiE '"[a-z_]*pid"[[:space:]]*:[[:space:]]*[0-9]+' "$HOME/.klav-forward/state.json" 2>/dev/null | head -n1 | grep -oE '[0-9]+$')"`,
     `echo "state_pid=$pid"`,
     `if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then`,
     `  echo "comm=$(cat "/proc/$pid/comm" 2>/dev/null)"`,

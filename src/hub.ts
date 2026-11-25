@@ -689,6 +689,8 @@ export class HubServer {
   pauseRetryMs = 60_000;
   /** How long a leftover `klav-forward` gets after TERM before KILL. */
   forwarderTermTimeoutSecs = 10;
+  /** How long a woken VM's bridge may take to open. */
+  wakeBridgeTimeoutMs = 20_000;
   private readonly urlTokenToSandbox = new Map<string, string>();
   private readonly stagedAttachments = new Map<string, StagedAttachment>();
   private readonly stagedUploadTokens = new Map<string, string>(); // uploadToken -> attachmentId
@@ -2182,7 +2184,8 @@ export class HubServer {
       this.threadToSandbox.delete(threadId);
       throw new Error(`Sandbox "${sandboxId}" no longer exists`);
     }
-    if (sb.phase === "sleeping") {
+    // Mid-sleep the record still says running, but its bridge and Klav sandbox are gone: wake it again
+    if (sb.phase === "sleeping" || this.inFlightSleeps.has(sandboxId)) {
       return this.wakeHubSandbox(sandboxId);
     }
     if (sb.phase !== "running") {
@@ -2322,7 +2325,7 @@ export class HubServer {
 
       step = "bridge";
       this.attachBridge(updated);
-      await this.bridges.get(sandboxId)!.waitUntilOpen(20_000);
+      await this.bridges.get(sandboxId)!.waitUntilOpen(this.wakeBridgeTimeoutMs);
       step = "settings-replay";
       await this.settingsReplayDone(sandboxId);
       this.emitWake({ type: "wake-success", sandboxId, threadIds: [...updated.threadIds] });
@@ -2355,8 +2358,15 @@ export class HubServer {
       });
     }
 
-    let vmPaused = !ctx.resumed;
-    if (ctx.resumed && this.boat.pause) {
+    // A resume that threw may still have started the VM (or a previous failure left it running)
+    const previous = this.state.getHubSandbox(sandboxId)?.wakeFailure;
+    let needsPause = ctx.resumed || previous?.vmPaused === false;
+    if (!needsPause) {
+      const info = await this.boat.info(sandboxId).catch(() => null);
+      needsPause = info?.state === "running";
+    }
+    let vmPaused = !needsPause;
+    if (needsPause && this.boat.pause) {
       try {
         await this.boat.pause(sandboxId);
         vmPaused = true;
@@ -2470,13 +2480,20 @@ export class HubServer {
       });
       const klavSandbox = sb.klavAgentName;
       if (klavSandbox) {
-        await this.klav.revokeForSandbox(klavSandbox).catch((err) => {
-          console.warn(`[hub] Klav revoke before sleep failed for ${sandboxId}: ${redactForLog(err)}`);
-        });
+        // On failure the name stays, so the wake's revoke of a previous sandbox retries it
+        const revoked = await this.klav.revokeForSandbox(klavSandbox).then(
+          () => true,
+          (err) => {
+            console.warn(`[hub] Klav revoke before sleep failed for ${sandboxId}: ${redactForLog(err)}`);
+            return false;
+          },
+        );
+        if (revoked) {
+          this.state.updateHubSandbox(sandboxId, (s) => {
+            if (s.klavAgentName === klavSandbox) s.klavAgentName = null;
+          });
+        }
       }
-      this.state.updateHubSandbox(sandboxId, (s) => {
-        s.klavAgentName = null;
-      });
     }
 
     await this.boat.pause(sandboxId);
