@@ -28,6 +28,17 @@ import { HubMcpHandler, type HubSandboxPhase } from "./hub-mcp.ts";
 import type { KlavClient } from "./klav.ts";
 import type { LifecycleManager, WatchdogEventPayload } from "./lifecycle.ts";
 import { buildAutoProjectConfig, type HubSandboxRecord, type StateStore } from "./state.ts";
+
+type SelfUpdateStage = "downloading" | "installing";
+type SelfUpdateResult = { targetVersion: string; method: "boot-service" };
+type SelfUpdateOutcome = { ok: true; result: SelfUpdateResult } | { ok: false; reason: string };
+
+/** One self-update round, shared by every request for its version while it is queued or running. */
+interface SelfUpdateRun {
+  stage: SelfUpdateStage | null;
+  readonly listeners: Set<(stage: SelfUpdateStage) => void>;
+  done: Promise<SelfUpdateOutcome>;
+}
 import { ensureT3Project } from "./t3rpc.ts";
 
 export interface HubWsData {
@@ -651,6 +662,10 @@ export class HubServer {
   >();
   private readonly activeProjectClones = new Map<string, ProjectCloneSnapshotState>();
   private readonly destroyingSandboxes = new Set<string>();
+  /** Self-update rounds queued or running, by target version: a request for one of them joins it. */
+  private readonly selfUpdateRuns = new Map<string, SelfUpdateRun>();
+  /** Tail of the self-update queue: rounds for different versions run one after another. */
+  private selfUpdateQueue: Promise<unknown> = Promise.resolve();
 
   private readonly boat: SandboxProvider;
   private readonly mcp: HubMcpHandler;
@@ -2654,45 +2669,120 @@ export class HubServer {
           ? "nightly"
           : this.config.t3.channel;
     const isStream = tag === "server.updateServerWithProgress";
-    const sendProgress = (stage: "downloading" | "installing") => {
+    const sendProgress = (stage: SelfUpdateStage) => {
       if (isStream) {
         sendRpcFrame(ws, { _tag: "Chunk", requestId: reqId, values: [{ type: "progress", stage }] });
       }
     };
 
-    try {
-      console.log(`[hub] T3 UI requested server update -> ${targetVersion} (${channel}); rebaking golden snapshots`);
-      sendProgress("downloading");
-      await this.lifecycle.bake("base", { t3Version: targetVersion, t3Channel: channel });
+    // A request for a version already queued or running joins that round and gets its outcome
+    const joined = this.selfUpdateRuns.get(targetVersion);
+    if (joined) console.log(`[hub] T3 UI requested server update -> ${targetVersion}; joining the round in progress`);
+    const run = joined ?? this.startSelfUpdateRun(targetVersion, channel);
+    if (run.stage) sendProgress(run.stage);
+    run.listeners.add(sendProgress);
+    const outcome = await run.done;
+    run.listeners.delete(sendProgress);
 
-      // Update in-memory config & cached descriptor serverVersion so future boots and clients see the new version
-      this.config.t3.version = targetVersion;
-      this.config.t3.channel = channel;
+    if (!outcome.ok) {
+      sendRpcExitFail(ws, reqId, { _tag: "ServerSelfUpdateError", reason: outcome.reason });
+    } else if (isStream) {
+      sendRpcFrame(ws, { _tag: "Chunk", requestId: reqId, values: [{ type: "complete", result: outcome.result }] });
+      sendRpcExitSuccess(ws, reqId, undefined);
+    } else {
+      sendRpcExitSuccess(ws, reqId, outcome.result);
+    }
+  }
 
-      sendProgress("installing");
-      const allProjects = this.state.getAllProjects(this.config);
-      for (const [name, proj] of Object.entries(allProjects)) {
-        if (proj.snapshot === this.config.boat.baseSnapshot) continue;
-        await this.lifecycle.bake(name, { t3Version: targetVersion, t3Channel: channel });
-      }
+  /** Queues a self-update round behind any other version's round; registered before the first await so duplicates join it. */
+  private startSelfUpdateRun(targetVersion: string, channel: "stable" | "nightly"): SelfUpdateRun {
+    const run: SelfUpdateRun = { stage: null, listeners: new Set(), done: Promise.resolve({ ok: false, reason: "not started" }) };
+    const setStage = (stage: SelfUpdateStage) => {
+      run.stage = stage;
+      for (const listener of run.listeners) listener(stage);
+    };
+    run.done = this.selfUpdateQueue
+      .then(() => this.runSelfUpdate(targetVersion, channel, setStage))
+      .then(
+        (result): SelfUpdateOutcome => ({ ok: true, result }),
+        (err): SelfUpdateOutcome => {
+          // ServerSelfUpdateError.reason must be non-empty
+          const reason = (err instanceof Error ? err.message : String(err)).trim() || "Golden snapshot rebake failed";
+          console.warn(`[hub] server update to T3 ${targetVersion} failed: ${reason}`);
+          return { ok: false, reason };
+        },
+      )
+      .finally(() => this.selfUpdateRuns.delete(targetVersion));
+    this.selfUpdateRuns.set(targetVersion, run);
+    this.selfUpdateQueue = run.done;
+    return run;
+  }
 
-      const prevTpl = this.state.getTemplates().descriptor;
-      if (prevTpl) {
-        this.state.setTemplates({ ...prevTpl, serverVersion: targetVersion }, null);
-      }
+  private async runSelfUpdate(
+    targetVersion: string,
+    channel: "stable" | "nightly",
+    setStage: (stage: SelfUpdateStage) => void,
+  ): Promise<SelfUpdateResult> {
+    const result = { targetVersion, method: "boot-service" as const };
+    if (this.isSelfUpdateBaked(targetVersion)) {
+      console.log(`[hub] T3 UI requested server update -> ${targetVersion}; every golden snapshot already has it`);
+      this.applyServerVersion(targetVersion, channel);
+      return result;
+    }
 
-      const result = { targetVersion, method: "boot-service" as const };
-      if (isStream) {
-        sendRpcFrame(ws, { _tag: "Chunk", requestId: reqId, values: [{ type: "complete", result }] });
-        sendRpcExitSuccess(ws, reqId, undefined);
-      } else {
-        sendRpcExitSuccess(ws, reqId, result);
-      }
-      console.log(`[hub] golden snapshots updated to T3 ${targetVersion}`);
-    } catch (err) {
-      // ServerSelfUpdateError is in both update RPCs' error unions; its `reason` must be non-empty
-      const reason = (err instanceof Error ? err.message : String(err)).trim() || "Golden snapshot rebake failed";
-      sendRpcExitFail(ws, reqId, { _tag: "ServerSelfUpdateError", reason });
+    console.log(`[hub] T3 UI requested server update -> ${targetVersion} (${channel}); rebaking golden snapshots`);
+    setStage("downloading");
+    await this.lifecycle.bake("base", { t3Version: targetVersion, t3Channel: channel });
+    const bakes: Record<string, string> = {};
+    const recordBake = (target: string) => {
+      const bakedAt = this.state.getBake(target)?.bakedAt;
+      if (bakedAt) bakes[target] = bakedAt;
+    };
+    recordBake("base");
+
+    // Update in-memory config so the project bakes and future boots use the new version
+    this.config.t3.version = targetVersion;
+    this.config.t3.channel = channel;
+
+    setStage("installing");
+    for (const name of this.selfUpdateProjectTargets()) {
+      await this.lifecycle.bake(name, { t3Version: targetVersion, t3Channel: channel });
+      recordBake(name);
+    }
+
+    this.applyServerVersion(targetVersion, channel);
+    // Only a whole round marks the version as baked, so a partial failure is retried next time
+    this.state.updateHub((h) => {
+      h.selfUpdate = { version: targetVersion, channel, completedAt: new Date().toISOString(), bakes };
+    });
+    console.log(`[hub] golden snapshots updated to T3 ${targetVersion}`);
+    return result;
+  }
+
+  /** Projects whose own snapshot a self-update rebakes (the rest boot from base-t3). */
+  private selfUpdateProjectTargets(): string[] {
+    return Object.entries(this.state.getAllProjects(this.config))
+      .filter(([, proj]) => proj.snapshot !== this.config.boat.baseSnapshot)
+      .map(([name]) => name);
+  }
+
+  /** True when the last whole round baked this version and no target was rebaked or added since. */
+  private isSelfUpdateBaked(targetVersion: string): boolean {
+    const marker = this.state.getHub()?.selfUpdate;
+    if (!marker || marker.version !== targetVersion) return false;
+    return ["base", ...this.selfUpdateProjectTargets()].every((target) => {
+      const bakedAt = marker.bakes[target];
+      return bakedAt !== undefined && this.state.getBake(target)?.bakedAt === bakedAt;
+    });
+  }
+
+  /** Makes the descriptor (and so the `subscribeServerLifecycle` replay) report this version. */
+  private applyServerVersion(targetVersion: string, channel: "stable" | "nightly"): void {
+    this.config.t3.version = targetVersion;
+    this.config.t3.channel = channel;
+    const prevTpl = this.state.getTemplates().descriptor;
+    if (prevTpl && prevTpl.serverVersion !== targetVersion) {
+      this.state.setTemplates({ ...prevTpl, serverVersion: targetVersion }, null);
     }
   }
 

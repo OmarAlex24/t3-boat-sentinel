@@ -2455,6 +2455,145 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     expect(desc.serverVersion).toBe("0.1.12-nightly.20261124.5204");
   });
 
+  /** Wraps the Hub's `lifecycle.bake` so a test can hold bakes, count them and fail one. */
+  function gateBakes(handle: SentinelServerHandle) {
+    const original = handle.lifecycle.bake.bind(handle.lifecycle);
+    const calls: Array<{ target: string; version?: string }> = [];
+    let release: () => void = () => {};
+    let gate: Promise<void> = Promise.resolve();
+    const failOnce = new Set<string>();
+    handle.lifecycle.bake = async (target, opts) => {
+      calls.push({ target, version: opts?.t3Version });
+      await gate;
+      if (failOnce.delete(target)) throw new Error(`bake of ${target} failed`);
+      return original(target, opts);
+    };
+    return {
+      calls,
+      failOnce,
+      hold() {
+        gate = new Promise<void>((r) => (release = r));
+      },
+      release: () => release(),
+    };
+  }
+
+  async function lifecycleServerVersion(client: Awaited<ReturnType<typeof connectHubClient>>, id: string) {
+    client.request(id, "subscribeServerLifecycle", {});
+    const chunk = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === id);
+    const ready = (chunk.values as Array<{ type: string; payload: { environment: { serverVersion: string } } }>).find(
+      (v) => v.type === "ready",
+    );
+    return ready?.payload.environment.serverVersion;
+  }
+
+  test("server update: a duplicate request joins the round in flight and an already-baked version returns at once", async () => {
+    const vm = startFakeVmT3Server("vm-upd");
+    cleanups.push(() => vm.server.stop(true));
+    const { cfg, handle } = await startHubWithVm(vm, "t3-sentinel-hub-upd-join-");
+    const bakes = gateBakes(handle);
+    const client = await connectHubClient(handle, cfg);
+    const target = "0.1.12-nightly.20261125.5230";
+
+    bakes.hold();
+    client.request("unary", "server.updateServer", { targetVersion: target });
+    client.request("stream", "server.updateServerWithProgress", { targetVersion: target, channel: "nightly" });
+    await new Promise((r) => setTimeout(r, 150));
+    bakes.release();
+
+    const unary = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "unary", 15_000);
+    expect(unary.exit).toEqual({ _tag: "Success", value: { targetVersion: target, method: "boot-service" } });
+    const streamExit = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "stream", 15_000);
+    expect(streamExit.exit).toEqual({ _tag: "Success", value: null });
+    const streamValues = client.inbox
+      .filter((f) => f._tag === "Chunk" && f.requestId === "stream")
+      .flatMap((f) => f.values as Array<Record<string, unknown>>);
+    expect(streamValues.at(-1)).toEqual({ type: "complete", result: { targetVersion: target, method: "boot-service" } });
+    expect(streamValues.filter((v) => v.type === "progress").map((v) => v.stage)).toContain("installing");
+
+    // One round for both requests: base-t3 once, env-my-app once
+    expect(bakes.calls).toEqual([
+      { target: "base", version: target },
+      { target: "my-app", version: target },
+    ]);
+    expect(handle.state.getHub()?.selfUpdate?.version).toBe(target);
+    expect(await lifecycleServerVersion(client, "life-1")).toBe(target);
+
+    // The app's queued second update for the same version: success at once, nothing rebaked
+    client.request("again", "server.updateServerWithProgress", { targetVersion: target });
+    const again = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "again");
+    expect(again.exit).toEqual({ _tag: "Success", value: null });
+    expect(bakes.calls).toHaveLength(2);
+    expect(await lifecycleServerVersion(client, "life-2")).toBe(target);
+
+    // The marker survives a restart (StateStore.load rebuilds the hub record field by field)
+    const reloaded = new StateStore(cfg.stateDir, cfg);
+    expect(reloaded.getHub()?.selfUpdate).toEqual(handle.state.getHub()?.selfUpdate);
+
+    // A later rebake of any target (e.g. a scheduled one) invalidates the marker
+    await handle.lifecycle.bake("my-app");
+    client.request("after-rebake", "server.updateServer", { targetVersion: target });
+    await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "after-rebake", 15_000);
+    expect(bakes.calls.filter((c) => c.target === "base")).toHaveLength(2);
+  });
+
+  test("server update: a different version waits for the round in flight, then runs", async () => {
+    const vm = startFakeVmT3Server("vm-upd-seq");
+    cleanups.push(() => vm.server.stop(true));
+    const { cfg, handle } = await startHubWithVm(vm, "t3-sentinel-hub-upd-seq-");
+    const bakes = gateBakes(handle);
+    const client = await connectHubClient(handle, cfg);
+    const first = "0.1.12-nightly.20261125.5230";
+    const second = "0.1.13-nightly.20261125.5245";
+
+    bakes.hold();
+    client.request("first", "server.updateServer", { targetVersion: first });
+    client.request("second", "server.updateServer", { targetVersion: second });
+    client.request("second-dup", "server.updateServer", { targetVersion: second });
+    await new Promise((r) => setTimeout(r, 150));
+    // Only the first round has started
+    expect(bakes.calls).toEqual([{ target: "base", version: first }]);
+    bakes.release();
+
+    for (const id of ["first", "second", "second-dup"]) {
+      const exit = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === id, 15_000);
+      expect((exit.exit as { _tag: string })._tag).toBe("Success");
+    }
+    expect(bakes.calls.map((c) => `${c.target}@${c.version}`)).toEqual([
+      `base@${first}`,
+      `my-app@${first}`,
+      `base@${second}`,
+      `my-app@${second}`,
+    ]);
+    expect(handle.state.getHub()?.selfUpdate?.version).toBe(second);
+    expect(await lifecycleServerVersion(client, "life")).toBe(second);
+  });
+
+  test("server update: a partial failure sends a typed error and is retried in full next time", async () => {
+    const vm = startFakeVmT3Server("vm-upd-fail");
+    cleanups.push(() => vm.server.stop(true));
+    const { cfg, handle } = await startHubWithVm(vm, "t3-sentinel-hub-upd-fail-");
+    const bakes = gateBakes(handle);
+    const client = await connectHubClient(handle, cfg);
+    const target = "0.1.12-nightly.20261125.5230";
+
+    bakes.failOnce.add("my-app");
+    client.request("fails", "server.updateServerWithProgress", { targetVersion: target });
+    const failed = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "fails", 15_000);
+    expect(failed.exit).toEqual({
+      _tag: "Failure",
+      cause: [{ _tag: "Fail", error: { _tag: "ServerSelfUpdateError", reason: "bake of my-app failed" } }],
+    });
+    // base-t3 was rebaked, but the round did not finish: no marker
+    expect(handle.state.getHub()?.selfUpdate ?? null).toBeNull();
+
+    client.request("retry", "server.updateServer", { targetVersion: target });
+    const retry = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "retry", 15_000);
+    expect((retry.exit as { _tag: string })._tag).toBe("Success");
+    expect(bakes.calls.map((c) => c.target)).toEqual(["base", "my-app", "base", "my-app"]);
+    expect(handle.state.getHub()?.selfUpdate?.version).toBe(target);
+  });
+
   test("Streamable HTTP /mcp: machine token, 0-VM idle reads, async <2s launch, queued sends, pending requests, and settle -> $0/hr destroy", async () => {
     const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-hub-mcp-"));
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));

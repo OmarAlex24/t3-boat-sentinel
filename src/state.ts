@@ -79,6 +79,15 @@ export interface HubProjectTemplate {
   vcsRefs?: unknown;
 }
 
+/** The last `server.updateServer` round that rebaked every golden snapshot (base + each project's own). */
+export interface HubSelfUpdateRecord {
+  version: string;
+  channel: "stable" | "nightly";
+  completedAt: string;
+  /** `bakedAt` of each bake target's snapshot when the round finished; a later rebake of any target invalidates it. */
+  bakes: Record<string, string>;
+}
+
 export interface HubStateRecord {
   environmentId: string;
   label: string;
@@ -92,6 +101,8 @@ export interface HubStateRecord {
   serverConfig: Record<string, unknown> | null;
   lifecycleEvents: unknown[] | null;
   projectTemplates: Record<string, HubProjectTemplate>;
+  /** Written only after a whole self-update round succeeds, so a partial failure is retried. */
+  selfUpdate: HubSelfUpdateRecord | null;
 }
 
 export interface PersistedState {
@@ -194,6 +205,7 @@ export class StateStore {
         serverConfig: prevHub?.serverConfig ?? null,
         lifecycleEvents: Array.isArray(prevHub?.lifecycleEvents) ? prevHub.lifecycleEvents : null,
         projectTemplates: prevHub?.projectTemplates ?? {},
+        selfUpdate: prevHub?.selfUpdate ?? null,
       };
     }
 
@@ -292,6 +304,7 @@ export class StateStore {
         serverConfig: null,
         lifecycleEvents: null,
         projectTemplates: {},
+        selfUpdate: null,
       };
       this.save();
     }
