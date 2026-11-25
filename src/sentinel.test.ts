@@ -906,6 +906,8 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       rejectLaunch?: string;
       /** With `rejectLaunch`: report the thread on the shell stream just after the failure. */
       lateShellItemAfterReject?: boolean;
+      /** Fail `orchestration.getThreadProjection` (the Hub then has no copy of a sleeping chat). */
+      failProjection?: boolean;
     } = {},
   ) {
     let vmSettings = (opts.configSnapshot?.settings ?? null) as Record<string, unknown> | null;
@@ -1063,6 +1065,12 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
           }
           if (frame.tag === "scheduledTasks.subscribe") {
             ws.sendText(JSON.stringify({ _tag: "Chunk", requestId: frame.id, values: [{ tasks: [] }] }));
+            return;
+          }
+          if (frame.tag === "orchestration.getThreadProjection" && opts.failProjection) {
+            ws.sendText(
+              JSON.stringify({ _tag: "Exit", requestId: frame.id, exit: { _tag: "Failure", cause: [{ _tag: "Die", defect: "busy" }] } }),
+            );
             return;
           }
           if (frame.tag === "orchestration.getThreadProjection") {
@@ -1358,6 +1366,17 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       const [snap, synced] = sub.values as Array<{ kind: string; snapshotSequence?: number; projection?: unknown }>;
       expect(snap).toMatchObject({ kind: "snapshot", snapshotSequence: 0, projection: { thread: { id: "thread-fast" } } });
       expect(synced.kind).toBe("synchronized");
+      // Reads the app sends on opening a chat are answered, not held until the VM is up
+      client.request("family", "orchestration.getThreadFamily", { threadId: "thread-fast" });
+      const family = exitOf(await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "family", 1_000));
+      expect((family.value!.threads as Array<{ id: string }>).map((t) => t.id)).toEqual(["thread-fast"]);
+      client.request("visit", "orchestration.dispatchCommand", {
+        type: "thread.visit",
+        commandId: "cmd-visit-fast",
+        threadId: "thread-fast",
+        visitedAt: new Date().toISOString(),
+      });
+      expect(exitOf(await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "visit", 1_000))._tag).toBe("Success");
       // HTTP snapshots answer 503, never another VM's 404 (the app would mark the chat deleted)
       expect((await httpThreadSnapshot(client, cfg, "thread-fast")).status).toBe(503);
       // A re-sent launch (the app re-sends after a socket loss) gets the same chat, no second VM
@@ -1621,8 +1640,8 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     const threadChunk = (reqId: string, pred: (notice: Row["item"] | undefined, f: Record<string, unknown>) => boolean) =>
       (f: Record<string, unknown>) => f._tag === "Chunk" && f.requestId === reqId && pred(noticeOf(f), f);
 
-    async function sleepingChat(prefix: string) {
-      const vm = startFakeVmT3Server(prefix);
+    async function sleepingChat(prefix: string, vmOpts: Parameters<typeof startFakeVmT3Server>[1] = {}) {
+      const vm = startFakeVmT3Server(prefix, vmOpts);
       cleanups.push(() => vm.server.stop(true));
       const hub = await startHubWithVm(vm, `t3-sentinel-hub-${prefix}-`);
       const client: HubClient = await connectHubClient(hub.handle, hub.cfg);
@@ -1671,6 +1690,22 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
           .slice(seenBefore)
           .some((m) => m.tag === "orchestration.dispatchCommand" && (m.payload as { type?: string }).type === "thread.visit"),
       );
+    });
+
+    test("with no Hub copy, a client's own cached history is kept, not replaced by an empty view", async () => {
+      const { client, boat, dir } = await sleepingChat("vm-nocache", { failProjection: true });
+      expect(existsSync(join(dir, "hub-thread-cache", "thread-zz.json"))).toBe(false);
+      let release!: () => void;
+      boat.resumeGate = new Promise<void>((r) => (release = r));
+      cleanups.push(() => release());
+
+      client.request("sub", "orchestration.subscribeThread", { threadId: "thread-zz", afterSequence: 7, requestCompletionMarker: true });
+      const first = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "sub");
+      expect(first.values).toEqual([{ kind: "synchronized" }]);
+      // The wake starts and its status is not pushed over the client's copy
+      await Bun.sleep(150);
+      expect(client.inbox.some((f) => f._tag === "Chunk" && f.requestId === "sub")).toBe(false);
+      release();
     });
 
     test("a failed wake says why in the chat, and commands fail with a readable reason", async () => {

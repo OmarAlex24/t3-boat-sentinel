@@ -1685,6 +1685,14 @@ export class HubServer {
         return;
       }
       if (!pending && servable && this.serveSleepingThread(ws, reqId, tag, payload, tid)) return;
+      if (tag === "orchestration.getThreadFamily" && (pending || this.sleepingSandboxForThread(tid))) {
+        // Opening the chat asks for its family; answer from the sidebar row instead of waiting for the VM
+        const shell = this.threadShells.get(tid);
+        if (shell) {
+          sendRpcExitSuccess(ws, reqId, { snapshotSequence: this.state.ensureHub().sequence, threads: [shell] });
+          return;
+        }
+      }
       try {
         const sb = await this.resolveSandboxForThread(tid);
         const bridge = await this.ensureBridgeOpen(sb);
@@ -1761,7 +1769,7 @@ export class HubServer {
       if (!pending && !this.threadToSandbox.has(threadId)) {
         const projectKey = this.projectKeyFromHubId(hubProjectId);
         if (!projectKey) {
-          sendRpcExitFailure(ws, reqId, `Unknown projectId "${hubProjectId}"`);
+          this.sendTypedFailure(ws, reqId, "orchestration.launchThread", payload, `Unknown projectId "${hubProjectId}"`);
           return;
         }
         const input = placeholderInputFrom("launch", payload, threadId, hubProjectId);
@@ -1769,7 +1777,7 @@ export class HubServer {
         if (input) {
           const limit = this.capacityError();
           if (limit) {
-            sendRpcExitFailure(ws, reqId, limit);
+            this.sendTypedFailure(ws, reqId, "orchestration.launchThread", payload, limit);
             return;
           }
           const started = this.startPendingLaunch("launch", projectKey, { ...payload, threadId }, input);
@@ -1843,7 +1851,7 @@ export class HubServer {
         if (input) {
           const limit = this.capacityError();
           if (limit) {
-            sendRpcExitFailure(ws, reqId, limit);
+            this.sendTypedFailure(ws, reqId, "orchestration.dispatchCommand", payload, limit);
             return;
           }
           const started = this.startPendingLaunch("create", projectKey, { ...payload, threadId }, input);
@@ -2143,9 +2151,14 @@ export class HubServer {
     return subs;
   }
 
-  /** Sends a newer Hub-built projection to the thread's local streams. */
-  private pushLocalThreadSnapshot(threadId: string, projection: Record<string, unknown>): void {
+  /**
+   * Sends a newer Hub-built projection to the thread's local streams. With `onlyServed`, a stream
+   * that kept the client's own copy (got only `synchronized`) is left alone, so a projection without
+   * history never replaces it.
+   */
+  private pushLocalThreadSnapshot(threadId: string, projection: Record<string, unknown>, onlyServed = false): void {
     for (const sub of this.liveLocalThreadSubs(threadId)) {
+      if (onlyServed && !sub.servedSnapshot) continue;
       sub.servedSnapshot = true;
       sendRpcFrame(sub.ws, {
         _tag: "Chunk",
@@ -2303,7 +2316,7 @@ export class HubServer {
       const subs = this.liveLocalThreadSubs(threadId);
       if (subs.length === 0) continue;
       const view = this.sleepingThreadView(threadId, sandboxId);
-      if (view) this.pushLocalThreadSnapshot(threadId, view);
+      if (view) this.pushLocalThreadSnapshot(threadId, view, !this.readProjectionCache(threadId));
     }
   }
 
@@ -2332,7 +2345,11 @@ export class HubServer {
     await Promise.all(
       sb.threadIds.map(async (threadId) => {
         const exit = await bridge.callUnary("orchestration.getThreadProjection", { threadId }, 10_000);
-        if (exit._tag !== "Success" || !exit.value || typeof exit.value !== "object") return;
+        if (exit._tag !== "Success" || !exit.value || typeof exit.value !== "object") {
+          // An older copy must never replace the newer one the client holds
+          this.dropProjectionCache(threadId);
+          return;
+        }
         const projection = rewriteProjectIds(exit.value, sb.vmProjectId, sb.hubProjectId) as Record<string, unknown>;
         this.projectionCache.set(threadId, projection);
         try {
