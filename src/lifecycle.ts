@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,7 +11,14 @@ import {
 } from "./providers/types.ts";
 import type { ProjectConfig, SentinelConfig } from "./config.ts";
 import type { KlavClient } from "./klav.ts";
-import { ProviderSessionStore, STAGED_SESSIONS_DIR } from "./provider-sessions.ts";
+import { ProviderSessionStore, STAGED_SESSIONS_DIR, type StagedCredential } from "./provider-sessions.ts";
+import {
+  buildProvisionBundle,
+  parseFailedGroups,
+  placeDeferredScript,
+  type BundleFile,
+  type ProvisionBundle,
+} from "./provision-bundle.ts";
 import { buildRepoSyncScript, describeRepoSync, parseRepoSyncOutput, type RepoSyncResult } from "./repo-sync.ts";
 import type { SlotRecord, StateStore } from "./state.ts";
 import { T3ReleaseResolver } from "./t3-release.ts";
@@ -21,6 +28,8 @@ import { templateVcsRefs } from "./vcs-refs.ts";
 const SCRIPTS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "scripts");
 const PROVISION_SCRIPT = join(SCRIPTS_DIR, "provision-base.sh");
 const WATCHDOG_SCRIPT = join(SCRIPTS_DIR, "watchdog.mjs");
+/** Bundle group of the staged provider sign-ins: all or none land in the VM. */
+const SESSIONS_GROUP = "provider-sessions";
 
 export interface WatchdogEventPayload {
   slot: string;
@@ -238,6 +247,7 @@ export class LifecycleManager {
 
         let sandboxId: string | null = null;
         let klavAgentName: string | null = null;
+        let klavTask: Promise<unknown> | null = null;
 
         try {
           console.log(
@@ -246,8 +256,12 @@ export class LifecycleManager {
           sandboxId = await this.boat.create({ name: sandboxName, size, fromSnapshot: snapshotToUse });
 
           if (effectiveProject.klav && this.klav) {
-            const prov = await this.klav.provisionForSandbox(this.boat, sandboxId, effectiveProject.klav);
-            klavAgentName = prov.agentName;
+            // Runs alongside the file upload; provisioning waits for it before T3 starts
+            klavTask = this.klav.provisionForSandbox(this.boat, sandboxId, effectiveProject.klav).then((prov) => {
+              klavAgentName = prov.agentName;
+              return prov;
+            });
+            klavTask.catch(() => {});
           }
 
           await this.provisionRunningVm(
@@ -259,6 +273,7 @@ export class LifecycleManager {
             true,
             true,
             !supportsSnapshots,
+            klavTask ?? undefined,
           );
 
           const endpoint = await this.boat.exposePort(sandboxId, 3773, {
@@ -340,6 +355,8 @@ export class LifecycleManager {
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           console.error(`[lifecycle] spawn failed for ${slotName}:`, msg);
+          // Klav may still be running (the upload failed first): let it settle so the agent it made is revoked
+          if (klavTask) await klavTask.catch(() => {});
           if (sandboxId) {
             this.state.queueDelete(sandboxId, "failed-spawn", klavAgentName);
             void this.reaperTick();
@@ -931,6 +948,12 @@ export class LifecycleManager {
      * (discarding what the bake left), before `envFile`, `bootCmd` and T3. Never on wake.
      */
     syncRepoToRemote?: boolean;
+    /**
+     * Work that must finish before `bootCmd` and `provision-base.sh` start (Klav, which writes
+     * `~/.klav-forward` and the shell env both read). Started by the caller right after create, so it
+     * runs while the files upload and the repo syncs; its rejection fails provisioning.
+     */
+    beforeBoot?: Promise<unknown>;
   }): Promise<{
     descriptor?: Record<string, unknown>;
     authSession?: Record<string, unknown>;
@@ -941,6 +964,10 @@ export class LifecycleManager {
     repoSync?: RepoSyncResult;
     /** How long `syncRepoToRemote` took, when it ran. */
     repoSyncMs?: number;
+    /** How long putting the provisioning files in place took (the bundle, or one upload per file). */
+    uploadMs?: number;
+    /** How long provisioning waited on `beforeBoot` (Klav still running after the files were placed). */
+    klavWaitMs?: number;
   }> {
     const { sandboxId, watchdogSlotKey, environmentId, label, projectName, project, watchdogSecret, llmToken, mintToken } = opts;
     // Stored sign-ins are only staged on providers with a file transfer (`download`): elsewhere the
@@ -955,55 +982,23 @@ export class LifecycleManager {
       }
     }
     const staged = opts.injectProviderSessions && canStageSessions ? this.providerSessions.stagedCredentials() : [];
-    const stagingDirs = [...new Set(staged.map((c) => c.remoteDir))];
-    // Staging dirs live under the 0700 ~/.t3-sentinel; provision-base.sh installs the files 0600 and removes them
-    const mkdirs = stagingDirs.map((d) => ` && mkdir -p ${d}`).join("");
-    await this.boat.execOk(sandboxId, `mkdir -p ~/.t3-sentinel && chmod 700 ~/.t3-sentinel${mkdirs}`, 30);
-    await this.boat.upload(sandboxId, PROVISION_SCRIPT, "~/.t3-sentinel/provision-base.sh");
-    await this.boat.upload(sandboxId, WATCHDOG_SCRIPT, "~/.t3-sentinel/watchdog.mjs");
-
-    const injected = new Set<string>();
-    for (const cred of staged) {
-      try {
-        await this.boat.upload(sandboxId, cred.localPath, cred.remotePath);
-        injected.add(cred.instanceId);
-      } catch {
-        // Never block a launch on a missing sign-in: drop anything staged (no partial files) and boot signed out
-        console.warn(`[sessions] could not copy stored ${cred.instanceId} session into ${sandboxId}; continuing signed out`);
-        injected.clear();
-        await this.boat.exec(sandboxId, `rm -rf ${STAGED_SESSIONS_DIR}`, 30).catch(() => {});
-        break;
-      }
-    }
-
-    const tmpDir = mkdtempSync(join(tmpdir(), "t3-sentinel-boot-"));
-    try {
-      const bootSecretsPath = join(tmpDir, "boot-secrets.json");
-      writeFileSync(
-        bootSecretsPath,
-        JSON.stringify(
-          {
-            slot: watchdogSlotKey,
-            sandboxId,
-            callbackUrl: `https://${this.config.controlHost}/internal/watchdog`,
-            watchdogSecret,
-            sleepAfterSecs: this.config.boat.sleepAfterSecs,
-            archiveGraceSecs: this.config.boat.archiveGraceSecs,
-            deleteWhen: this.config.boat.deleteWhen,
-            projectWorkdir: project?.workdir ?? null,
-          },
-          null,
-          2,
-        ),
-        { mode: 0o600 },
-      );
-      await this.boat.upload(sandboxId, bootSecretsPath, "~/.t3-sentinel/boot-secrets.json");
-
-      if (this.config.llmProxy && llmToken) {
-        const claudeSettingsPath = join(tmpDir, "claude-settings.json");
-        writeFileSync(
-          claudeSettingsPath,
-          JSON.stringify(
+    const bootSecrets = JSON.stringify(
+      {
+        slot: watchdogSlotKey,
+        sandboxId,
+        callbackUrl: `https://${this.config.controlHost}/internal/watchdog`,
+        watchdogSecret,
+        sleepAfterSecs: this.config.boat.sleepAfterSecs,
+        archiveGraceSecs: this.config.boat.archiveGraceSecs,
+        deleteWhen: this.config.boat.deleteWhen,
+        projectWorkdir: project?.workdir ?? null,
+      },
+      null,
+      2,
+    );
+    const claudeSettings =
+      this.config.llmProxy && llmToken
+        ? JSON.stringify(
             {
               env: {
                 CLAUDE_CODE_DISABLE_TERMINAL_TITLE: "1",
@@ -1015,38 +1010,56 @@ export class LifecycleManager {
             },
             null,
             2,
-          ),
-          { mode: 0o600 },
-        );
-        await this.boat.execOk(sandboxId, "mkdir -p ~/.claude", 30);
-        await this.boat.upload(sandboxId, claudeSettingsPath, "~/.claude/settings.json");
-        await this.boat.execOk(sandboxId, "chmod 600 ~/.claude/settings.json", 30);
+          )
+        : null;
+    const runsRepoSync = !!(opts.syncRepoToRemote && project);
+    const envFile =
+      project?.envFile && existsSync(project.envFile)
+        ? { from: project.envFile, to: project.envTarget ?? `${project.workdir}/.env` }
+        : null;
+
+    const uploadStartedAt = Date.now();
+    let injected: Set<string>;
+    let placeEnvAfterSync: (() => Promise<void>) | null = null;
+    if (canStageSessions) {
+      // Providers with a file transfer: every file in one archive, one upload, one place exec
+      const res = await this.uploadProvisionBundle(sandboxId, {
+        staged,
+        bootSecrets,
+        claudeSettings,
+        envFile,
+        deferEnv: runsRepoSync,
+      });
+      injected = res.injected;
+      const deferred = res.deferred;
+      if (deferred.length > 0) {
+        placeEnvAfterSync = async () => {
+          await this.boat.execOk(sandboxId, placeDeferredScript(deferred), 30);
+        };
       }
-    } finally {
-      rmSync(tmpDir, { recursive: true, force: true });
+    } else {
+      injected = await this.uploadProvisionFilesOneByOne(sandboxId, { bootSecrets, claudeSettings });
+      if (envFile) {
+        placeEnvAfterSync = async () => {
+          await this.boat.upload(sandboxId, envFile.from, envFile.to);
+        };
+      }
     }
-
-    if (this.config.t3.settingsFile && existsSync(this.config.t3.settingsFile)) {
-      await this.boat.upload(sandboxId, this.config.t3.settingsFile, "~/.t3-sentinel/t3-settings.json");
-    }
-
-    for (const file of this.config.boat.injectFiles) {
-      if (!existsSync(file.from)) continue;
-      const remoteDir = file.to.includes("/") ? file.to.slice(0, file.to.lastIndexOf("/")) : ".";
-      await this.boat.execOk(sandboxId, `mkdir -p ${remoteDir}`, 30);
-      await this.boat.upload(sandboxId, file.from, file.to);
-      await this.boat.execOk(sandboxId, `chmod ${file.mode ?? "600"} ${file.to}`, 30);
-    }
+    const uploadMs = Date.now() - uploadStartedAt;
 
     // After `injectFiles` (which may carry git credentials), before the `.env` and `bootCmd` that use the tree
     const repoSyncStartedAt = Date.now();
-    const repoSync =
-      opts.syncRepoToRemote && project ? await this.syncRepoToRemote(sandboxId, projectName, project) : undefined;
+    const repoSync = runsRepoSync ? await this.syncRepoToRemote(sandboxId, projectName, project!) : undefined;
     const repoSyncMs = Date.now() - repoSyncStartedAt;
 
-    if (project?.envFile && existsSync(project.envFile)) {
-      const target = project.envTarget ?? `${project.workdir}/.env`;
-      await this.boat.upload(sandboxId, project.envFile, target);
+    if (placeEnvAfterSync) await placeEnvAfterSync();
+
+    // Klav (started by the caller alongside the upload) must be in place before anything runs with its env
+    let klavWaitMs = 0;
+    if (opts.beforeBoot) {
+      const waitStartedAt = Date.now();
+      await opts.beforeBoot;
+      klavWaitMs = Date.now() - waitStartedAt;
     }
 
     if (project?.bootCmd) {
@@ -1084,7 +1097,140 @@ export class LifecycleManager {
     if (injected.size > 0) {
       console.log(`[sessions] copied stored ${[...injected].join(", ")} session(s) into ${sandboxId}`);
     }
-    return { ...parsed, injectedProviderSessions: [...injected], ...(repoSync ? { repoSync, repoSyncMs } : {}) };
+    return {
+      ...parsed,
+      injectedProviderSessions: [...injected],
+      uploadMs,
+      klavWaitMs,
+      ...(repoSync ? { repoSync, repoSyncMs } : {}),
+    };
+  }
+
+  /**
+   * Sends every provisioning file in one tar archive: one `upload` (a file transfer, so no secret ever
+   * travels in an exec body or output), then one exec that extracts it and places each file. The exec
+   * script holds paths and modes only. Local staging is a fresh 0700 dir with the 0600 archive, removed
+   * afterwards; the remote archive and extraction dir live under the 0700 `~/.t3-sentinel` and are
+   * removed by the place script.
+   */
+  private async uploadProvisionBundle(
+    sandboxId: string,
+    input: {
+      staged: StagedCredential[];
+      bootSecrets: string;
+      claudeSettings: string | null;
+      envFile: { from: string; to: string } | null;
+      /** Hold the `.env` in VM staging until `placeDeferredScript` (it must land after the repo sync). */
+      deferEnv: boolean;
+    },
+  ): Promise<{ injected: Set<string>; deferred: ProvisionBundle["deferred"] }> {
+    const encode = (s: string) => new TextEncoder().encode(s);
+    const files: BundleFile[] = [
+      { source: PROVISION_SCRIPT, dest: "~/.t3-sentinel/provision-base.sh" },
+      { source: WATCHDOG_SCRIPT, dest: "~/.t3-sentinel/watchdog.mjs" },
+    ];
+
+    // Read stored sign-ins up front: one unreadable file drops them all (no partial session), boot signed out
+    const credFiles: BundleFile[] = [];
+    try {
+      for (const cred of input.staged) {
+        credFiles.push({ source: readFileSync(cred.localPath), dest: cred.remotePath, mode: "600", group: SESSIONS_GROUP });
+      }
+    } catch {
+      console.warn(`[sessions] could not read a stored session for ${sandboxId}; continuing signed out`);
+      credFiles.length = 0;
+    }
+    files.push(...credFiles);
+
+    files.push({ source: encode(input.bootSecrets), dest: "~/.t3-sentinel/boot-secrets.json", mode: "600" });
+    if (input.claudeSettings !== null) {
+      files.push({ source: encode(input.claudeSettings), dest: "~/.claude/settings.json", mode: "600", forceMode: "600" });
+    }
+    if (this.config.t3.settingsFile && existsSync(this.config.t3.settingsFile)) {
+      files.push({ source: this.config.t3.settingsFile, dest: "~/.t3-sentinel/t3-settings.json" });
+    }
+    for (const file of this.config.boat.injectFiles) {
+      if (!existsSync(file.from)) continue;
+      const mode = file.mode ?? "600";
+      files.push({ source: file.from, dest: file.to, mode, forceMode: mode });
+    }
+    const deferredFiles: BundleFile[] = [];
+    if (input.envFile) {
+      (input.deferEnv ? deferredFiles : files).push({ source: input.envFile.from, dest: input.envFile.to });
+    }
+
+    const bundle = buildProvisionBundle(files, {
+      deferred: deferredFiles,
+      groups: credFiles.length > 0 ? { [SESSIONS_GROUP]: { cleanupDir: STAGED_SESSIONS_DIR } } : {},
+    });
+
+    const localDir = mkdtempSync(join(tmpdir(), "t3-sentinel-bundle-"));
+    try {
+      chmodSync(localDir, 0o700);
+      const localArchive = join(localDir, "bundle.tar");
+      writeFileSync(localArchive, bundle.archive, { mode: 0o600 });
+      // The upload needs its 0700 staging dir; snapshots already have it, this keeps fresh images working
+      await this.boat.execOk(sandboxId, "mkdir -p ~/.t3-sentinel && chmod 700 ~/.t3-sentinel", 30);
+      try {
+        await this.boat.upload(sandboxId, localArchive, bundle.remoteArchive);
+      } catch (err) {
+        // A partial archive must not stay behind (a failed wake keeps its VM)
+        await this.boat.exec(sandboxId, `rm -f ${bundle.remoteArchive}`, 30).catch(() => {});
+        throw err;
+      }
+    } finally {
+      rmSync(localDir, { recursive: true, force: true });
+    }
+
+    const out = await this.boat.execOk(sandboxId, bundle.placeScript, 120);
+    const injected = new Set(credFiles.length > 0 ? input.staged.map((c) => c.instanceId) : []);
+    if (parseFailedGroups(out).includes(SESSIONS_GROUP)) {
+      // Never block a launch on a missing sign-in: the place script dropped every staged file
+      console.warn(`[sessions] could not place stored sessions into ${sandboxId}; continuing signed out`);
+      injected.clear();
+    }
+    return { injected, deferred: bundle.deferred };
+  }
+
+  /** Providers without a file transfer (their `upload` goes through exec): one upload per file, as before. */
+  private async uploadProvisionFilesOneByOne(
+    sandboxId: string,
+    input: { bootSecrets: string; claudeSettings: string | null },
+  ): Promise<Set<string>> {
+    await this.boat.execOk(sandboxId, "mkdir -p ~/.t3-sentinel && chmod 700 ~/.t3-sentinel", 30);
+    await this.boat.upload(sandboxId, PROVISION_SCRIPT, "~/.t3-sentinel/provision-base.sh");
+    await this.boat.upload(sandboxId, WATCHDOG_SCRIPT, "~/.t3-sentinel/watchdog.mjs");
+
+    const tmpDir = mkdtempSync(join(tmpdir(), "t3-sentinel-boot-"));
+    try {
+      const bootSecretsPath = join(tmpDir, "boot-secrets.json");
+      writeFileSync(bootSecretsPath, input.bootSecrets, { mode: 0o600 });
+      await this.boat.upload(sandboxId, bootSecretsPath, "~/.t3-sentinel/boot-secrets.json");
+
+      if (input.claudeSettings !== null) {
+        const claudeSettingsPath = join(tmpDir, "claude-settings.json");
+        writeFileSync(claudeSettingsPath, input.claudeSettings, { mode: 0o600 });
+        await this.boat.execOk(sandboxId, "mkdir -p ~/.claude", 30);
+        await this.boat.upload(sandboxId, claudeSettingsPath, "~/.claude/settings.json");
+        await this.boat.execOk(sandboxId, "chmod 600 ~/.claude/settings.json", 30);
+      }
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+
+    if (this.config.t3.settingsFile && existsSync(this.config.t3.settingsFile)) {
+      await this.boat.upload(sandboxId, this.config.t3.settingsFile, "~/.t3-sentinel/t3-settings.json");
+    }
+
+    for (const file of this.config.boat.injectFiles) {
+      if (!existsSync(file.from)) continue;
+      const remoteDir = file.to.includes("/") ? file.to.slice(0, file.to.lastIndexOf("/")) : ".";
+      await this.boat.execOk(sandboxId, `mkdir -p ${remoteDir}`, 30);
+      await this.boat.upload(sandboxId, file.from, file.to);
+      await this.boat.execOk(sandboxId, `chmod ${file.mode ?? "600"} ${file.to}`, 30);
+    }
+    // Stored sign-ins are never staged here: these providers have no `download`
+    return new Set<string>();
   }
 
   /** Bounded and non-fatal: a failure or timeout boots the chat on the snapshot's code, with one log line. */
@@ -1122,6 +1268,7 @@ export class LifecycleManager {
     mintToken: boolean,
     injectProviderSessions = false,
     installProviderRuntimes = false,
+    beforeBoot?: Promise<unknown>,
   ): Promise<void> {
     const slot = this.state.getSlot(slotName)!;
     const parsed = await this.provisionStandaloneVm({
@@ -1136,6 +1283,7 @@ export class LifecycleManager {
       mintToken,
       injectProviderSessions,
       installProviderRuntimes,
+      ...(beforeBoot ? { beforeBoot } : {}),
     });
 
     this.state.updateSlot(slotName, (s) => {
