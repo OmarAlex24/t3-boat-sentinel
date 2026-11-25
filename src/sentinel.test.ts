@@ -37,6 +37,7 @@ import { handleMcpRequest } from "./mcp.ts";
 import { CelestoProvider, SandboxSdkProvider, createSandboxProvider, type ExternalSdkProviderLike } from "./providers/index.ts";
 import { asSandboxProvider, type ProviderCapability, type SandboxProvider } from "./providers/types.ts";
 import { ProviderSessionStore } from "./provider-sessions.ts";
+import { ProviderSetupRouter, ProviderStatusBook } from "./hub-providers.ts";
 import { StateStore } from "./state.ts";
 import { T3ReleaseResolver } from "./t3-release.ts";
 import { ATTACHMENT_UPLOAD_URL_TTL_MS, parseUploadRequest } from "./hub-attachments.ts";
@@ -1002,6 +1003,11 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       failProjection?: boolean;
       /** Attachment ids this VM holds: `assets.createUrl` for any other attachment fails as T3 does. */
       attachments?: string[];
+      /**
+       * Run a provider sign-in like T3: `provider.auth.start` answers `waiting` with a flow,
+       * `provider.auth.complete` answers `succeeded` and publishes it on the open `provider.auth.subscribe` streams.
+       */
+      signIn?: boolean;
     } = {},
   ) {
     let assetSeq = 0;
@@ -1027,6 +1033,11 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       deletedAt: null,
     };
     let configStream: { ws: { sendText(data: string): unknown }; requestId: string } | null = null;
+    let shellStream: { ws: { sendText(data: string): unknown }; requestId: string } | null = null;
+    const authStreams: Array<{ ws: { sendText(data: string): unknown }; requestId: string }> = [];
+    let flowSeq = 0;
+    /** With `signIn`: the last sign-in state, which a new `provider.auth.subscribe` gets first (like T3). */
+    let authState: Record<string, unknown> | null = null;
     // Preview media, like T3's /api/preview-stream: who connected (and how), and what they sent
     const mediaConnections: Array<{ path: string; query: Record<string, string>; authorization: string | null }> = [];
     const mediaMessages: string[] = [];
@@ -1105,13 +1116,33 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
             );
             return;
           }
+          if (opts.signIn && (frame.tag === "provider.auth.start" || frame.tag === "provider.auth.complete")) {
+            const done = frame.tag === "provider.auth.complete";
+            if (!done) flowSeq++;
+            const state = {
+              instanceId: frame.payload?.instanceId,
+              phase: done ? "succeeded" : "waiting",
+              flowId: `flow-${vmTag}-${flowSeq}`,
+              authorizationUrl: null,
+              expiresAt: null,
+              message: null,
+            };
+            authState = state;
+            ws.sendText(JSON.stringify({ _tag: "Exit", requestId: frame.id, exit: { _tag: "Success", value: state } }));
+            for (const s of authStreams) {
+              s.ws.sendText(JSON.stringify({ _tag: "Chunk", requestId: s.requestId, values: [state] }));
+            }
+            return;
+          }
           if (frame.tag === "provider.install.subscribe" || frame.tag === "provider.auth.subscribe") {
+            if (frame.tag === "provider.auth.subscribe") authStreams.push({ ws, requestId: frame.id });
+            const current = frame.tag === "provider.auth.subscribe" && authState ? authState : null;
             // Like a real VM: one snapshot, stream stays open
             ws.sendText(
               JSON.stringify({
                 _tag: "Chunk",
                 requestId: frame.id,
-                values: [{ instanceId: frame.payload?.instanceId, phase: "idle", fromVm: vmTag }],
+                values: [current ?? { instanceId: frame.payload?.instanceId, phase: "idle", fromVm: vmTag }],
               }),
             );
             return;
@@ -1146,6 +1177,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
           }
 
           if (frame.tag === "orchestration.subscribeShell") {
+            shellStream = { ws, requestId: frame.id };
             ws.sendText(
               JSON.stringify({
                 _tag: "Chunk",
@@ -1330,6 +1362,19 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       if (!configStream) throw new Error("no open subscribeServerConfig stream on fake VM");
       configStream.ws.sendText(JSON.stringify({ _tag: "Chunk", requestId: configStream.requestId, values }));
     };
+    /** Publishes a thread row change on the Hub's shell stream, like T3 when a turn starts or ends. */
+    const pushThreadRow = (threadId: string, patch: Record<string, unknown>) => {
+      if (!shellStream) throw new Error("no open orchestration.subscribeShell stream on fake VM");
+      const row = { ...threads.get(threadId)!, ...patch };
+      threads.set(threadId, row);
+      shellStream.ws.sendText(
+        JSON.stringify({
+          _tag: "Chunk",
+          requestId: shellStream.requestId,
+          values: [{ kind: "thread.updated", sequence: 10, location: "active", thread: row }],
+        }),
+      );
+    };
     const pushPreviewEvent = (event: Record<string, unknown>) => {
       for (const stream of previewEventStreams) {
         stream.ws.sendText(JSON.stringify({ _tag: "Chunk", requestId: stream.requestId, values: [event] }));
@@ -1342,6 +1387,11 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       acks,
       vmProjectId,
       pushConfigItems,
+      pushThreadRow,
+      /** Sets the sign-in state a new `provider.auth.subscribe` gets first (with `signIn`). */
+      setAuthState: (state: Record<string, unknown>) => {
+        authState = state;
+      },
       getSettings: () => vmSettings,
       uploads,
       threads,
@@ -3017,6 +3067,230 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     expect(handle.state.listHubSandboxes().length).toBe(0);
   });
 
+  describe("provider status and sign-in across chat VMs", () => {
+    const agModels = [{ slug: "gemini-3-pro", name: "Gemini 3 Pro", isCustom: false, capabilities: null }];
+    const claude = { instanceId: "claudeAgent", driver: "claudeAgent", enabled: true, installed: true, status: "ready", auth: { status: "authenticated" } };
+    /** Antigravity on a VM where a session already ran: signed in, with its models. */
+    const agConfirmed = {
+      instanceId: "antigravity",
+      driver: "antigravity",
+      enabled: true,
+      installed: true,
+      status: "ready",
+      auth: { status: "authenticated", type: "oauth-personal", label: "Google account" },
+      models: agModels,
+    };
+    /** Antigravity on a fresh VM: T3 has not checked the Google account yet. */
+    const agUnchecked = {
+      instanceId: "antigravity",
+      driver: "antigravity",
+      enabled: true,
+      installed: true,
+      status: "warning",
+      auth: { status: "unknown" },
+      message: "Antigravity is installed. Google account access is not checked yet.",
+      models: [],
+    };
+    const agSignedOut = { ...agUnchecked, auth: { status: "unauthenticated" }, message: "Sign in with Google to use Antigravity." };
+    type AgStub = { auth?: { status?: string }; models?: unknown[] };
+    const hubAg = (handle: SentinelServerHandle) =>
+      providerById(handle.state.getHub()?.serverConfig?.providers, "antigravity") as (ProviderStub & AgStub) | undefined;
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    async function until(cond: () => boolean, timeoutMs = 5_000) {
+      const start = Date.now();
+      while (!cond()) {
+        if (Date.now() - start > timeoutMs) throw new Error("condition not met in time");
+        await sleep(20);
+      }
+    }
+    const authTags = (vm: ReturnType<typeof startFakeVmT3Server>) =>
+      vm.seenMethods.filter((m) => m.tag.startsWith("provider.auth.")).map((m) => m.tag);
+
+    /** A Hub with two chats, each on its own fake VM: thread-a on sb-1 (vm-a), thread-b on sb-2 (vm-b). */
+    async function twoChatVms(
+      dirPrefix: string,
+      optsA: Parameters<typeof startFakeVmT3Server>[1] = {},
+      optsB: Parameters<typeof startFakeVmT3Server>[1] = {},
+    ) {
+      const vmA = startFakeVmT3Server("vm-a", optsA);
+      const vmB = startFakeVmT3Server("vm-b", optsB);
+      cleanups.push(() => vmA.server.stop(true));
+      cleanups.push(() => vmB.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vmA, dirPrefix);
+      boat.hostPublic = async (id: string) => (id === "sb-2" ? vmB.url : vmA.url);
+      const client = await connectHubClient(handle, cfg);
+      client.request("cfg", "subscribeServerConfig", {});
+      await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "cfg");
+      await launchThreadOnHub(client, "thread-a");
+      const hubProjectId = handle.state.getHub()!.projectIds["my-app"];
+      client.request("launch-b", "orchestration.launchThread", clientLaunchPayload("thread-b", hubProjectId));
+      const launchB = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "launch-b");
+      expect((launchB.exit as { _tag: string })._tag).toBe("Success");
+      // The Hub answers at once; wait for the VM's own row, as `launchThreadOnHub` does
+      await until(() => vmB.threads.has("thread-b") && handle.state.getHubSandbox("sb-2")?.phase === "running");
+      await client.waitForFrame(shellThreadUpdate("thread-b", (t) => t.worktreePath !== null && t.status === "running"));
+      expect(handle.state.listHubSandboxes().map((s) => s.sandboxId)).toEqual(["sb-1", "sb-2"]);
+      return { vmA, vmB, handle, client };
+    }
+
+    /** A thread row that runs (or ran) a turn on Antigravity. */
+    const onAntigravity = (status: string) => ({
+      status,
+      providerInstanceId: "antigravity",
+      modelSelection: { instanceId: "antigravity", model: "gemini-3-pro" },
+    });
+    async function setRow(
+      client: Awaited<ReturnType<typeof connectHubClient>>,
+      vm: ReturnType<typeof startFakeVmT3Server>,
+      threadId: string,
+      patch: Record<string, unknown>,
+    ) {
+      vm.pushThreadRow(threadId, patch);
+      await client.waitForFrame(shellThreadUpdate(threadId, (t) => t.status === patch.status && t.providerInstanceId === (patch.providerInstanceId ?? t.providerInstanceId)));
+    }
+
+    test("a fresh VM's 'not checked yet' report keeps another VM's signed-in status and models; it wins once that VM is gone", async () => {
+      const { vmB, handle, client } = await twoChatVms(
+        "t3-sentinel-prov-merge-",
+        { configSnapshot: { providers: [claude, agConfirmed], settings: {} } },
+        { configSnapshot: { providers: [claude, agUnchecked], settings: {} } },
+      );
+      // vm-b's boot snapshot was harvested (it is the second VM); the Hub still shows vm-a's sign-in
+      await until(() => vmB.seenMethods.some((m) => m.tag === "subscribeServerLifecycle"));
+      await sleep(100);
+      expect(hubAg(handle)?.auth?.status).toBe("authenticated");
+      expect(hubAg(handle)?.models).toEqual(agModels);
+
+      // A later live report from vm-b says the same: nothing changes, nothing is broadcast
+      const before = client.inbox.length;
+      vmB.pushConfigItems([{ version: 1, type: "providerStatuses", payload: { providers: [claude, agUnchecked] } }]);
+      await sleep(150);
+      expect(hubAg(handle)?.auth?.status).toBe("authenticated");
+      expect(hubAg(handle)?.models).toEqual(agModels);
+      const sent = client.inbox
+        .slice(before)
+        .filter((f) => f._tag === "Chunk" && f.requestId === "cfg")
+        .flatMap((f) => f.values as Array<{ payload?: { providers?: unknown } }>)
+        .map((v) => providerById(v.payload?.providers, "antigravity") as AgStub | undefined);
+      expect(sent.every((p) => p === undefined || p.auth?.status === "authenticated")).toBe(true);
+
+      // The confirming VM goes away: vm-b's own report is all that is left, and it wins
+      await handle.hub!.destroyHubSandbox("sb-1", "test");
+      vmB.pushConfigItems([{ version: 1, type: "providerStatuses", payload: { providers: [claude, agUnchecked] } }]);
+      await until(() => hubAg(handle)?.auth?.status === "unknown");
+      expect(hubAg(handle)?.models).toEqual([]);
+    });
+
+    test("a real sign-out still updates the status, and no other VM's older sign-in vouches for it afterwards", async () => {
+      const { vmA, vmB, handle, client } = await twoChatVms(
+        "t3-sentinel-prov-signout-",
+        { configSnapshot: { providers: [claude, agConfirmed], settings: {} } },
+        { configSnapshot: { providers: [claude, agUnchecked], settings: {} } },
+      );
+      await until(() => vmB.seenMethods.some((m) => m.tag === "subscribeServerLifecycle"));
+      await sleep(100);
+      // Starts from what only the merge can hold: vm-b unchecked, the Hub still signed in from vm-a
+      expect(hubAg(handle)?.auth?.status).toBe("authenticated");
+
+      client.request("logout", "provider.auth.logout", { instanceId: "antigravity" });
+      const logout = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "logout");
+      expect((logout.exit as { _tag: string })._tag).toBe("Success");
+
+      // After the sign-out, vm-a's earlier sign-in no longer replaces vm-b's report
+      vmB.pushConfigItems([{ version: 1, type: "providerStatuses", payload: { providers: [claude, agUnchecked] } }]);
+      await until(() => hubAg(handle)?.auth?.status === "unknown");
+      // The signed-out VM reports it: shown as reported, never replaced
+      vmA.pushConfigItems([{ version: 1, type: "providerStatuses", payload: { providers: [claude, agSignedOut] } }]);
+      await until(() => hubAg(handle)?.auth?.status === "unauthenticated");
+      await client.waitForFrame(
+        (f) =>
+          f._tag === "Chunk" &&
+          f.requestId === "cfg" &&
+          (f.values as Array<{ payload?: { providers?: unknown } }>).some(
+            (v) => (providerById(v.payload?.providers, "antigravity") as AgStub | undefined)?.auth?.status === "unauthenticated",
+          ),
+      );
+    });
+
+    test("provider.auth.start avoids a VM whose chat runs a turn on that provider, and the rest of the flow sticks to the chosen VM", async () => {
+      const { vmA, vmB, client } = await twoChatVms("t3-sentinel-prov-route-");
+      // thread-a (vm-a, the oldest VM) runs an Antigravity turn; thread-b (vm-b) is idle
+      await setRow(client, vmA, "thread-a", onAntigravity("running"));
+      await setRow(client, vmB, "thread-b", { status: "idle" });
+
+      client.request("auth", "provider.auth.subscribe", { instanceId: "antigravity" });
+      await client.waitForFrame(
+        (f) => f._tag === "Chunk" && f.requestId === "auth" && (f.values as Array<{ fromVm?: string }>)[0]?.fromVm === "vm-b",
+      );
+      client.request("start", "provider.auth.start", { instanceId: "antigravity" });
+      const start = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "start");
+      expect((start.exit as { value?: { vmTag?: string } }).value?.vmTag).toBe("vm-b");
+
+      // Loads flip: vm-a is now idle (a fresh pick would prefer it), vm-b runs a turn on another provider
+      await setRow(client, vmA, "thread-a", { status: "idle" });
+      await setRow(client, vmB, "thread-b", { status: "running" });
+      client.request("respond", "provider.auth.respond", {
+        instanceId: "antigravity",
+        flowId: "flow-1",
+        interactionId: "i-1",
+        response: { type: "text", text: "1" },
+      });
+      client.request("complete", "provider.auth.complete", { instanceId: "antigravity", flowId: "flow-1", callbackUrl: "http://localhost/cb" });
+      client.request("cancel", "provider.auth.cancel", { instanceId: "antigravity", flowId: "flow-1" });
+      for (const id of ["respond", "complete", "cancel"]) {
+        const exit = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === id);
+        expect((exit.exit as { value?: { vmTag?: string } }).value?.vmTag).toBe("vm-b");
+      }
+      expect(authTags(vmA)).toEqual([]);
+      expect(authTags(vmB)).toEqual([
+        "provider.auth.subscribe",
+        "provider.auth.start",
+        "provider.auth.respond",
+        "provider.auth.complete",
+        "provider.auth.cancel",
+      ]);
+
+      // A new start while vm-b runs a turn on Antigravity moves the flow to vm-a, and the panel's stream follows it
+      await setRow(client, vmB, "thread-b", onAntigravity("running"));
+      client.request("start-2", "provider.auth.start", { instanceId: "antigravity" });
+      const start2 = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "start-2");
+      expect((start2.exit as { value?: { vmTag?: string } }).value?.vmTag).toBe("vm-a");
+      await client.waitForFrame(
+        (f) => f._tag === "Chunk" && f.requestId === "auth" && (f.values as Array<{ fromVm?: string }>)[0]?.fromVm === "vm-a",
+      );
+      expect(authTags(vmA)).toEqual(["provider.auth.subscribe", "provider.auth.start"]);
+    });
+
+    test("with every VM running a turn on the provider, sign-in fails with a typed ProviderSetupError and reaches no VM", async () => {
+      const { vmA, vmB, client } = await twoChatVms("t3-sentinel-prov-busy-");
+      await setRow(client, vmA, "thread-a", onAntigravity("running"));
+      await setRow(client, vmB, "thread-b", onAntigravity("waiting"));
+
+      // Reading setup state never interrupts anything: the panel's stream still opens
+      client.request("auth", "provider.auth.subscribe", { instanceId: "antigravity" });
+      await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "auth");
+
+      client.request("start", "provider.auth.start", { instanceId: "antigravity" });
+      client.request("install", "provider.install.start", { instanceId: "antigravity" });
+      for (const [id, operation] of [
+        ["start", "auth.start"],
+        ["install", "install.start"],
+      ] as const) {
+        const frame = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === id);
+        const cause = (frame.exit as { _tag: string; cause: Array<{ _tag: string; error: Record<string, unknown> }> }).cause;
+        expect((frame.exit as { _tag: string })._tag).toBe("Failure");
+        expect(cause).toHaveLength(1);
+        expect(cause[0]._tag).toBe("Fail");
+        expect(cause[0].error).toMatchObject({ _tag: "ProviderSetupError", instanceId: "antigravity", operation });
+        expect(String(cause[0].error.detail)).toContain("would interrupt a running chat");
+        expect(String(cause[0].error.detail)).toContain("from a new chat");
+        if (t3Contracts) expect(t3Contracts.decodeExit(`provider.${operation}`, frame.exit)).toEqual({ ok: true });
+      }
+      const commands = [...vmA.seenMethods, ...vmB.seenMethods].filter((m) => m.tag === "provider.auth.start" || m.tag === "provider.install.start");
+      expect(commands).toEqual([]);
+    });
+  });
+
   describe("server.updateSettings (patch, providerInstanceMutation, overlay)", () => {
     const SECRET = "sk-test-do-not-log-4242";
     const baseSettings = () => ({
@@ -3398,7 +3672,14 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       expect(boat.execScripts.some((sc) => sc.includes(`mkdir -p ${AG_STAGED.slice(0, AG_STAGED.lastIndexOf("/"))}`))).toBe(true);
       expect(order.indexOf(`upload:${AG_STAGED}`)).toBeLessThan(order.indexOf("provision"));
       await waitFor(() => vm.seenMethods.some((m) => m.tag === "server.refreshProviders"));
-      expect(vm.seenMethods.find((m) => m.tag === "server.refreshProviders")?.payload).toEqual({ instanceId: "antigravity" });
+      // `refreshModels` opens a session, the only check that confirms the injected sign-in
+      expect(vm.seenMethods.find((m) => m.tag === "server.refreshProviders")?.payload).toEqual({
+        instanceId: "antigravity",
+        refreshModels: true,
+      });
+      if (t3Contracts) {
+        expect(t3Contracts.decodePayload("server.refreshProviders", { instanceId: "antigravity", refreshModels: true })).toEqual({ ok: true });
+      }
       // The VM already holds the stored copy: no read-back on its first authenticated report
       await new Promise((r) => setTimeout(r, 150));
       await handle.lifecycle.providerSessions.settle();
@@ -3422,6 +3703,81 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       await launchThreadOnHub(client, "thread-ag-inject-fail");
       expect(handle.state.listHubSandboxes()[0]?.phase).toBe("running");
       expect(boat.execScripts.some((sc) => sc.includes("rm -rf ~/.t3-sentinel/provider-sessions"))).toBe(true);
+    });
+
+    test("a re-sign-in on a VM that was already signed in stores the new session at once, also after a sign-out", async () => {
+      const vm = startFakeVmT3Server("vm-ag-resign", {
+        configSnapshot: { providers: agProviders("authenticated"), settings: {} },
+        signIn: true,
+      });
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat, dir } = await startHubWithVm(vm, "t3-sentinel-ag-resign-", {
+        persistProviderSessions: ["antigravity"],
+      });
+      const first = agToken("ya29.FIRST-SECRET", "2026-11-25T10:00:00Z");
+      const vmToken = { current: first as string | null };
+      const reads = serveVmToken(boat, vmToken);
+      const client = await connectHubClient(handle, cfg);
+      await launchThreadOnHub(client, "thread-ag-resign");
+      await waitFor(() => existsSync(storedPath(dir)) && readFileSync(storedPath(dir), "utf8") === first);
+      await handle.lifecycle.providerSessions.settle();
+      expect(reads.count).toBe(1);
+
+      /** Signs in through the Settings panel's flow; the VM keeps reporting `authenticated` throughout. */
+      const signIn = async (n: number) => {
+        client.request(`auth-${n}`, "provider.auth.subscribe", { instanceId: "antigravity" });
+        await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === `auth-${n}`);
+        client.request(`start-${n}`, "provider.auth.start", { instanceId: "antigravity" });
+        const start = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === `start-${n}`);
+        const flowId = (start.exit as { value: { flowId: string } }).value.flowId;
+        client.request(`complete-${n}`, "provider.auth.complete", { instanceId: "antigravity", flowId, callbackUrl: "http://localhost/cb" });
+        const complete = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === `complete-${n}`);
+        expect((complete.exit as { value: { phase: string } }).value.phase).toBe("succeeded");
+        if (t3Contracts) expect(t3Contracts.decodeExit("provider.auth.complete", complete.exit)).toEqual({ ok: true });
+        // The succeeded state also arrives on the panel's stream: still one capture per flow
+        await client.waitForFrame(
+          (f) => f._tag === "Chunk" && f.requestId === `auth-${n}` && (f.values as Array<{ phase?: string }>)[0]?.phase === "succeeded",
+        );
+      };
+
+      // The same VM, signed in again (another account, a fresh token): stored without waiting for a teardown
+      const second = agToken("ya29.SECOND-SECRET", "2026-11-26T10:00:00Z");
+      vmToken.current = second;
+      await signIn(1);
+      await waitFor(() => readFileSync(storedPath(dir), "utf8") === second);
+      await handle.lifecycle.providerSessions.settle();
+      expect(reads.count).toBe(2);
+
+      // A Hub sign-out forgets the stored copy and stops this VM's old token from coming back...
+      client.request("logout", "provider.auth.logout", { instanceId: "antigravity" });
+      await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "logout");
+      expect(existsSync(storedPath(dir))).toBe(false);
+      // A panel visit replays the VM's last state: a `succeeded` flow this Hub never saw (it restarted
+      // since). Not a new sign-in: nothing stored, the sign-out holds
+      vm.setAuthState({
+        instanceId: "antigravity",
+        phase: "succeeded",
+        flowId: "flow-before-hub-restart",
+        authorizationUrl: null,
+        expiresAt: null,
+        message: null,
+      });
+      client.request("replay", "provider.auth.subscribe", { instanceId: "antigravity" });
+      const replay = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "replay");
+      expect((replay.values as Array<{ phase?: string }>)[0]?.phase).toBe("succeeded");
+      await new Promise((r) => setTimeout(r, 150));
+      await handle.lifecycle.providerSessions.settle();
+      expect(existsSync(storedPath(dir))).toBe(false);
+      expect(reads.count).toBe(2);
+      // ...but signing in on it again is a new sign-in, and it is stored
+      const third = agToken("ya29.THIRD-SECRET", "2026-11-27T10:00:00Z");
+      vmToken.current = third;
+      await signIn(2);
+      await waitFor(() => existsSync(storedPath(dir)) && readFileSync(storedPath(dir), "utf8") === third);
+      await handle.lifecycle.providerSessions.settle();
+      expect(reads.count).toBe(3);
+      expect(statSync(storedPath(dir)).mode & 0o777).toBe(0o600);
+      expect(readFileSync(join(dir, "state.json"), "utf8")).not.toContain("SECRET");
     });
 
     test("a failed read is retried; a hung teardown pull never delays the destroy past its bound", async () => {
@@ -6252,6 +6608,54 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       await decode("orchestration", "shellSnapshot", await fetch(`${base}/api/orchestration/shell`, { headers: auth }));
       expect(failures).toEqual([]);
     });
+  });
+});
+
+describe("provider status merge and setup routing (hub-providers)", () => {
+  const models = [{ slug: "m", name: "M", isCustom: false, capabilities: null }];
+  const ag = (patch: Record<string, unknown>) => ({ instanceId: "antigravity", enabled: true, installed: true, ...patch });
+  const confirmed = ag({ status: "ready", auth: { status: "authenticated" }, models });
+  const unchecked = ag({ status: "warning", auth: { status: "unknown" }, models: [] });
+  const live = () => true;
+
+  test("only a less informed entry is replaced, and only by another live VM's confirmed entry", () => {
+    const book = new ProviderStatusBook();
+    book.record("vm-1", [confirmed]);
+    expect(book.merge("vm-2", [unchecked], live)).toEqual([confirmed]);
+    // Real changes pass through: signed out, uninstalled, disabled
+    for (const real of [ag({ auth: { status: "unauthenticated" }, models: [] }), ag({ installed: false }), ag({ enabled: false })]) {
+      expect(book.merge("vm-2", [real], live)).toEqual([real]);
+    }
+    // An entry that is itself confirmed (ready with models, auth not checked) is kept as reported
+    const readyUnknown = ag({ status: "ready", auth: { status: "unknown" }, models });
+    expect(book.merge("vm-2", [readyUnknown], live)).toEqual([readyUnknown]);
+    // A VM never vouches against itself, nor once it is gone or signed out
+    const own = new ProviderStatusBook();
+    own.record("vm-1", [confirmed]);
+    expect(own.merge("vm-1", [unchecked], live)).toEqual([unchecked]);
+    own.record("vm-1", [confirmed]);
+    expect(own.merge("vm-2", [unchecked], (id) => id !== "vm-1")).toEqual([unchecked]);
+    own.forgetInstance("antigravity");
+    expect(own.merge("vm-2", [unchecked], live)).toEqual([unchecked]);
+  });
+
+  test("setup routing: safe VM first, idle VM preferred, sticky flow, busy only for commands", () => {
+    const router = new ProviderSetupRouter();
+    const loads: Record<string, { onInstance: boolean; any: boolean }> = {
+      a: { onInstance: true, any: true },
+      b: { onInstance: false, any: true },
+      c: { onInstance: false, any: false },
+    };
+    const load = (id: string) => loads[id];
+    expect(router.route("c1", "antigravity", "provider.auth.start", ["a", "b", "c"], load, false)).toEqual({ kind: "vm", sandboxId: "c" });
+    loads.c = { onInstance: true, any: true };
+    // The flow continues where it started; a new start moves off a busy VM
+    expect(router.route("c1", "antigravity", "provider.auth.complete", ["a", "b", "c"], load, false)).toEqual({ kind: "vm", sandboxId: "c" });
+    expect(router.route("c1", "antigravity", "provider.auth.start", ["a", "b", "c"], load, false)).toEqual({ kind: "vm", sandboxId: "b" });
+    loads.b = { onInstance: true, any: true };
+    expect(router.route("c2", "antigravity", "provider.auth.start", ["a", "b", "c"], load, false)).toEqual({ kind: "busy" });
+    expect(router.route("c2", "antigravity", "provider.auth.subscribe", ["a", "b", "c"], load, true)).toEqual({ kind: "vm", sandboxId: "a" });
+    expect(router.route("c2", "antigravity", "provider.auth.start", [], load, false)).toEqual({ kind: "none" });
   });
 });
 
