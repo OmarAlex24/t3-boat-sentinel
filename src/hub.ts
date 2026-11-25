@@ -3607,10 +3607,13 @@ export class HubServer {
       phaseMs[phase] = now - phaseStartedAt;
       phaseStartedAt = now;
     };
+    /** Phases that overlap the sequential ones above (Klav runs during upload and sync). */
+    const parallelMs: Record<string, number> = {};
     const timings = () =>
-      `${Object.entries(phaseMs)
-        .map(([k, v]) => `${k}=${v}ms`)
-        .join(" ")} total=${Date.now() - spawnStartedAt}ms`;
+      `${[
+        ...Object.entries(phaseMs).map(([k, v]) => `${k}=${v}ms`),
+        ...Object.entries(parallelMs).map(([k, v]) => `${k}=${v}ms(parallel)`),
+      ].join(" ")} total=${Date.now() - spawnStartedAt}ms`;
 
     const supportsSnapshots = hasCapability(this.boat, "snapshots") && typeof this.boat.listSnapshots === "function";
     let snapshotToUse: string | undefined = supportsSnapshots ? project.snapshot : undefined;
@@ -3648,6 +3651,7 @@ export class HubServer {
 
     let sandboxId: string | null = null;
     let klavAgentName: string | null = null;
+    let klavTask: Promise<unknown> | null = null;
     const setupStartedAt = new Date().toISOString();
     let setupSeq = 0;
     const emitStage = (
@@ -3764,9 +3768,15 @@ export class HubServer {
       if (effectiveProject.klav && this.klav) {
         emitStage("checkout", `VM ${sandboxId} created — attaching zero-trust Klav proxy...`, 40);
         notifyProgress("booting", `VM ${sandboxId} created — attaching zero-trust Klav proxy...`);
-        const prov = await this.klav.provisionForSandbox(this.boat, sandboxId, effectiveProject.klav);
-        klavAgentName = prov.agentName;
-        lap("klav");
+        // Runs alongside the file upload and repo sync; provisioning waits for it before T3 starts
+        const klavStartedAt = Date.now();
+        klavTask = this.klav.provisionForSandbox(this.boat, sandboxId, effectiveProject.klav).then((prov) => {
+          klavAgentName = prov.agentName;
+          parallelMs.klav = Date.now() - klavStartedAt;
+          return prov;
+        });
+        // Its rejection surfaces through provisioning (or the failure path below), never unhandled
+        klavTask.catch(() => {});
       } else {
         emitStage("checkout", `VM ${sandboxId} created — preparing workspace...`, 40);
         notifyProgress("booting", `VM ${sandboxId} created — preparing workspace...`);
@@ -3799,14 +3809,26 @@ export class HubServer {
         installProviderRuntimes: !supportsSnapshots,
         // A fallback clone is already fresh; a project snapshot is as old as its bake
         syncRepoToRemote: !fallbackCloning && project.syncToRemoteOnStart !== false,
+        ...(klavTask ? { beforeBoot: klavTask } : {}),
       });
 
       lap("provision");
-      if (provisioned.repoSyncMs !== undefined) {
-        // Sync to origin runs inside provisioning, before T3 starts: report it as its own phase
-        phaseMs.provision -= provisioned.repoSyncMs;
-        phaseMs.sync = provisioned.repoSyncMs;
+      // Upload, sync and the Klav wait run inside provisioning: report each as its own phase, in boot order,
+      // and keep `provision` for the rest (.env, bootCmd, provision-base.sh). `klav` overlaps upload and
+      // sync, so it is logged apart as a parallel phase
+      let provisionRestMs = phaseMs.provision ?? 0;
+      delete phaseMs.provision;
+      const inner: Array<[string, number | undefined]> = [
+        ["upload", provisioned.uploadMs],
+        ["sync", provisioned.repoSyncMs],
+        ["klav-wait", provisioned.klavWaitMs || undefined],
+      ];
+      for (const [phase, ms] of inner) {
+        if (ms === undefined) continue;
+        phaseMs[phase] = ms;
+        provisionRestMs -= ms;
       }
+      phaseMs.provision = provisionRestMs;
       if (!provisioned.upstreamToken) {
         throw new Error(`T3 server inside ${sandboxId} returned no upstreamToken`);
       }
@@ -3876,6 +3898,8 @@ export class HubServer {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`[hub] VM boot for thread=${threadId} failed after ${timings()}`);
       emitStage("failed", `Boat VM boot failed`, 100, msg);
+      // Klav may still be running (the upload failed first): let it settle so the agent it made is revoked
+      if (klavTask) await klavTask.catch(() => {});
       if (sandboxId) {
         this.state.removeHubSandbox(sandboxId);
         this.state.queueDelete(sandboxId, "hub-failed-spawn", klavAgentName);

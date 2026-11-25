@@ -51,6 +51,9 @@ const t3Contracts = await loadT3Contracts();
 if (t3Contracts) console.log(`[contracts] decoding with the T3 app's schemas, version ${t3Contracts.version}`);
 else console.log("[contracts] no T3 app bundle found: contract decodes skipped");
 
+/** The exec that runs provisioning (the bundle's place script only names the file). */
+const RUN_PROVISION = "bash ~/.t3-sentinel/provision-base.sh";
+
 class MockBoat implements BoatClient {
   sandboxes = new Map<string, BoatSandbox>();
   snapshots = new Set<string>();
@@ -135,6 +138,12 @@ class MockBoat implements BoatClient {
     this.execScripts.push(script);
     const hooked = this.execHook?.(id, script);
     if (hooked) return hooked;
+    if (script.includes("t3s_place()")) {
+      if (!this.vmHome) return { exitCode: 0, stdout: "", stderr: "" };
+      // The real place script, run by bash against the fake VM's home
+      const proc = Bun.spawnSync(["bash", "-c", script], { env: { ...process.env, HOME: this.vmHome } });
+      return { exitCode: proc.exitCode, stdout: proc.stdout.toString(), stderr: proc.stderr.toString() };
+    }
     if (script.includes(REPO_SYNC_MARKER)) {
       // A VM whose workdir is not a checkout, like most fixtures here
       return { exitCode: 0, stdout: JSON.stringify({ status: "skipped", reason: "not-a-repository" }), stderr: "" };
@@ -169,7 +178,7 @@ class MockBoat implements BoatClient {
         stderr: "",
       };
     }
-    if (script.includes("provision-base.sh")) {
+    if (script.includes(RUN_PROVISION)) {
       return {
         exitCode: 0,
         stdout: JSON.stringify({
@@ -208,7 +217,37 @@ class MockBoat implements BoatClient {
     return r.stdout;
   }
 
-  async upload(): Promise<void> {}
+  /** Every upload with the bytes sent, read at upload time (local staging is removed right after). */
+  uploads: Array<{ id: string; local: string; remote: string; bytes: Uint8Array }> = [];
+  /** When set, uploads land under this dir as the VM's home and the bundle's place scripts run there in bash. */
+  vmHome: string | null = null;
+  /** Artificial latency of each upload (a `boat scp` takes ~4s in production). */
+  uploadDelayMs = 0;
+  /** When set, `upload` fails with it. */
+  uploadError: Error | null = null;
+
+  /** A remote path inside the fake VM (`~/` and relative paths resolve against `vmHome`). */
+  vmPath(remote: string): string {
+    const home = this.vmHome!;
+    if (remote.startsWith("~/")) return join(home, remote.slice(2));
+    if (remote.startsWith("/")) {
+      if (!remote.startsWith(home)) throw new Error(`fake VM path outside its home: ${remote}`);
+      return remote;
+    }
+    return join(home, remote);
+  }
+
+  async upload(id: string, localPath: string, remotePath: string): Promise<void> {
+    const bytes = existsSync(localPath) ? new Uint8Array(readFileSync(localPath)) : new Uint8Array();
+    this.uploads.push({ id, local: localPath, remote: remotePath, bytes });
+    if (this.uploadDelayMs) await Bun.sleep(this.uploadDelayMs);
+    if (this.uploadError) throw this.uploadError;
+    if (this.vmHome) {
+      const dest = this.vmPath(remotePath);
+      mkdirSync(dirname(dest), { recursive: true });
+      writeFileSync(dest, bytes, { mode: 0o600 });
+    }
+  }
 
   downloads: Array<{ id: string; remotePath: string; localPath: string }> = [];
   async download(id: string, remotePath: string, localPath: string): Promise<void> {
@@ -219,6 +258,13 @@ class MockBoat implements BoatClient {
 
 const tempDirs: string[] = [];
 const cleanups: Array<() => void> = [];
+
+/** A fresh dir standing in for a VM's home (see `MockBoat.vmHome`). */
+function fakeVmHome(): string {
+  const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-vmhome-"));
+  tempDirs.push(dir);
+  return dir;
+}
 
 /** The chat a request a fake VM received names, top-level or in `resource`. */
 function extractThreadIdForTest(payload: unknown): string | undefined {
@@ -426,7 +472,7 @@ describe("LifecycleManager hardening", () => {
       const res = await lifecycle.spawn("my-app", { slot: "boat-1" });
       expect(res.slot.phase).toBe("running");
       const provision = execs.find((e) => e.script.includes("bash ~/.t3-sentinel/provision-base.sh"))!;
-      return { uploads, provision };
+      return { uploads, provision, execs };
     };
 
     // Celesto-like: no snapshots, no download
@@ -438,7 +484,9 @@ describe("LifecycleManager hardening", () => {
 
     // Boat-like: snapshots + download keep today's behavior
     const boatLike = await run({ snapshots: true, download: true });
-    expect(boatLike.uploads.some((r) => r.includes("provider-sessions"))).toBe(true);
+    // One archive upload; the place script puts the stored sign-in under the staging dir
+    expect(boatLike.uploads).toHaveLength(1);
+    expect(boatLike.execs.some((e) => e.script.includes("t3s_place()") && e.script.includes("provider-sessions"))).toBe(true);
     expect(boatLike.provision.script).not.toContain("T3_INSTALL_PROVIDERS");
     expect(boatLike.provision.script).not.toContain("T3_PREPARE_ACP_AGENTS");
     expect(boatLike.provision.timeout).toBe(300);
@@ -699,7 +747,7 @@ describe("LifecycleManager hardening", () => {
     const sandboxId = res.slot.sandboxId!;
 
     // Verify SLOT_ENV_ID was passed and watchdogSecret was NOT on the CLI
-    const provExec = boat.execScripts.find((s) => s.includes("provision-base.sh"))!;
+    const provExec = boat.execScripts.find((s) => s.includes(RUN_PROVISION))!;
     expect(provExec).toContain(`SLOT_ENV_ID='${stableEnvId}'`);
     expect(provExec).not.toContain("WATCHDOG_SECRET=");
     expect(res.slot.watchdogSecret).toBeTruthy();
@@ -1509,6 +1557,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       beforeStart?: (dir: string) => void;
       patchConfig?: (cfg: SentinelConfig) => SentinelConfig;
       maxSandboxes?: number;
+      klav?: KlavClient;
     } = {},
   ) {
     const dir = mkdtempSync(join(tmpdir(), dirPrefix));
@@ -1526,7 +1575,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     };
     const cfg = opts.patchConfig ? opts.patchConfig(unpatched) : unpatched;
     opts.beforeStart?.(dir);
-    const handle = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+    const handle = createSentinelServer(cfg, boat, { startBackgroundLoops: false, ...(opts.klav ? { klav: opts.klav } : {}) });
     handle.lifecycle.providerSessions.debounceMs = 10;
     cleanups.push(() => handle.stop());
     return { cfg, handle, boat, dir };
@@ -1940,7 +1989,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       // Sync-to-remote still runs in the background boot, before T3 starts, and is its own timed phase
       expect(boat.execScripts.some((s) => s.includes(REPO_SYNC_MARKER))).toBe(true);
       const ready = logs.find((l) => l.includes("ready for thread=thread-sc"));
-      expect(ready).toMatch(/create=\d+ms .*provision=\d+ms sync=\d+ms .*total=\d+ms/);
+      expect(ready).toMatch(/create=\d+ms upload=\d+ms sync=\d+ms provision=\d+ms .*total=\d+ms/);
     });
 
     test("a chat-scoped RPC for a sleeping chat wakes its VM; a chat whose start failed gets the gone error", async () => {
@@ -3652,25 +3701,19 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
         },
       });
       const reads = serveVmToken(boat, { current: stored });
-      const order: string[] = [];
-      const uploads: Array<{ local: string; remote: string }> = [];
-      boat.upload = async (...args: unknown[]) => {
-        uploads.push({ local: String(args[1]), remote: String(args[2]) });
-        order.push(`upload:${String(args[2])}`);
-      };
-      const originalExec = boat.exec;
-      boat.exec = async (id: string, script: string) => {
-        if (script.includes("provision-base.sh")) order.push("provision");
-        return originalExec(id, script);
-      };
+      boat.vmHome = fakeVmHome();
 
       const client = await connectHubClient(handle, cfg);
       await launchThreadOnHub(client, "thread-ag-inject");
 
-      const credUpload = uploads.find((u) => u.remote === AG_STAGED);
-      expect(credUpload?.local).toBe(storedPath(dir));
-      expect(boat.execScripts.some((sc) => sc.includes(`mkdir -p ${AG_STAGED.slice(0, AG_STAGED.lastIndexOf("/"))}`))).toBe(true);
-      expect(order.indexOf(`upload:${AG_STAGED}`)).toBeLessThan(order.indexOf("provision"));
+      // Placed by the bundle into the VM's staging dir, 0600, before provision-base.sh installs it
+      const landed = boat.vmPath(AG_STAGED);
+      expect(readFileSync(landed, "utf8")).toBe(stored);
+      expect(statSync(landed).mode & 0o777).toBe(0o600);
+      const placeAt = boat.execScripts.findIndex((sc) => sc.includes("t3s_place()"));
+      expect(placeAt).toBeGreaterThanOrEqual(0);
+      expect(placeAt).toBeLessThan(boat.execScripts.findIndex((sc) => sc.includes(RUN_PROVISION)));
+      expect(boat.uploads).toHaveLength(1);
       await waitFor(() => vm.seenMethods.some((m) => m.tag === "server.refreshProviders"));
       // `refreshModels` opens a session, the only check that confirms the injected sign-in
       expect(vm.seenMethods.find((m) => m.tag === "server.refreshProviders")?.payload).toEqual({
@@ -3696,13 +3739,24 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
           writeFileSync(storedPath(d), agToken("ya29.X", "2026-12-01T00:00:00Z"), { mode: 0o600 });
         },
       });
-      boat.upload = async (...args: unknown[]) => {
-        if (String(args[2]).includes("provider-sessions")) throw new Error("scp failed");
+      // The staging dir cannot be created in the VM (a file is in its way): the sign-in cannot be placed
+      boat.vmHome = fakeVmHome();
+      mkdirSync(join(boat.vmHome, ".t3-sentinel"), { recursive: true, mode: 0o700 });
+      writeFileSync(join(boat.vmHome, ".t3-sentinel", "provider-sessions"), "in the way");
+      const marked: string[][] = [];
+      const sessions = handle.lifecycle.providerSessions;
+      const markInjected = sessions.markInjected.bind(sessions);
+      sessions.markInjected = (id, ids) => {
+        marked.push([...ids]);
+        markInjected(id, ids);
       };
       const client = await connectHubClient(handle, cfg);
       await launchThreadOnHub(client, "thread-ag-inject-fail");
       expect(handle.state.listHubSandboxes()[0]?.phase).toBe("running");
-      expect(boat.execScripts.some((sc) => sc.includes("rm -rf ~/.t3-sentinel/provider-sessions"))).toBe(true);
+      // Nothing staged is left behind, the rest of the bundle landed, and the VM boots signed out
+      expect(existsSync(join(boat.vmHome, ".t3-sentinel", "provider-sessions"))).toBe(false);
+      expect(existsSync(join(boat.vmHome, ".t3-sentinel", "boot-secrets.json"))).toBe(true);
+      expect(marked).toEqual([[]]);
     });
 
     test("a re-sign-in on a VM that was already signed in stores the new session at once, also after a sign-out", async () => {
@@ -4162,13 +4216,9 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       expect(readFileSync(join(dir, "state.json"), "utf8")).not.toContain("SECRET");
 
       // A fresh VM gets both files staged before provision-base.sh runs
-      const order: string[] = [];
-      boat.upload = async (...args: unknown[]) => void order.push(`upload:${String(args[2])}`);
-      const execWithOrder = boat.exec;
-      boat.exec = async (id: string, script: string) => {
-        if (script.includes("provision-base.sh")) order.push("provision");
-        return execWithOrder(id, script);
-      };
+      boat.vmHome = fakeVmHome();
+      boat.uploads.length = 0;
+      const execsBefore = boat.execScripts.length;
       const res = await handle.lifecycle.provisionStandaloneVm({
         sandboxId: "sb-next",
         watchdogSlotKey: "slot",
@@ -4182,10 +4232,11 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
         injectProviderSessions: true,
       });
       expect(res.injectedProviderSessions).toEqual([DEVIN_ID]);
-      const credsUpload = order.indexOf(`upload:~/.t3-sentinel/provider-sessions/${CREDS_VM}`);
-      expect(credsUpload).toBeGreaterThanOrEqual(0);
-      expect(order.indexOf(`upload:~/.t3-sentinel/provider-sessions/${FLAG_VM}`)).toBeGreaterThanOrEqual(0);
-      expect(credsUpload).toBeLessThan(order.indexOf("provision"));
+      expect(boat.uploads).toHaveLength(1);
+      expect(readFileSync(boat.vmPath(`~/.t3-sentinel/provider-sessions/${CREDS_VM}`), "utf8")).toBe(devinCreds("cog_HUB-SECRET"));
+      expect(existsSync(boat.vmPath(`~/.t3-sentinel/provider-sessions/${FLAG_VM}`))).toBe(true);
+      const newExecs = boat.execScripts.slice(execsBefore);
+      expect(newExecs.findIndex((sc) => sc.includes("t3s_place()"))).toBeLessThan(newExecs.findIndex((sc) => sc.includes(RUN_PROVISION)));
 
       // Signing out of Devin in T3 (ACP registry logout) deletes the stored copy
       client.request("logout", "server.logoutAcpRegistry", { instanceId: DEVIN_ID });
@@ -4256,6 +4307,230 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     });
   });
 
+  describe("a new chat VM gets its files in one upload while Klav sets up in parallel", () => {
+    const CANARY = {
+      signIn: "ya29.CANARY-SIGNIN-7f3a",
+      injected: "ghp_CANARY-INJECT-91bd",
+      env: "API_KEY=CANARY-ENV-c04e",
+      settings: '{"canary":"CANARY-T3SETTINGS-5e21"}',
+    };
+
+    /** A Klav that takes `delayMs` to set up, with the times it ran. */
+    class SlowKlav implements KlavClient {
+      started = 0;
+      finished = 0;
+      revoked: string[] = [];
+      constructor(private readonly delayMs: number) {}
+      async provisionForSandbox(_b: unknown, sandboxId: string) {
+        this.started = Date.now();
+        await Bun.sleep(this.delayMs);
+        this.finished = Date.now();
+        return { agentName: `ksb-${sandboxId}`, project: "dev" };
+      }
+      async revokeForSandbox(handle: string) {
+        this.revoked.push(handle);
+      }
+    }
+
+    /** A Hub whose project uses every kind of provisioning file, each carrying a recognizable fake secret. */
+    async function startFullHub(prefix: string, opts: { klav?: KlavClient } = {}) {
+      const vm = startFakeVmT3Server(prefix);
+      cleanups.push(() => vm.server.stop(true));
+      const vmHome = fakeVmHome();
+      const local = mkdtempSync(join(tmpdir(), "t3-sentinel-bundle-src-"));
+      tempDirs.push(local);
+      const ghHosts = join(local, "hosts.yml");
+      writeFileSync(ghHosts, CANARY.injected, { mode: 0o600 });
+      const envFile = join(local, "app.env");
+      writeFileSync(envFile, CANARY.env, { mode: 0o600 });
+      const settingsFile = join(local, "t3-settings.json");
+      writeFileSync(settingsFile, CANARY.settings, { mode: 0o600 });
+      const envTarget = join(vmHome, "my-app", ".env");
+      const started = await startHubWithVm(vm, `t3-sentinel-${prefix}-`, {
+        persistProviderSessions: ["antigravity"],
+        ...(opts.klav ? { klav: opts.klav } : {}),
+        beforeStart: (d) => {
+          mkdirSync(join(d, "credentials", "antigravity"), { recursive: true, mode: 0o700 });
+          writeFileSync(join(d, "credentials", "antigravity", "antigravity-oauth-token"), CANARY.signIn, { mode: 0o600 });
+        },
+        patchConfig: (c) => ({
+          ...c,
+          llmProxy: { host: "boat-llm.boat.example.com", upstreamUrl: "http://127.0.0.1:1", upstreamApiKey: "k" },
+          t3: { ...c.t3, settingsFile },
+          boat: { ...c.boat, injectFiles: [{ from: ghHosts, to: "~/.config/gh/hosts.yml", mode: "640" }] },
+          ...(opts.klav
+            ? { klav: { mode: "proxy" as const, proxyPort: 18790, defaultTtl: "8h", defaultAllow: [], defaultDeny: [], defaultExpires: "8h" } }
+            : {}),
+          projects: {
+            ...c.projects,
+            "my-app": { ...c.projects["my-app"]!, envFile, envTarget, ...(opts.klav ? { klav: { profiles: ["dev"] } } : {}) },
+          },
+        }),
+      });
+      started.boat.vmHome = vmHome;
+      return { ...started, vm, vmHome, envTarget };
+    }
+
+    /** Every file under `dir`, relative. */
+    const filesUnder = (dir: string): string[] =>
+      readdirSync(dir, { recursive: true, withFileTypes: true })
+        .filter((e) => e.isFile())
+        .map((e) => join(e.parentPath, e.name).slice(dir.length + 1))
+        .sort();
+
+    test("one upload carries every file; no exec script ever holds a secret", async () => {
+      const { cfg, handle, boat } = await startFullHub("bundle-one");
+      const client = await connectHubClient(handle, cfg);
+      await launchThreadOnHub(client, "thread-bundle-one");
+
+      // Before: a separate scp per file (scripts, sign-in, boot secrets, Claude settings, T3 settings, injected file, .env)
+      expect(boat.uploads).toHaveLength(1);
+      const record = handle.state.listHubSandboxes()[0]!;
+      const secrets = [CANARY.signIn, CANARY.injected, CANARY.env, CANARY.settings, record.watchdogSecret, record.llmToken!];
+      const archive = Buffer.from(boat.uploads[0]!.bytes).toString("latin1");
+      for (const secret of secrets) {
+        // The secret did travel, as a file transfer…
+        expect(archive).toContain(secret);
+        // …and never inside a command
+        for (const script of boat.execScripts) expect(script).not.toContain(secret);
+      }
+    });
+
+    test("every file lands at its path with its mode; the .env after the repo sync; no staging is left", async () => {
+      const { cfg, handle, boat, vmHome, envTarget } = await startFullHub("bundle-paths");
+      boat.execHook = (_id, script) =>
+        script.includes(REPO_SYNC_MARKER)
+          ? Promise.resolve({
+              exitCode: 0,
+              stdout: JSON.stringify({ status: "synced", reason: "", from: "a".repeat(40), to: "b".repeat(40), branch: "main", discarded: 0 }),
+              stderr: "",
+            })
+          : undefined;
+      // A file the snapshot already holds keeps its mode on overwrite, like an scp; an injected file's mode is forced
+      mkdirSync(join(vmHome, ".config", "gh"), { recursive: true });
+      writeFileSync(join(vmHome, ".config", "gh", "hosts.yml"), "old", { mode: 0o644 });
+      const client = await connectHubClient(handle, cfg);
+      await launchThreadOnHub(client, "thread-bundle-paths");
+
+      const mode = (p: string) => statSync(p).mode & 0o777;
+      const at = (p: string) => join(vmHome, p);
+      const record = handle.state.listHubSandboxes()[0]!;
+      const scriptMode = (name: string) => statSync(join(import.meta.dir, "..", "scripts", name)).mode & 0o777;
+
+      expect(readFileSync(at(".t3-sentinel/provision-base.sh"), "utf8")).toBe(
+        readFileSync(join(import.meta.dir, "..", "scripts", "provision-base.sh"), "utf8"),
+      );
+      expect(mode(at(".t3-sentinel/provision-base.sh"))).toBe(scriptMode("provision-base.sh"));
+      expect(mode(at(".t3-sentinel/watchdog.mjs"))).toBe(scriptMode("watchdog.mjs"));
+      expect(mode(at(".t3-sentinel"))).toBe(0o700);
+
+      const bootSecrets = JSON.parse(readFileSync(at(".t3-sentinel/boot-secrets.json"), "utf8"));
+      expect(bootSecrets).toMatchObject({ sandboxId: "sb-1", watchdogSecret: record.watchdogSecret });
+      expect(mode(at(".t3-sentinel/boot-secrets.json"))).toBe(0o600);
+
+      const claude = JSON.parse(readFileSync(at(".claude/settings.json"), "utf8"));
+      expect(claude.env.ANTHROPIC_AUTH_TOKEN).toBe(record.llmToken);
+      expect(mode(at(".claude/settings.json"))).toBe(0o600);
+
+      expect(readFileSync(at(".t3-sentinel/t3-settings.json"), "utf8")).toBe(CANARY.settings);
+      expect(mode(at(".t3-sentinel/t3-settings.json"))).toBe(0o600);
+
+      expect(readFileSync(at(".config/gh/hosts.yml"), "utf8")).toBe(CANARY.injected);
+      expect(mode(at(".config/gh/hosts.yml"))).toBe(0o640);
+
+      const staged = filesUnder(at(".t3-sentinel/provider-sessions"));
+      expect(staged).toHaveLength(1);
+      expect(staged[0]).toEndWith("antigravity-oauth-token");
+      expect(readFileSync(at(`.t3-sentinel/provider-sessions/${staged[0]}`), "utf8")).toBe(CANARY.signIn);
+      expect(mode(at(`.t3-sentinel/provider-sessions/${staged[0]}`))).toBe(0o600);
+
+      expect(readFileSync(envTarget, "utf8")).toBe(CANARY.env);
+      expect(mode(envTarget)).toBe(0o600);
+      // The .env is placed by its own exec after the sync (which may clean the tree), before bootCmd and T3
+      const syncAt = boat.execScripts.findIndex((sc) => sc.includes(REPO_SYNC_MARKER));
+      const envAt = boat.execScripts.findIndex((sc, i) => i > syncAt && sc.includes("t3s_place()"));
+      expect(syncAt).toBeGreaterThan(boat.execScripts.findIndex((sc) => sc.includes("t3s_place()")));
+      expect(envAt).toBeGreaterThan(syncAt);
+      expect(envAt).toBeLessThan(boat.execScripts.indexOf("git fetch origin"));
+      expect(envAt).toBeLessThan(boat.execScripts.findIndex((sc) => sc.includes(RUN_PROVISION)));
+
+      // Only what provision-base.sh expects stays in the staging dir: no archive, extraction dir or deferred copy
+      expect(readdirSync(at(".t3-sentinel")).sort()).toEqual(
+        ["boot-secrets.json", "provider-sessions", "provision-base.sh", "t3-settings.json", "watchdog.mjs"].sort(),
+      );
+    });
+
+    test("Klav sets up while the files upload: the boot takes less than both in a row, and T3 starts after Klav", async () => {
+      const DELAY = 400;
+      const klav = new SlowKlav(DELAY);
+      const { cfg, handle, boat } = await startFullHub("bundle-klav", { klav });
+      boat.uploadDelayMs = DELAY;
+      let uploadStarted = 0;
+      let uploadFinished = 0;
+      let provisionAt = 0;
+      const upload = boat.upload.bind(boat);
+      boat.upload = async (id: string, l: string, r: string) => {
+        uploadStarted = Date.now();
+        await upload(id, l, r);
+        uploadFinished = Date.now();
+      };
+      boat.execHook = (_id, script) => {
+        if (script.includes(RUN_PROVISION)) provisionAt = Date.now();
+        return undefined;
+      };
+      const logs: string[] = [];
+      const origLog = console.log;
+      console.log = (...args: unknown[]) => {
+        logs.push(args.map(String).join(" "));
+        origLog(...args);
+      };
+      cleanups.push(() => (console.log = origLog));
+      const client = await connectHubClient(handle, cfg);
+      await launchThreadOnHub(client, "thread-bundle-klav");
+
+      // Both ran at the same time…
+      expect(uploadStarted).toBeLessThan(klav.finished);
+      expect(klav.started).toBeLessThan(uploadFinished);
+      // …so getting both done took less than their sum
+      expect(Math.max(klav.finished, uploadFinished) - Math.min(klav.started, uploadStarted)).toBeLessThan(2 * DELAY - 100);
+      // T3 starts only once Klav's environment is in place
+      expect(provisionAt).toBeGreaterThanOrEqual(klav.finished);
+      expect(handle.state.listHubSandboxes()[0]?.klavAgentName).toBe("ksb-sb-1");
+      const ready = logs.find((l) => l.includes("ready for thread=thread-bundle-klav"))!;
+      expect(ready).toMatch(/ upload=\d+ms .*klav=\d+ms\(parallel\) total=\d+ms/);
+    });
+
+    test("an upload that fails while Klav is still setting up revokes the Klav agent and queues the VM for deletion", async () => {
+      const klav = new SlowKlav(300);
+      const { cfg, handle, boat } = await startFullHub("bundle-fail", { klav });
+      let uploadFailedAt = 0;
+      boat.uploadError = new Error("scp: connection reset");
+      const upload = boat.upload.bind(boat);
+      boat.upload = async (id: string, l: string, r: string) => {
+        try {
+          await upload(id, l, r);
+        } finally {
+          uploadFailedAt = Date.now();
+        }
+      };
+      const client = await connectHubClient(handle, cfg);
+      const hubProjectId = await subscribeHubShell(client);
+      client.request("launch", "orchestration.launchThread", clientLaunchPayload("thread-bundle-fail", hubProjectId));
+      await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "launch");
+
+      const deadline = Date.now() + 5_000;
+      while (!(klav.revoked.includes("ksb-sb-1") && boat.deleted.includes("sb-1"))) {
+        if (Date.now() > deadline) throw new Error("Klav agent was not revoked / VM not deleted");
+        await Bun.sleep(20);
+      }
+      // The upload failed first, while Klav was still running
+      expect(uploadFailedAt).toBeGreaterThan(0);
+      expect(uploadFailedAt).toBeLessThan(klav.finished);
+      expect(handle.state.listHubSandboxes()).toHaveLength(0);
+      expect(boat.execScripts.some((sc) => sc.includes(RUN_PROVISION))).toBe(false);
+    });
+  });
+
   test("a new chat VM syncs its repo before .env, bootCmd and T3; a resumed VM is never synced", async () => {
     const vm = startFakeVmT3Server("vm-sync");
     cleanups.push(() => vm.server.stop(true));
@@ -4279,7 +4554,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     expect(syncAt).toBeGreaterThanOrEqual(0);
     expect(boat.execScripts.filter((s) => s.includes(REPO_SYNC_MARKER)).length).toBe(1);
     expect(syncAt).toBeLessThan(boat.execScripts.indexOf("git fetch origin")); // the project's bootCmd
-    expect(syncAt).toBeLessThan(boat.execScripts.findIndex((s) => s.includes("provision-base.sh")));
+    expect(syncAt).toBeLessThan(boat.execScripts.findIndex((s) => s.includes(RUN_PROVISION)));
     expect(boat.execScripts[syncAt]).toContain("'/home/user/my-app'");
     // The chat's setup panel says which commit it starts on
     const done = await client.waitForFrame(
@@ -4289,9 +4564,9 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
 
     await handle.hub!.sleepHubSandbox("sb-1");
     expect(handle.state.getHubSandbox("sb-1")?.phase).toBe("sleeping");
-    const provisionsBefore = boat.execScripts.filter((s) => s.includes("provision-base.sh")).length;
+    const provisionsBefore = boat.execScripts.filter((s) => s.includes(RUN_PROVISION)).length;
     await handle.hub!.wakeHubSandbox("sb-1");
-    expect(boat.execScripts.filter((s) => s.includes("provision-base.sh")).length).toBe(provisionsBefore + 1);
+    expect(boat.execScripts.filter((s) => s.includes(RUN_PROVISION)).length).toBe(provisionsBefore + 1);
     expect(boat.execScripts.filter((s) => s.includes(REPO_SYNC_MARKER)).length).toBe(1);
   });
 
@@ -4307,7 +4582,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     await launchThreadOnHub(client, "thread-hang");
     expect(Date.now() - started).toBeLessThan(4_000);
     expect(handle.state.getHubSandbox("sb-1")?.phase).toBe("running");
-    expect(boat.execScripts.some((s) => s.includes("provision-base.sh"))).toBe(true);
+    expect(boat.execScripts.some((s) => s.includes(RUN_PROVISION))).toBe(true);
     const done = await client.waitForFrame(
       (f) => f._tag === "Chunk" && f.requestId === "setup" && JSON.stringify(f.values).includes('"phase":"done"'),
     );
@@ -4971,7 +5246,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       async destroy() {},
       async exec(_id, input) {
         execCommands.push(input.command);
-        if (input.command.includes("provision-base.sh")) {
+        if (input.command.includes(RUN_PROVISION)) {
           return {
             exitCode: 0,
             stdout: JSON.stringify({
@@ -5149,7 +5424,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     const origExec = boat.exec.bind(boat);
     let reaperRanDuringSpawn = false;
     boat.exec = async (id: string, script: string) => {
-      if (!reaperRanDuringSpawn && script.includes("provision-base.sh")) {
+      if (!reaperRanDuringSpawn && script.includes(RUN_PROVISION)) {
         reaperRanDuringSpawn = true;
         await handle.lifecycle.reaperTick();
         expect(boat.deleted).not.toContain(id);
