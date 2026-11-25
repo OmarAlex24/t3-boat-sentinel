@@ -89,6 +89,26 @@ export interface HubSelfUpdateRecord {
   bakes: Record<string, string>;
 }
 
+/**
+ * A chat the Hub already answered while its VM is still booting (or failed to boot). Kept so the
+ * chat survives a Hub restart: a booting launch is started again, a failed one stays in the sidebar
+ * with its error until the user archives or deletes it.
+ */
+export interface HubPendingLaunchRecord {
+  threadId: string;
+  projectKey: string;
+  hubProjectId: string;
+  /** `launch`: `orchestration.launchThread`; `create`: an `orchestration.dispatchCommand` `thread.create`. */
+  kind: "launch" | "create";
+  /** The client's request payload, with Hub project ids. May hold the user's first message. */
+  payload: Record<string, unknown>;
+  shell: Record<string, unknown>;
+  projection: Record<string, unknown>;
+  phase: "booting" | "failed";
+  error: string | null;
+  createdAt: string;
+}
+
 export interface HubStateRecord {
   environmentId: string;
   label: string;
@@ -109,6 +129,8 @@ export interface HubStateRecord {
    * VM after spawn, resume and reconnect. May hold credentials the user typed; never logged.
    */
   settingsOverlay: HubSettingsOverlay | null;
+  /** Chats answered before their VM was ready, by thread id (see `HubPendingLaunchRecord`). */
+  pendingLaunches?: Record<string, HubPendingLaunchRecord>;
 }
 
 export interface PersistedState {
@@ -213,6 +235,9 @@ export class StateStore {
         projectTemplates: prevHub?.projectTemplates ?? {},
         selfUpdate: prevHub?.selfUpdate ?? null,
         settingsOverlay: normalizeSettingsOverlay(prevHub?.settingsOverlay),
+        ...(prevHub?.pendingLaunches && Object.keys(prevHub.pendingLaunches).length > 0
+          ? { pendingLaunches: prevHub.pendingLaunches }
+          : {}),
       };
     }
 

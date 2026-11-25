@@ -902,6 +902,8 @@ export class LifecycleManager {
     injectedProviderSessions?: string[];
     /** Outcome of `syncRepoToRemote`, when it ran. */
     repoSync?: RepoSyncResult;
+    /** How long `syncRepoToRemote` took, when it ran. */
+    repoSyncMs?: number;
   }> {
     const { sandboxId, watchdogSlotKey, environmentId, label, projectName, project, watchdogSecret, llmToken, mintToken } = opts;
     // Stored sign-ins are only staged on providers with a file transfer (`download`): elsewhere the
@@ -1000,8 +1002,10 @@ export class LifecycleManager {
     }
 
     // After `injectFiles` (which may carry git credentials), before the `.env` and `bootCmd` that use the tree
+    const repoSyncStartedAt = Date.now();
     const repoSync =
       opts.syncRepoToRemote && project ? await this.syncRepoToRemote(sandboxId, projectName, project) : undefined;
+    const repoSyncMs = Date.now() - repoSyncStartedAt;
 
     if (project?.envFile && existsSync(project.envFile)) {
       const target = project.envTarget ?? `${project.workdir}/.env`;
@@ -1043,7 +1047,7 @@ export class LifecycleManager {
     if (injected.size > 0) {
       console.log(`[sessions] copied stored ${[...injected].join(", ")} session(s) into ${sandboxId}`);
     }
-    return { ...parsed, injectedProviderSessions: [...injected], ...(repoSync ? { repoSync } : {}) };
+    return { ...parsed, injectedProviderSessions: [...injected], ...(repoSync ? { repoSync, repoSyncMs } : {}) };
   }
 
   /** Bounded and non-fatal: a failure or timeout boots the chat on the snapshot's code, with one log line. */
