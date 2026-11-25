@@ -202,6 +202,9 @@ interface LocalThreadSub {
 /** Commands that close a chat; for a chat still booting (or whose VM failed to start) they cancel the launch. */
 const CLOSING_COMMANDS = new Set(["thread.archive", "thread.delete", "thread.settle", "thread.auto-settle"]);
 
+/** A VM that is up: Boat reports it `running`, or `idle` when nothing in it is busy. */
+const isLiveSandboxState = (state: string | undefined): boolean => state === "running" || state === "idle";
+
 /** Commands that only record what the user did; answered at once and sent once the VM is up. */
 const BOOKKEEPING_COMMANDS = new Set([
   "thread.visit",
@@ -363,7 +366,37 @@ class HubVmBridge {
     ) => void,
     private readonly onProviderStatuses: (sandboxId: string, providers: unknown[]) => void = () => {},
     private readonly onOpen: (sandboxId: string) => void = () => {},
+    private readonly opts: {
+      /** Delay before each reconnect. */
+      reconnectMs?: () => number;
+      /** A connection attempt closed before it opened; `failures` counts them since the last open. */
+      onConnectFailure?: (sandboxId: string, failures: number) => void;
+    } = {},
   ) {}
+
+  /** Connection attempts that closed before opening, since the last open. */
+  private connectFailures = 0;
+
+  /**
+   * Points the bridge at a new endpoint for the same VM (its port was exposed again) and, unless it is
+   * open, connects to it now. Callers waiting for it to open keep waiting.
+   */
+  retarget(sandbox: HubSandboxRecord): void {
+    this.sandbox = sandbox;
+    if (this.closed || this.isOpen()) return;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    const stale = this.ws;
+    this.ws = null;
+    try {
+      stale?.close();
+    } catch {
+      // ignore
+    }
+    this.connect();
+  }
 
   start(): void {
     this.closed = false;
@@ -442,8 +475,11 @@ class HubVmBridge {
     } as unknown as string[]);
     this.ws = ws;
 
+    let opened = false;
     ws.addEventListener("open", () => {
       if (this.ws !== ws) return;
+      opened = true;
+      this.connectFailures = 0;
       for (const waiter of this.openWaiters.splice(0)) {
         waiter.resolve();
       }
@@ -510,7 +546,8 @@ class HubVmBridge {
         }
       }
       if (!this.closed && this.sandbox.phase === "running") {
-        this.reconnectTimer = setTimeout(() => this.connect(), 2_000);
+        this.reconnectTimer = setTimeout(() => this.connect(), this.opts.reconnectMs?.() ?? 2_000);
+        if (!opened) this.opts.onConnectFailure?.(this.sandbox.sandboxId, ++this.connectFailures);
       }
     });
 
@@ -871,6 +908,18 @@ export class HubServer {
   wakeBridgeTimeoutMs = 20_000;
   /** How long archive or delete waits for a VM's bridge before treating the VM as unreachable. */
   closeBridgeTimeoutMs = 8_000;
+  /** Delay between a VM bridge's reconnect attempts. */
+  bridgeReconnectMs = 2_000;
+  /** Failed connects in a row (since the last open) after which the Hub re-exposes the VM's T3 port. */
+  relayRepairAfterFailures = 3;
+  /** At most one automatic relay repair per VM in this window. */
+  relayRepairBackoffMs = 60_000;
+  /** How long one relay repair (Boat state check + re-expose) may take. */
+  relayRepairTimeoutMs = 20_000;
+  /** Relay repairs under way, by sandbox id. */
+  private readonly relayRepairs = new Map<string, Promise<boolean>>();
+  /** When each VM's last relay repair started, by sandbox id. */
+  private readonly lastRelayRepairAt = new Map<string, number>();
   /** How long a parked VM is kept before its chat becomes read only (Boat drops the disk after 14 days). */
   parkedTtlMs = PARKED_DATA_TTL_MS;
   /** After a parked VM wakes, `all-archived` does not park it again for this long (its watchdog's stale grace). */
@@ -2487,7 +2536,9 @@ export class HubServer {
       }
       // Other commands for a booting chat wait for its VM (resolveSandboxForThread)
       const sb = await this.resolveSandboxForThread(tid);
-      const bridge = closes ? await this.bridgeForClose(sb) : await this.ensureBridgeOpen(sb);
+      let bridge = closes ? await this.bridgeForClose(sb) : await this.ensureBridgeOpen(sb);
+      // An agent may still work behind a lost relay: once repaired, the VM applies the close itself
+      if (!bridge && (await this.repairLocalhostRelay(sb.sandboxId, "close"))) bridge = await this.bridgeForClose(sb);
       if (!bridge) {
         await this.closeUnreachableThread(ws, reqId, cmdType, payload, tid, sb);
         return;
@@ -4235,7 +4286,7 @@ export class HubServer {
     let needsPause = ctx.resumed || previous?.vmPaused === false;
     if (!needsPause) {
       const info = await this.boat.info(sandboxId).catch(() => null);
-      needsPause = info?.state === "running";
+      needsPause = isLiveSandboxState(info?.state);
     }
     let vmPaused = !needsPause;
     if (needsPause && this.boat.pause) {
@@ -4447,6 +4498,7 @@ export class HubServer {
     this.clearPauseRetry(sandboxId);
     this.parkCacheMisses.delete(sandboxId);
     this.unparkedAt.delete(sandboxId);
+    this.lastRelayRepairAt.delete(sandboxId);
 
     // Threads may have been bound while a teardown pull ran
     const current = this.state.getHubSandbox(sandboxId) ?? sb;
@@ -4531,6 +4583,85 @@ export class HubServer {
     }
   }
 
+  /**
+   * Re-exposes a running VM's T3 port when its bridge cannot connect. Inside the VM T3 listens on
+   * 127.0.0.1 only and Boat's localhost relay carries it; an in-VM `host <port>` without `--localhost`
+   * drops that relay, and Boat's edge then answers 502 forever. The same `exposePort` the spawn uses
+   * brings it back; the record adopts whatever endpoint it returns and the bridge reconnects to it.
+   * Skipped for a VM that is sleeping, waking or being destroyed, or that Boat does not report running.
+   * `bridge` repairs run at most once per `relayRepairBackoffMs`; a `close` asks once regardless.
+   */
+  private repairLocalhostRelay(sandboxId: string, trigger: "bridge" | "close"): Promise<boolean> {
+    const existing = this.relayRepairs.get(sandboxId);
+    if (existing) return existing;
+    if (!this.relayRepairAllowed(sandboxId)) return Promise.resolve(false);
+    const last = this.lastRelayRepairAt.get(sandboxId);
+    if (trigger === "bridge" && last !== undefined && Date.now() - last < this.relayRepairBackoffMs) {
+      return Promise.resolve(false);
+    }
+    this.lastRelayRepairAt.set(sandboxId, Date.now());
+    const promise = this.doRepairLocalhostRelay(sandboxId, trigger)
+      .catch((err) => {
+        console.warn(`[hub] relay repair of ${sandboxId} failed: ${redactForLog(err)}`);
+        return false;
+      })
+      .finally(() => this.relayRepairs.delete(sandboxId));
+    this.relayRepairs.set(sandboxId, promise);
+    return promise;
+  }
+
+  private relayRepairAllowed(sandboxId: string): boolean {
+    const sb = this.state.getHubSandbox(sandboxId);
+    return (
+      !!sb &&
+      sb.phase === "running" &&
+      typeof this.boat.exposePort === "function" &&
+      !this.inFlightSleeps.has(sandboxId) &&
+      !this.inFlightWakes.has(sandboxId) &&
+      !this.destroyingSandboxes.has(sandboxId)
+    );
+  }
+
+  private async doRepairLocalhostRelay(sandboxId: string, trigger: "bridge" | "close"): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`timed out after ${this.relayRepairTimeoutMs}ms`)), this.relayRepairTimeoutMs);
+    });
+    try {
+      // The VM's watchdog may have stopped it while the record still says running (until the reaper's next tick)
+      const info = await Promise.race([this.boat.info(sandboxId), timeout]).catch(() => null);
+      if (!isLiveSandboxState(info?.state)) {
+        console.warn(`[hub] not repairing the relay of ${sandboxId}: ${this.boat.name} reports it ${info?.state ?? "missing"}`);
+        return false;
+      }
+      if (!this.relayRepairAllowed(sandboxId)) return false;
+      const endpoint = await Promise.race([
+        this.boat.exposePort(sandboxId, 3773, { visibility: this.config.boat.hostVisibility }),
+        timeout,
+      ]);
+      // A sleep or destroy may have started meanwhile; it owns the bridge now
+      if (!this.relayRepairAllowed(sandboxId)) return false;
+      const updated = this.state.updateHubSandbox(sandboxId, (s) => {
+        s.upstreamUrl = endpoint.url;
+        s.upstreamHeaders = endpoint.headers ?? null;
+      });
+      if (!updated) return false;
+      const bridge = this.bridges.get(sandboxId);
+      if (bridge) bridge.retarget(updated);
+      else this.attachBridge(updated);
+      let host = endpoint.url;
+      try {
+        host = new URL(endpoint.url).host;
+      } catch {
+        // keep the raw value
+      }
+      console.log(`[hub] repaired the localhost relay of ${sandboxId} (${trigger}): port 3773 exposed again at ${host}; reconnecting`);
+      return true;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   private attachBridge(sb: HubSandboxRecord): void {
     this.bridges.get(sb.sandboxId)?.stop();
     const bridge = new HubVmBridge(
@@ -4547,6 +4678,12 @@ export class HubServer {
           void this.bridges.get(sandboxId)?.callUnary("preview.reportProfiles", this.lastPreviewProfiles, 10_000);
         }
         this.replaySettingsOverlay(sandboxId);
+      },
+      {
+        reconnectMs: () => this.bridgeReconnectMs,
+        onConnectFailure: (sandboxId, failures) => {
+          if (failures >= this.relayRepairAfterFailures) void this.repairLocalhostRelay(sandboxId, "bridge");
+        },
       },
     );
     this.bridges.set(sb.sandboxId, bridge);

@@ -2987,6 +2987,135 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     });
   });
 
+  describe("a VM whose localhost relay was lost is repaired by the Hub", () => {
+    type HubClient = Awaited<ReturnType<typeof connectHubClient>>;
+    const until = async (cond: () => boolean, timeoutMs = 5_000) => {
+      const start = Date.now();
+      while (!cond()) {
+        if (Date.now() - start > timeoutMs) throw new Error("condition not met in time");
+        await Bun.sleep(20);
+      }
+    };
+    type HubInternals = {
+      bridges: Map<string, { isOpen(): boolean }>;
+      attachBridge(sb: unknown): void;
+      inFlightSleeps: Map<string, Promise<void>>;
+      destroyingSandboxes: Set<string>;
+    };
+    const internals = (handle: SentinelServerHandle) => handle.hub as unknown as HubInternals;
+    /** A URL nothing listens on: like Boat's edge after the relay is gone, every connect fails. */
+    const deadUrl = () => {
+      const dead = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("") });
+      const url = `http://127.0.0.1:${dead.port}`;
+      dead.stop(true);
+      return url;
+    };
+
+    async function chatWithLostRelay(prefix: string, vmOpts: Parameters<typeof startFakeVmT3Server>[1] = {}) {
+      const vm = startFakeVmT3Server(prefix, vmOpts);
+      cleanups.push(() => vm.server.stop(true));
+      const hub = await startHubWithVm(vm, `t3-sentinel-hub-${prefix}-`);
+      const client: HubClient = await connectHubClient(hub.handle, hub.cfg);
+      await launchThreadOnHub(client, "thread-r");
+      const sandboxId = hub.handle.state.listHubSandboxes()[0].sandboxId;
+      const hubServer = hub.handle.hub!;
+      hubServer.bridgeReconnectMs = 20;
+      hubServer.relayRepairAfterFailures = 3;
+      // Real Boat reports a live VM with nothing busy in it as `idle`, not `running`
+      (hub.boat.sandboxes.get(sandboxId) as { state: string }).state = "idle";
+      // `boat host` from now on: counted, and pointing wherever the test says
+      let exposeTo = deadUrl();
+      const exposes: string[] = [];
+      hub.boat.hostPublic = async (id: string) => {
+        exposes.push(id);
+        return exposeTo;
+      };
+      const loseRelay = () => {
+        const record = hub.handle.state.updateHubSandbox(sandboxId, (s) => {
+          s.upstreamUrl = deadUrl();
+        })!;
+        internals(hub.handle).attachBridge(record);
+      };
+      return {
+        vm,
+        client,
+        sandboxId,
+        exposes,
+        loseRelay,
+        exposeAt: (url: string) => {
+          exposeTo = url;
+        },
+        ...hub,
+      };
+    }
+
+    test("repeated failed connects trigger one repair per backoff; the record adopts the new endpoint and the bridge reconnects", async () => {
+      const { handle, vm, sandboxId, exposes, loseRelay, exposeAt } = await chatWithLostRelay("relay-repair");
+      // First a repair that does not help (Boat hands back an endpoint that is still dead)
+      loseRelay();
+      await until(() => exposes.length === 1);
+      await Bun.sleep(400);
+      // ~20 more failed connects, still inside the backoff window: no second `boat host`
+      expect(exposes).toEqual([sandboxId]);
+      expect(internals(handle).bridges.get(sandboxId)!.isOpen()).toBe(false);
+
+      // After the backoff the next failures repair it for real
+      handle.hub!.relayRepairBackoffMs = 0;
+      exposeAt(vm.url);
+      await until(() => internals(handle).bridges.get(sandboxId)!.isOpen());
+      expect(handle.state.getHubSandbox(sandboxId)!.upstreamUrl).toBe(vm.url);
+      expect(exposes.length).toBeGreaterThanOrEqual(2);
+      const repairs = exposes.length;
+      await Bun.sleep(200);
+      // Open again: no more repairs
+      expect(exposes.length).toBe(repairs);
+    });
+
+    test("no repair for a VM Boat reports stopped, nor while a sleep or destroy is in flight", async () => {
+      const { handle, boat, sandboxId, exposes, loseRelay } = await chatWithLostRelay("relay-guards");
+      handle.hub!.relayRepairBackoffMs = 0;
+      // Stopped by its own watchdog; the record still says running until the reaper's next tick
+      (boat.sandboxes.get(sandboxId) as { state: string }).state = "stopped";
+      loseRelay();
+      await Bun.sleep(400);
+      expect(exposes).toEqual([]);
+
+      (boat.sandboxes.get(sandboxId) as { state: string }).state = "running";
+      let endSleep!: () => void;
+      internals(handle).inFlightSleeps.set(sandboxId, new Promise<void>((r) => (endSleep = r)));
+      await Bun.sleep(300);
+      expect(exposes).toEqual([]);
+      internals(handle).inFlightSleeps.delete(sandboxId);
+      endSleep();
+
+      internals(handle).destroyingSandboxes.add(sandboxId);
+      await Bun.sleep(300);
+      expect(exposes).toEqual([]);
+      internals(handle).destroyingSandboxes.delete(sandboxId);
+      // Nothing in the way any more: it is repaired
+      await until(() => exposes.length > 0);
+    });
+
+    test("closing a chat behind a lost relay repairs it first: the VM applies the close and is not deleted", async () => {
+      const { handle, client, boat, vm, sandboxId, exposes, loseRelay, exposeAt } = await chatWithLostRelay("relay-close");
+      // Keep the automatic repair out of the way: the close's own repair is the one under test
+      handle.hub!.relayRepairAfterFailures = 1_000;
+      handle.hub!.closeBridgeTimeoutMs = 300;
+      exposeAt(vm.url);
+      loseRelay();
+      await Bun.sleep(100);
+      client.request("close", "orchestration.dispatchCommand", { type: "thread.archive", commandId: "cmd-close", threadId: "thread-r" });
+      const exit = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "close", 3_000);
+      expect((exit.exit as { _tag: string })._tag).toBe("Success");
+      expect(exposes).toEqual([sandboxId]);
+      expect(
+        vm.seenMethods.some((m) => m.tag === "orchestration.dispatchCommand" && (m.payload as { type?: string }).type === "thread.archive"),
+      ).toBe(true);
+      expect(boat.deleted).toEqual([]);
+      expect(handle.state.getHubSandbox(sandboxId)?.phase).toBe("running");
+    });
+  });
+
   test("follows live providerStatuses from a VM after its stale boot snapshot and pushes them to clients", async () => {
     const staleSnapshot = {
       providers: [
