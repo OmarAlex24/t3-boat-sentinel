@@ -469,8 +469,9 @@ describe("CelestoProvider", () => {
     // No verdict (e.g. the exec failed oddly) never reads as expired: the wake fails and can retry
     checkOutput = { exit_code: 1, stdout: "" };
     await expect(provider.resume(id, "default")).rejects.toThrow(/no verdict/);
+    // Provisioned disk but no live supervisor after a stop: resumable (the Hub re-provisions)
     checkOutput = { exit_code: 0, stdout: "t3s-resume:dead\n" };
-    expect(await provider.resume(id, "default")).toBe("data_expired");
+    expect(await provider.resume(id, "default")).toBe("resumed");
 
     fake.computers.delete(id);
     expect(await provider.resume(id, "default")).toBe("data_expired");

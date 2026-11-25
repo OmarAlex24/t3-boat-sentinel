@@ -468,8 +468,9 @@ export class CelestoProvider implements SandboxProvider {
       }
       await this.waitForStatus(id, ["running"], 300_000, `start ${id}`);
     }
-    // Resumable only when this VM was provisioned and its T3 supervisor survived the stop. Any
-    // other outcome (exec error, no verdict) throws so the wake can be retried, never destroyed.
+    // Resumable whenever this VM was provisioned: the disk survives a stop, but running processes
+    // may not ("dead"), and the Hub re-runs provision-base.sh after a resume, which restarts the
+    // supervisors. Any other outcome (exec error, no verdict) throws so the wake can be retried.
     const check = await this.exec(
       id,
       `if [ ! -f ${CELESTO_PROVISION_MARKER} ]; then echo t3s-resume:missing; ` +
@@ -478,8 +479,8 @@ export class CelestoProvider implements SandboxProvider {
       30,
     );
     const verdict = check.stdout.match(/t3s-resume:(ok|missing|dead)/)?.[1];
-    if (verdict === "ok") return "resumed";
-    if (verdict === "missing" || verdict === "dead") return "data_expired";
+    if (verdict === "ok" || verdict === "dead") return "resumed";
+    if (verdict === "missing") return "data_expired";
     throw new Error(`celesto resume check on ${id} gave no verdict (exit ${check.exitCode})`);
   }
 
