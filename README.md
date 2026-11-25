@@ -220,7 +220,7 @@ Chat VMs are disposable, so providers that need a runtime install or a sign-in m
 
 Changes you make in T3 Settings while connected to the Hub (model favorites, hidden models, provider on/off switches, provider instances, and other server settings) apply to every chat VM, including ones created later:
 
-- Sentinel sends each change to every running chat VM, where T3 applies it and updates the provider list. The reply and the `settingsUpdated` event to your other devices come from that result. With no VM running, sentinel applies the change to its own copy with T3's rules.
+- Sentinel sends each change to every running chat VM, where T3 applies it and updates the provider list. The reply and the `settingsUpdated` event to your other devices come from that result. With no VM running, sentinel applies the change to its own copy with T3's rules, except for values that can hold credentials (a provider instance's `config` and `environment`, speech keys, secret providers, source control hosts, usage limit sources, text generators, device hosts). Those are stored and sent to the next VM, but Settings shows them only once a VM is running.
 - Sentinel stores the changes in `<stateDir>/state.json` (`hub.settingsOverlay`). It re-applies them to every VM after it boots or resumes, before the chat opens, and whenever sentinel reconnects to a VM. They survive sentinel restarts and re-bakes, because they are never written into a snapshot.
 
 **Precedence, from lowest to highest:** T3's defaults, then `t3-settings.json` (copied at bake, merged at boot), then your changes from the app. Only what you changed in the app overrides the file:

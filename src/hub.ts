@@ -685,6 +685,8 @@ export class HubServer {
   private settingsQueue: Promise<unknown> = Promise.resolve();
   /** Overlay replay of each VM's latest connection, awaited before a spawned or woken VM is used. */
   private readonly settingsReplays = new Map<string, Promise<void>>();
+  /** A VM's settings after its replay on the current connection; newer than its boot snapshot. */
+  private readonly replayedSettings = new Map<string, Record<string, unknown>>();
 
   private readonly boat: SandboxProvider;
   private readonly mcp: HubMcpHandler;
@@ -2276,6 +2278,8 @@ export class HubServer {
 
     this.bridges.get(sandboxId)?.stop();
     this.bridges.delete(sandboxId);
+    this.settingsReplays.delete(sandboxId);
+    this.replayedSettings.delete(sandboxId);
 
     // Threads may have been bound while the pull ran
     const current = this.state.getHubSandbox(sandboxId) ?? sb;
@@ -2553,7 +2557,10 @@ export class HubServer {
     let changed = false;
     this.state.updateHub((h) => {
       if (templates.serverConfig) {
-        h.serverConfig = this.withSettingsOverlay(templates.serverConfig, h.settingsOverlay);
+        const replayed = this.replayedSettings.get(sandbox.sandboxId);
+        h.serverConfig = replayed
+          ? { ...templates.serverConfig, settings: replayed }
+          : this.withSettingsOverlay(templates.serverConfig, h.settingsOverlay);
         changed = true;
       }
       if (templates.lifecycleEvents && templates.lifecycleEvents.length > 0) {
@@ -2727,6 +2734,7 @@ export class HubServer {
    * restart). Queued with settings updates so a replay never lands after a newer change.
    */
   private replaySettingsOverlay(sandboxId: string): void {
+    this.replayedSettings.delete(sandboxId);
     const calls: SettingsUpdateInput[] = overlayReplayCalls(this.state.getHub()?.settingsOverlay);
     if (calls.length === 0) {
       this.settingsReplays.delete(sandboxId);
@@ -2748,6 +2756,16 @@ export class HubServer {
       const failed = results.filter((r) => r._tag !== "Success").length;
       if (failed > 0) console.warn(`[hub] settings replay on ${sandboxId}: ${failed} of ${results.length} call(s) failed`);
       else console.log(`[hub] settings replay on ${sandboxId}: ${results.length} call(s) applied`);
+      // The last reply holds every replayed change as the VM's T3 applied it (redacted by T3)
+      const last = results.filter((r) => r._tag === "Success").at(-1);
+      if (last?._tag !== "Success" || !isFullServerSettings(last.value) || this.bridges.get(sandboxId) !== bridge) return;
+      const settings = rewriteProjectIdsAndKeys(last.value, bridge.sandbox.vmProjectId, bridge.sandbox.hubProjectId) as Record<string, unknown>;
+      this.replayedSettings.set(sandboxId, settings);
+      // A harvest that lands later uses this too, instead of the VM's pre-replay snapshot
+      this.state.updateHub((h) => {
+        if (h.serverConfig && typeof h.serverConfig === "object") h.serverConfig = { ...h.serverConfig, settings };
+      });
+      this.broadcastSettings(settings);
     });
     this.settingsQueue = run.catch(() => {});
     this.settingsReplays.set(

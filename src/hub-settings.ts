@@ -38,6 +38,9 @@ export interface HubSettingsOverlay {
   updatedAt: string | null;
 }
 
+/** How T3 shows a saved secret field to clients; a client sends it back unchanged. */
+export const SECRET_REDACTED = "\u2022\u2022\u2022\u2022\u2022\u2022";
+
 /** Where a VM keeps its settings; reported in `ServerSettingsError.settingsPath`. */
 export const VM_SETTINGS_PATH = "/home/user/.t3/userdata/settings.json";
 
@@ -351,6 +354,35 @@ export function normalizeSettingsOverlay(raw: unknown): HubSettingsOverlay | nul
   };
 }
 
+/**
+ * Keeps the raw secrets an earlier change recorded where a later change only echoes T3's redacted
+ * form (`"••••••"`, or `valueRedacted: true` on a provider environment variable). T3 keeps its
+ * stored secret for an echo, but a VM that never stored it would lose it on replay.
+ */
+export function carryRedactedSecrets(next: unknown, prev: unknown): unknown {
+  if (prev === undefined || prev === null) return next;
+  if (next === SECRET_REDACTED) return typeof prev === "string" && prev !== SECRET_REDACTED ? prev : next;
+  if (Array.isArray(next)) {
+    const prevList = Array.isArray(prev) ? prev : [];
+    return next.map((item, i) => {
+      const named = isObject(item) && typeof item.name === "string";
+      const match = named ? prevList.find((p) => isObject(p) && p.name === item.name) : prevList[i];
+      return carryRedactedSecrets(item, match);
+    });
+  }
+  if (isObject(next)) {
+    if (next.valueRedacted === true && isObject(prev) && typeof prev.value === "string" && prev.value !== "" && prev.valueRedacted !== true) {
+      const { valueRedacted: _redacted, ...rest } = next;
+      return { ...rest, value: prev.value };
+    }
+    const p = isObject(prev) ? prev : {};
+    return Object.fromEntries(Object.entries(next).map(([k, v]) => [k, carryRedactedSecrets(v, p[k])]));
+  }
+  return next;
+}
+
+const previousInstance = (op: InstanceOp | undefined) => (op?.operation === "upsert" ? op.instance : undefined);
+
 /** Composes a keyed delta list (`setModelFavorites`, `setModelsHidden`): the later change per model wins. */
 function composeDeltas(earlier: unknown, later: unknown[]): unknown[] {
   const byKey = new Map<string, unknown>();
@@ -377,8 +409,9 @@ export function recordSettingsUpdate(
   const modelOrders = { ...base.modelOrders };
   const instances = { ...base.providerInstances };
 
-  for (const [key, value] of Object.entries(input.patch)) {
-    if (value === undefined) continue;
+  for (const [key, raw] of Object.entries(input.patch)) {
+    if (raw === undefined) continue;
+    const value = carryRedactedSecrets(raw, acc[key]);
     switch (key) {
       case "favorites":
         acc.favorites = value;
@@ -403,7 +436,11 @@ export function recordSettingsUpdate(
           ...Object.keys(instances).filter((id) => instances[id]?.operation === "upsert"),
         ]);
         for (const id of existing) if (!(id in map)) instances[id] = { operation: "remove" };
-        for (const [id, inst] of Object.entries(map)) if (isObject(inst)) instances[id] = { operation: "upsert", instance: inst };
+        for (const [id, inst] of Object.entries(map)) {
+          if (isObject(inst)) {
+            instances[id] = { operation: "upsert", instance: carryRedactedSecrets(inst, previousInstance(instances[id])) as Obj };
+          }
+        }
         break;
       }
       case "sourceControlHosts": {
@@ -477,7 +514,10 @@ export function recordSettingsUpdate(
   }
   const m = input.providerInstanceMutation;
   if (m) {
-    instances[m.instanceId] = m.operation === "remove" ? { operation: "remove" } : { operation: "upsert", instance: m.instance };
+    instances[m.instanceId] =
+      m.operation === "remove"
+        ? { operation: "remove" }
+        : { operation: "upsert", instance: carryRedactedSecrets(m.instance, previousInstance(instances[m.instanceId])) as Obj };
   }
   return { version: 1, patch: acc, modelOrders, providerInstances: instances, updatedAt: now };
 }

@@ -955,7 +955,15 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
               ws.sendText(JSON.stringify({ _tag: "Exit", requestId: frame.id, exit: { _tag: "Failure", cause: [{ _tag: "Die", defect: parsed.message }] } }));
               return;
             }
-            vmSettings = applySettingsUpdate(vmSettings, parsed.value);
+            // Like T3: the patch, then the instance mutation replacing the whole instance
+            vmSettings = applySettingsUpdate(vmSettings, { patch: parsed.value.patch });
+            const m = parsed.value.providerInstanceMutation;
+            if (m) {
+              const instances = { ...(vmSettings.providerInstances as Record<string, unknown>) };
+              if (m.operation === "remove") delete instances[m.instanceId];
+              else instances[m.instanceId] = m.instance;
+              vmSettings = { ...vmSettings, providerInstances: instances };
+            }
             ws.sendText(JSON.stringify({ _tag: "Exit", requestId: frame.id, exit: { _tag: "Success", value: vmSettings } }));
             return;
           }
@@ -1616,36 +1624,50 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     });
 
     test("replays the overlay to a new VM before its thread launches, and its stale snapshot does not overwrite it", async () => {
+      const withConfig = (binaryPath: string) => {
+        const settings = baseSettings();
+        settings.providerInstances.opencode = { driver: "opencode", enabled: true, config: { binaryPath } } as never;
+        return settings;
+      };
       const vm = startFakeVmT3Server("vm-settings-replay", {
         // Booted from a snapshot baked before the user's changes
-        configSnapshot: { providers: baseProviders(), settings: baseSettings() },
+        configSnapshot: { providers: baseProviders(), settings: { ...withConfig("/old"), bootMarker: "vm-boot" } },
         applySettings: true,
       });
       cleanups.push(() => vm.server.stop(true));
       const { cfg, handle } = await startHubWithVm(vm, "t3-sentinel-hub-settings-replay-");
       handle.state.updateHub((h) => {
-        h.serverConfig = { providers: baseProviders(), settings: baseSettings() };
+        h.serverConfig = { providers: baseProviders(), settings: withConfig("/old") };
+        h.lifecycleEvents = null;
       });
       const client = await connectHubClient(handle, cfg);
-      client.request("cfg", "subscribeServerConfig", {});
-      await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "cfg");
       expect((await updateExit(client, "fav", { patch: FAVORITE }))._tag).toBe("Success");
-      expect((await updateExit(client, "off", DISABLE_OPENCODE))._tag).toBe("Success");
+      const newInstance = { driver: "opencode", enabled: false, config: { binaryPath: "/new" } };
+      const off = await updateExit(client, "off", {
+        patch: {},
+        providerInstanceMutation: { operation: "upsert", instanceId: "opencode", instance: newInstance },
+      });
+      expect(off._tag).toBe("Success");
+      // With no VM, instance config stays as the Hub last saw it from a VM (it can hold secrets)
+      expect(opencodeOf(off.value)).toEqual({ driver: "opencode", enabled: false, config: { binaryPath: "/old" } });
       expect(handle.state.listHubSandboxes().length).toBe(0);
 
       await launchThreadOnHub(client, "thread-settings-replay");
       const tags = vm.seenMethods.map((m) => m.tag);
-      const replayed = vm.seenMethods.filter((m) => m.tag === "server.updateSettings");
-      expect(replayed.length).toBeGreaterThanOrEqual(2);
+      expect(vm.seenMethods.filter((m) => m.tag === "server.updateSettings").length).toBe(2);
       expect(tags.indexOf("server.updateSettings")).toBeLessThan(tags.indexOf("orchestration.launchThread"));
       expect(vm.getSettings()?.favorites).toEqual([{ provider: "claudeAgent", model: "claude-opus-4-6" }]);
-      expect(opencodeOf(vm.getSettings())).toEqual({ driver: "opencode", enabled: false });
+      expect(opencodeOf(vm.getSettings())).toEqual(newInstance);
 
-      // The VM's boot snapshot (favorites null, OpenCode on) was harvested; the overlay still wins
-      await client.waitForFrame(configChunk("cfg", "settingsUpdated"));
+      // Wait for the harvest of the VM's boot snapshot (favorites null, OpenCode on, old config)
+      const deadline = Date.now() + 5_000;
+      while (!handle.state.getHub()?.lifecycleEvents && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+      expect(handle.state.getHub()?.lifecycleEvents).not.toBeNull();
       const hubSettings = handle.state.getHub()?.serverConfig?.settings as Record<string, unknown>;
+      expect(hubSettings.bootMarker).toBe("vm-boot");
       expect(hubSettings.favorites).toEqual([{ provider: "claudeAgent", model: "claude-opus-4-6" }]);
-      expect(opencodeOf(hubSettings)).toEqual({ driver: "opencode", enabled: false });
+      // The Hub copy is the VM's reply to the replay, so it has the config the user saved
+      expect(opencodeOf(hubSettings)).toEqual(newInstance);
     });
   });
 
@@ -3331,6 +3353,22 @@ describe("hub settings overlay", () => {
     // An instance added later by t3-settings.json that the user never touched is kept
     const withNew = { ...settings(), providerInstances: { ...settings().providerInstances, devin: { driver: "acpRegistry" } } };
     expect(Object.keys(applySettingsOverlay(withNew, overlay).providerInstances as object).sort()).toEqual(["devin", "opencode"]);
+  });
+
+  test("a later change that echoes a redacted secret keeps the raw secret recorded earlier", () => {
+    const env = (value: string, redacted = false) => [{ name: "OPENCODE_KEY", value, sensitive: true, ...(redacted ? { valueRedacted: true } : {}) }];
+    const upsert = (instance: Record<string, unknown>) =>
+      parse({ patch: {}, providerInstanceMutation: { operation: "upsert", instanceId: "opencode", instance } });
+    let overlay = recordSettingsUpdate(null, upsert({ driver: "opencode", enabled: true, environment: env("sk-env-raw") }), settings());
+    // What the app sends when the switch is turned off: T3's redacted view of the instance
+    overlay = recordSettingsUpdate(overlay, upsert({ driver: "opencode", enabled: false, environment: env("", true) }), settings());
+    expect(overlay.providerInstances.opencode).toEqual({
+      operation: "upsert",
+      instance: { driver: "opencode", enabled: false, environment: env("sk-env-raw") },
+    });
+    overlay = recordSettingsUpdate(overlay, parse({ patch: { cloudSpeechCredentials: { openai: "sk-voice-raw" } } }), settings());
+    overlay = recordSettingsUpdate(overlay, parse({ patch: { cloudSpeechCredentials: { openai: "\u2022\u2022\u2022\u2022\u2022\u2022", xai: "x" } } }), settings());
+    expect(overlay.patch.cloudSpeechCredentials).toEqual({ openai: "sk-voice-raw", xai: "x" });
   });
 
   test("replaying is idempotent, and secrets and instance config never enter the Hub copy", () => {
