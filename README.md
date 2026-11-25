@@ -216,6 +216,22 @@ Chat VMs are disposable, so providers that need a runtime install or a sign-in m
    ```
    Chat VMs that are already running keep their sign-in until they are destroyed. Sentinel does not copy it back from them unless they sign in again.
 
+### Settings changed in the app
+
+Changes you make in T3 Settings while connected to the Hub (model favorites, hidden models, provider on/off switches, provider instances, and other server settings) apply to every chat VM, including ones created later:
+
+- Sentinel sends each change to every running chat VM, where T3 applies it and updates the provider list. The reply and the `settingsUpdated` event to your other devices come from that result. With no VM running, sentinel applies the change to its own copy with T3's rules, except for values that can hold credentials (a provider instance's `config` and `environment`, speech keys, secret providers, source control hosts, usage limit sources, text generators, device hosts). Those are stored and sent to the next VM, but Settings shows them only once a VM is running.
+- Sentinel stores the changes in `<stateDir>/state.json` (`hub.settingsOverlay`). It re-applies them to every VM after it boots or resumes, before the chat opens, and whenever sentinel reconnects to a VM. They survive sentinel restarts and re-bakes, because they are never written into a snapshot.
+
+**Precedence, from lowest to highest:** T3's defaults, then `t3-settings.json` (copied at bake, merged at boot), then your changes from the app. Only what you changed in the app overrides the file:
+- A setting, model favorite or hidden model is tracked on its own.
+- A provider instance is tracked as a whole. After you change one in the app (for example, switch OpenCode off), sentinel re-applies your version of it, and later edits to that instance in `t3-settings.json` have no effect. Instances you never changed in the app keep following the file.
+- **Reset to defaults** in the app removes the instance on every VM, including an entry that comes from `t3-settings.json`.
+
+To go back to `t3-settings.json` alone, stop sentinel, set `hub.settingsOverlay` to `null` in `state.json`, and start it again. VMs that are already running keep their current settings.
+
+The stored changes can include credentials you typed in T3 Settings (for example, speech API keys). `state.json` is mode 0600, and sentinel never logs setting values, only key names. The copy of the settings sentinel serves to clients never contains them: credentials are only shown as T3 redacts them.
+
 ### Troubleshooting
 
 | Message | Cause | Fix |

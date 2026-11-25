@@ -25,6 +25,21 @@ import {
 } from "./security.ts";
 import type { ProjectConfig, SentinelConfig } from "./config.ts";
 import { HubMcpHandler, type HubSandboxPhase } from "./hub-mcp.ts";
+import {
+  applySettingsOverlay,
+  applySettingsUpdate,
+  describeSettingsUpdate,
+  forwardableSettingsUpdate,
+  isEmptySettingsOverlay,
+  isFullServerSettings,
+  overlayReplayCalls,
+  parseSettingsUpdate,
+  providersWithInstanceEnabled,
+  recordSettingsUpdate,
+  rewriteProjectIdsAndKeys,
+  VM_SETTINGS_PATH,
+  type SettingsUpdateInput,
+} from "./hub-settings.ts";
 import type { KlavClient } from "./klav.ts";
 import type { LifecycleManager, WatchdogEventPayload } from "./lifecycle.ts";
 import { buildAutoProjectConfig, type HubSandboxRecord, type StateStore } from "./state.ts";
@@ -666,6 +681,12 @@ export class HubServer {
   private readonly selfUpdateRuns = new Map<string, SelfUpdateRun>();
   /** Tail of the self-update queue: rounds for different versions run one after another. */
   private selfUpdateQueue: Promise<unknown> = Promise.resolve();
+  /** Settings updates and overlay replays run one at a time, in arrival order. */
+  private settingsQueue: Promise<unknown> = Promise.resolve();
+  /** Overlay replay of each VM's latest connection, awaited before a spawned or woken VM is used. */
+  private readonly settingsReplays = new Map<string, Promise<void>>();
+  /** A VM's settings after its replay on the current connection; newer than its boot snapshot. */
+  private readonly replayedSettings = new Map<string, Record<string, unknown>>();
 
   private readonly boat: SandboxProvider;
   private readonly mcp: HubMcpHandler;
@@ -1480,18 +1501,16 @@ export class HubServer {
       return;
     }
     if (tag === "server.updateSettings") {
-      const cfg = this.buildHubServerConfig();
-      const merged = {
-        ...((cfg.settings as Record<string, unknown> | undefined) ?? {}),
-        ...((payload && typeof payload === "object" ? (payload as Record<string, unknown>) : {})),
-      };
-      this.state.updateHub((h) => {
-        if (h.serverConfig && typeof h.serverConfig === "object") {
-          h.serverConfig = { ...h.serverConfig, settings: merged };
-        }
-      });
-      sendRpcExitSuccess(ws, reqId, merged);
+      await this.handleUpdateSettings(ws, reqId, payload);
       return;
+    }
+    if (tag === "server.getSettings") {
+      const settings = this.buildHubServerConfig().settings;
+      if (isFullServerSettings(settings)) {
+        sendRpcExitSuccess(ws, reqId, settings);
+        return;
+      }
+      // No harvested settings yet: fall through and ask a VM
     }
     if (tag === "server.updateServer" || tag === "server.updateServerWithProgress") {
       await this.handleServerSelfUpdate(ws, reqId, tag, (payload ?? {}) as Record<string, unknown>);
@@ -2101,6 +2120,7 @@ export class HubServer {
       this.threadToSandbox.set(threadId, sandboxId);
       this.attachBridge(record);
       await this.bridges.get(sandboxId)!.waitUntilOpen(20_000);
+      await this.settingsReplayDone(sandboxId);
       // T3 may still report the status it probed before the sign-in was placed; re-check in the background
       for (const instanceId of injected) this.refreshInjectedProvider(sandboxId, instanceId);
 
@@ -2207,6 +2227,7 @@ export class HubServer {
 
       this.attachBridge(updated);
       await this.bridges.get(sandboxId)!.waitUntilOpen(20_000);
+      await this.settingsReplayDone(sandboxId);
       return updated;
     })().finally(() => {
       this.inFlightWakes.delete(sandboxId);
@@ -2257,6 +2278,8 @@ export class HubServer {
 
     this.bridges.get(sandboxId)?.stop();
     this.bridges.delete(sandboxId);
+    this.settingsReplays.delete(sandboxId);
+    this.replayedSettings.delete(sandboxId);
 
     // Threads may have been bound while the pull ran
     const current = this.state.getHubSandbox(sandboxId) ?? sb;
@@ -2326,7 +2349,10 @@ export class HubServer {
       (sandboxId, token) => this.urlTokenToSandbox.set(token, sandboxId),
       (sandbox, templates) => this.handleTemplatesHarvested(sandbox, templates),
       (sandboxId, providers) => this.handleVmProviderStatuses(sandboxId, providers),
-      (sandboxId) => this.adoptLocalProviderStreams(sandboxId),
+      (sandboxId) => {
+        this.adoptLocalProviderStreams(sandboxId);
+        this.replaySettingsOverlay(sandboxId);
+      },
     );
     this.bridges.set(sb.sandboxId, bridge);
     bridge.start();
@@ -2531,7 +2557,10 @@ export class HubServer {
     let changed = false;
     this.state.updateHub((h) => {
       if (templates.serverConfig) {
-        h.serverConfig = templates.serverConfig;
+        const replayed = this.replayedSettings.get(sandbox.sandboxId);
+        h.serverConfig = replayed
+          ? { ...templates.serverConfig, settings: replayed }
+          : this.withSettingsOverlay(templates.serverConfig, h.settingsOverlay);
         changed = true;
       }
       if (templates.lifecycleEvents && templates.lifecycleEvents.length > 0) {
@@ -2542,6 +2571,8 @@ export class HubServer {
     if (changed && templates.serverConfig) {
       // Push updated real ServerConfig to any already-connected clients
       this.broadcastProviderStatuses();
+      const settings = this.state.getHub()?.serverConfig?.settings;
+      if (isFullServerSettings(settings)) this.broadcastSettings(settings);
     }
     // The first snapshot is not sent to onProviderStatuses; a VM may already be signed in (e.g. after a Hub restart)
     const providers = templates.serverConfig?.providers;
@@ -2562,6 +2593,194 @@ export class HubServer {
         }
       });
     }
+  }
+
+  /**
+   * A VM's settings snapshot with the user's overlay applied. The snapshot can predate the overlay
+   * replay (boot cache, or a VM resumed from an old disk), so it never overwrites newer changes.
+   */
+  private withSettingsOverlay(
+    serverConfig: Record<string, unknown>,
+    overlay: Parameters<typeof applySettingsOverlay>[1],
+  ): Record<string, unknown> {
+    if (isEmptySettingsOverlay(overlay) || !isFullServerSettings(serverConfig.settings)) return serverConfig;
+    return { ...serverConfig, settings: applySettingsOverlay(serverConfig.settings, overlay) };
+  }
+
+  private handleUpdateSettings(ws: ServerWebSocket<HubWsData>, reqId: string | number, payload: unknown): Promise<void> {
+    const run = this.settingsQueue.then(() => this.runUpdateSettings(ws, reqId, payload));
+    this.settingsQueue = run.catch(() => {});
+    return run.catch((err) => {
+      console.error(`[hub] settings update failed: ${err instanceof Error ? err.name : "error"}`);
+      sendRpcExitFailure(ws, reqId, "Settings update failed");
+    });
+  }
+
+  /**
+   * `server.updateSettings`: forwards the update to every running VM and answers with the first
+   * VM's result (T3 applied it there). With no VM, applies it to the Hub's copy. Either way it is
+   * recorded in the overlay that new VMs replay, and pushed to `subscribeServerConfig` clients.
+   */
+  private async runUpdateSettings(ws: ServerWebSocket<HubWsData>, reqId: string | number, payload: unknown): Promise<void> {
+    const parsed = parseSettingsUpdate(payload);
+    if (!parsed.ok) {
+      // A T3 server answers a payload its schema rejects with a defect, not a typed error
+      sendRpcExitFailure(ws, reqId, parsed.message);
+      return;
+    }
+    const input = parsed.value;
+    const current = this.buildHubServerConfig().settings;
+    const mutation = input.providerInstanceMutation;
+    if (
+      mutation?.operation === "create" &&
+      isFullServerSettings(current) &&
+      Object.hasOwn(current.providerInstances as Record<string, unknown>, mutation.instanceId)
+    ) {
+      sendRpcExitFail(ws, reqId, {
+        _tag: "ServerSettingsError",
+        settingsPath: VM_SETTINGS_PATH,
+        operation: "create-provider-instance",
+        providerInstanceId: mutation.instanceId,
+      });
+      return;
+    }
+
+    const summary = describeSettingsUpdate(input);
+    const forwarded = forwardableSettingsUpdate(input);
+    const bridges = this.openRunningBridges();
+    // Sent to every VM before awaiting any, so each VM sees updates in the order the Hub received them
+    const calls = bridges.map((b) => ({
+      bridge: b,
+      exit: b.callUnary(
+        "server.updateSettings",
+        rewriteProjectIdsAndKeys(forwarded, b.sandbox.hubProjectId, b.sandbox.vmProjectId),
+        15_000,
+      ),
+    }));
+    for (const { bridge, exit } of calls.slice(1)) {
+      void exit.then((res) => {
+        if (res._tag !== "Success") console.warn(`[hub] settings update ${summary} not applied on ${bridge.sandbox.sandboxId}`);
+      });
+    }
+
+    let settings: Record<string, unknown> | null = null;
+    const primary = calls[0];
+    if (primary) {
+      const res = await primary.exit;
+      if (res._tag === "Success" && isFullServerSettings(res.value)) {
+        settings = rewriteProjectIdsAndKeys(res.value, primary.bridge.sandbox.vmProjectId, primary.bridge.sandbox.hubProjectId) as Record<
+          string,
+          unknown
+        >;
+      } else if (res._tag === "Failure" && !isHubTransportFailure(res.cause)) {
+        // The VM's T3 rejected it: pass its error through unchanged and record nothing
+        console.warn(`[hub] settings update ${summary} rejected by ${primary.bridge.sandbox.sandboxId}`);
+        sendRpcFrame(ws, { _tag: "Exit", requestId: reqId, exit: { _tag: "Failure", cause: res.cause } });
+        return;
+      }
+    }
+    const applyLocally = settings === null;
+    if (applyLocally) {
+      if (!isFullServerSettings(current)) {
+        // Nothing to apply the patch to before any VM has booted once
+        sendRpcExitFail(ws, reqId, { _tag: "ServerSettingsError", settingsPath: VM_SETTINGS_PATH, operation: "read-file" });
+        return;
+      }
+      settings = applySettingsUpdate(current, input);
+    }
+
+    const before = isFullServerSettings(current) ? current : {};
+    this.state.updateHub((h) => {
+      h.settingsOverlay = recordSettingsUpdate(h.settingsOverlay, input, before);
+      if (h.serverConfig && typeof h.serverConfig === "object") {
+        h.serverConfig = { ...h.serverConfig, settings };
+      }
+    });
+    console.log(`[hub] settings update ${summary} applied (${applyLocally ? "Hub copy only, no VM" : `${calls.length} VM(s)`})`);
+    if (applyLocally) {
+      // No VM reports provider status: show the switch's effect right away, as T3 does
+      const providers = providersWithInstanceEnabled(this.state.getHub()?.serverConfig?.providers, mutation);
+      if (providers) this.applyProviderStatuses(providers);
+    }
+    this.broadcastSettings(settings!);
+    sendRpcExitSuccess(ws, reqId, settings);
+  }
+
+  /** Sends `settingsUpdated` to every client subscribed to `subscribeServerConfig`, as T3 does. */
+  private broadcastSettings(settings: Record<string, unknown>): void {
+    for (const client of this.clients) {
+      for (const [, sub] of client.data.localStreams) {
+        if (sub.tag === "subscribeServerConfig") {
+          sendRpcFrame(client, {
+            _tag: "Chunk",
+            requestId: sub.rawId,
+            values: [{ version: 1, type: "settingsUpdated", payload: { settings } }],
+          });
+        }
+      }
+    }
+  }
+
+  private openRunningBridges(): HubVmBridge[] {
+    return this.state
+      .listHubSandboxes()
+      .filter((s) => s.phase === "running" && !this.destroyingSandboxes.has(s.sandboxId))
+      .map((s) => this.bridges.get(s.sandboxId))
+      .filter((b): b is HubVmBridge => !!b?.isOpen());
+  }
+
+  /**
+   * Replays the settings overlay on a VM whose bridge just opened (spawn, resume, reconnect or Hub
+   * restart). Queued with settings updates so a replay never lands after a newer change.
+   */
+  private replaySettingsOverlay(sandboxId: string): void {
+    this.replayedSettings.delete(sandboxId);
+    const calls: SettingsUpdateInput[] = overlayReplayCalls(this.state.getHub()?.settingsOverlay);
+    if (calls.length === 0) {
+      this.settingsReplays.delete(sandboxId);
+      return;
+    }
+    const run = this.settingsQueue.then(async () => {
+      const bridge = this.bridges.get(sandboxId);
+      if (!bridge?.isOpen()) return;
+      // Re-read under the queue: an update may have landed since the bridge opened
+      const latest = overlayReplayCalls(this.state.getHub()?.settingsOverlay);
+      const exits = latest.map((call) =>
+        bridge.callUnary(
+          "server.updateSettings",
+          rewriteProjectIdsAndKeys(call, bridge.sandbox.hubProjectId, bridge.sandbox.vmProjectId),
+          15_000,
+        ),
+      );
+      const results = await Promise.all(exits);
+      const failed = results.filter((r) => r._tag !== "Success").length;
+      if (failed > 0) console.warn(`[hub] settings replay on ${sandboxId}: ${failed} of ${results.length} call(s) failed`);
+      else console.log(`[hub] settings replay on ${sandboxId}: ${results.length} call(s) applied`);
+      // The last reply holds every replayed change as the VM's T3 applied it (redacted by T3)
+      const last = results.filter((r) => r._tag === "Success").at(-1);
+      if (last?._tag !== "Success" || !isFullServerSettings(last.value) || this.bridges.get(sandboxId) !== bridge) return;
+      const settings = rewriteProjectIdsAndKeys(last.value, bridge.sandbox.vmProjectId, bridge.sandbox.hubProjectId) as Record<string, unknown>;
+      this.replayedSettings.set(sandboxId, settings);
+      // A harvest that lands later uses this too, instead of the VM's pre-replay snapshot
+      this.state.updateHub((h) => {
+        if (h.serverConfig && typeof h.serverConfig === "object") h.serverConfig = { ...h.serverConfig, settings };
+      });
+      this.broadcastSettings(settings);
+    });
+    this.settingsQueue = run.catch(() => {});
+    this.settingsReplays.set(
+      sandboxId,
+      run.catch(() => {}),
+    );
+  }
+
+  /** Waits (bounded) for a VM's overlay replay so the user never sees it with stale settings. */
+  private async settingsReplayDone(sandboxId: string): Promise<void> {
+    const replay = this.settingsReplays.get(sandboxId);
+    if (!replay) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([replay, new Promise<void>((r) => (timer = setTimeout(r, 30_000)))]);
+    clearTimeout(timer);
   }
 
   private broadcastShellItem(item: Record<string, unknown>): void {
@@ -2996,6 +3215,17 @@ export type RpcCauseReason =
 /** Cause for a failure whose error is in no RPC's error union, as a real T3 server sends for an unknown tag. */
 export function hubDefectCause(message: string): RpcCauseReason[] {
   return [{ _tag: "Die", defect: message }];
+}
+
+/** True for the Hub's own "could not reach the VM" failures, as opposed to an error the VM sent. */
+function isHubTransportFailure(cause: unknown): boolean {
+  const reasons = Array.isArray(cause) ? (cause as RpcCauseReason[]) : [];
+  return reasons.some(
+    (r) =>
+      r._tag === "Die" &&
+      typeof r.defect === "string" &&
+      (["VM not connected", "Upstream VM disconnected", "Sandbox stopped"].includes(r.defect) || r.defect.endsWith(" timed out")),
+  );
 }
 
 /** Ends a request with an untyped failure (`Die`): the client decodes it for every RPC. */
