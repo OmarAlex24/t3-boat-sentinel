@@ -66,7 +66,7 @@ Disposable Boat VMs (`boat new --type large --from env-<project>`)
   If you start a chat before `env-<repo>` finishes baking, Sentinel automatically boots from `base-t3` and clones on first boot.
 - **Native Live Boot Progress in T3 Code:** Streams real-time VM creation, Klav setup, T3 server startup, and connection stages straight into T3 Code's native setup progress panel (`subscribeWorktreeSetup`) — no separate Mac CLI required.
 - **Immutable 2-Tier Golden Snapshots:** `base-t3` (Ubuntu + `t3` + watchdog + cached provider/ACP tool binaries + optional `klav-forward`) → `env-<project>` (always built cleanly from `base-t3`, smoke-tested, and wiped of per-VM DB/tokens while preserving pre-cached provider binaries). Supports daily UTC auto-bake (`baseBakeHourUtc` / `bakeHourUtc`).
-- **Provider Sign-ins That Follow You (`t3.persistProviderSessions`):** Sign in to Antigravity once in any Hub chat and every later chat VM starts signed in. Sentinel captures the credential file from the signed-in VM into `<stateDir>/credentials/<instanceId>/` (dir 0700, file 0600, atomic, newer `expiry` wins), copies it into each new VM before T3 starts, pulls the CLI's refreshed copy before a VM is destroyed, and never bakes it into a snapshot. Signing out in T3 (or `sentinel forget-session antigravity`) deletes the stored copy. Setup steps: [Devin and Antigravity](#devin-and-antigravity).
+- **Provider Sign-ins That Follow You (`t3.persistProviderSessions`):** Sign in to Antigravity or Devin once in any Hub chat and every later chat VM starts signed in. Sentinel captures the credential file from the signed-in VM into `<stateDir>/credentials/<instanceId>/` (dir 0700, file 0600, atomic, newer `expiry` wins), copies it into each new VM before T3 starts, pulls the CLI's refreshed copy before a VM is destroyed, and never bakes it into a snapshot. Signing out in T3 (or `sentinel forget-session <instanceId>`) deletes the stored copy. Setup steps: [Devin and Antigravity](#devin-and-antigravity).
 - **Zero-Trust LLM Proxy (`llmProxy:`):** Forward Claude/OpenAI requests to a private LAN/Tailscale gateway (e.g., `cliproxy`) without ever letting Boat VMs join your LAN or see your real API key. Each running VM receives a unique `t3llm_...` token that immediately returns `401` the moment the VM sleeps or is destroyed.
 - **Zero-Knowledge Secrets with [Klav](https://klav.dev) (`klav:`):** Supports Klav ADR 0036/0042 (`mode: proxy` with `klav-proxy` + ephemeral `tag:klav-sandbox` Tailscale + `klav-forward`) so agents can call external APIs (e.g. Northflank, GitHub, Cloudflare) without plaintext secrets ever entering the sandbox, revoking access automatically when the chat ends.
 - **Auto-Delete on Settle or Archive:** Configure `deleteWhen: archived-or-settled` (or `archived`) and `archiveAction: delete` (or `stop`). After `archiveGraceSecs` (default 20s), the VM is permanently deleted ($0/hr idle, no standby pool required).
@@ -190,7 +190,7 @@ Chat VMs are disposable, so providers that need a runtime install or a sign-in m
      settingsFile: /opt/t3-boat-sentinel/t3-settings.json
      prepareAcpAgents: [devin]          # ACP Registry agent IDs
      installProviders: [antigravity]    # provider instance IDs
-     persistProviderSessions: [antigravity]  # optional, see step 4
+     persistProviderSessions: [antigravity, acpRegistry_devin]  # optional, see step 4
    ```
    `prepareAcpAgents` takes ACP agent IDs. The bake checks the `providerInstances` entry with `driver: acpRegistry` and that `config.agentId`. If no entry references the agent, the bake logs `no provider instance references ACP agent devin; nothing to verify for it` and does not check it. `installProviders` takes instance IDs (the keys under `providerInstances`).
 
@@ -202,17 +202,22 @@ Chat VMs are disposable, so providers that need a runtime install or a sign-in m
    ```
    `bake base` installs the runtimes into `base-t3`. Project snapshots are built from `base-t3`, so they only get the runtimes after a re-bake. A project bake does not install anything; it checks that the runtimes are there. Both kinds of bake wait until T3 reports every listed provider as installed. If it does not within 180s, the bake fails with `provider status caches still not installed after 180s: <ids>; refusing to snapshot` and keeps the old snapshot.
 
-4. **Sign in.** Open a Boat chat and send a message, so a VM is running. Then go to **T3 Settings → Providers → Antigravity** and sign in with Google. Sign-in requests go to a running chat VM; with none running, they fail (see Troubleshooting).
+4. **Sign in.** Open a Boat chat and send a message, so a VM is running. Then go to **T3 Settings → Providers → Antigravity** and sign in with Google, and to **T3 Settings → Providers → Devin** and sign in with your Devin account. Sign-in requests go to a running chat VM; with none running, they fail (see Troubleshooting).
 
-   With `persistProviderSessions: [antigravity]`, sentinel copies the Antigravity sign-in from that VM to `<stateDir>/credentials/antigravity/` on the sentinel host. Every chat VM created after that starts signed in. Details:
-   - The copy is taken a few seconds after the VM reports Antigravity as signed in, and again before the VM is destroyed (the CLI may have refreshed its token).
+   With `persistProviderSessions: [antigravity, acpRegistry_devin]` (the keys under `providerInstances`), sentinel copies each sign-in from that VM to `<stateDir>/credentials/<instanceId>/` on the sentinel host. Every chat VM created after that starts signed in. Details:
+   - The copy is taken a few seconds after the VM reports the provider as signed in, and again before the VM is destroyed (the CLI may have refreshed its token).
    - It is placed only in new Hub chat VMs, before T3 starts. It is never baked into a snapshot.
-   - Only the `antigravity` driver is supported. Devin's sign-in is not stored, so sign in to Devin in each chat VM that needs it.
+   - What is copied:
+     - **Antigravity** (`driver: antigravity`): the OAuth token file in the instance's T3 profile directory. When the VM holds an older token than the stored one (by `expiry`), the stored one is kept.
+     - **Devin** (`driver: acpRegistry`, `config.agentId: devin`): the Devin CLI's `~/.local/share/devin/credentials.toml`, which `devin acp` falls back to when T3 passes no credentials, plus T3's non-secret "sign-in confirmed" marker `~/.t3/caches/acp-auth-<hash>.json`, so new VMs show Devin as signed in. The marker is never copied without `credentials.toml`. Devin tokens do not expire by default, so the latest copy wins.
+     - Other ACP Registry agents, and `source: local` agents, are not supported. Sentinel logs a warning and skips them.
    - It needs a provider that can copy files out of a VM. The Boat provider can. The `sandbox-sdk` provider cannot, so on it this option does nothing.
+   - Devin's credential path follows `XDG_DATA_HOME`. Don't set `XDG_DATA_HOME` for T3 on the VMs; sentinel looks only in the default location.
 
-   **Signing out.** Signing out of Antigravity in T3 deletes the stored copy, so new chat VMs start signed out. You can also delete it from the sentinel host:
+   **Signing out.** Signing out of a provider in T3 deletes its stored copy, so new chat VMs start signed out. You can also delete it from the sentinel host:
    ```bash
    bun run sentinel forget-session antigravity
+   bun run sentinel forget-session acpRegistry_devin
    ```
    Chat VMs that are already running keep their sign-in until they are destroyed. Sentinel does not copy it back from them unless they sign in again.
 
@@ -286,7 +291,7 @@ bun run sentinel bake my-app            # refresh env-my-app from base-t3
 bun run sentinel reset hub:<sandboxId>  # destroy one Hub VM immediately
 bun run sentinel reset hub              # destroy all live Hub VMs
 bun run sentinel revoke hub             # revoke paired device tokens
-bun run sentinel forget-session antigravity  # delete the stored Antigravity sign-in (t3.persistProviderSessions)
+bun run sentinel forget-session antigravity  # delete a stored provider sign-in, by instance ID (t3.persistProviderSessions)
 ```
 
 ### As an MCP server (Claude Code / Codex / T3 Code / Personal Assistants)

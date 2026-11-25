@@ -11,7 +11,7 @@
 #                  then stop t3 and wipe ALL of `~/.t3/userdata` so the golden snapshot is spotless
 #                  (provider sign-in tokens included; `providers/` runtimes are kept).
 #   (default)      Install provider sign-ins staged by sentinel in `~/.t3-sentinel/provider-sessions/`
-#                  (`t3.persistProviderSessions`, mode 0600) and
+#                  (`t3.persistProviderSessions`, mode 0600, same path under `$HOME`) and
 #                  write slot's permanent `environment-id` BEFORE t3 starts, start `t3code.service`
 #                  and `t3-sentinel-watchdog.service`, optionally register `PROJECT_WORKDIR` via
 #                  `t3 project add`, and print one JSON line with `{ environmentId, descriptor, authSession, upstreamToken?, t3Version }`.
@@ -450,7 +450,9 @@ if [ "$BAKE_CLEAN" = "1" ]; then
       "$HOME/.klav-forward" "$units/t3code.service.d/klav-env.conf" \
       "$sentinel_dir/provider-sessions" \
       "$userdata_dir"/providers/antigravity/*/antigravity-acp/antigravity-oauth-token \
-      "$userdata_dir"/providers/antigravity/*/antigravity-acp/acp_token.json
+      "$userdata_dir"/providers/antigravity/*/antigravity-acp/acp_token.json \
+      "$HOME/.local/share/devin/credentials.toml" \
+      "$HOME"/.t3/caches/acp-auth-*.json
   }
   # The sandbox home is FUSE (ascii-lazyfs), which can briefly return EBUSY on files t3 just closed; retry
   for attempt in $(seq 1 30); do
@@ -467,7 +469,12 @@ if [ "$BAKE_CLEAN" = "1" ]; then
   # Keep logs/ so t3code.service can open its stdout log when VMs boot from this snapshot
   mkdir -p "$userdata_dir/logs"
   # Provider sign-ins must never be frozen into a snapshot
-  leaked="$(find "$userdata_dir/providers/antigravity" "$sentinel_dir" \( -name antigravity-oauth-token -o -name acp_token.json \) -print 2>/dev/null || true)"
+  # (Scoped per directory: e.g. Antigravity's own cache/acp-auth-state.json is not T3's ACP sign-in marker)
+  leaked="$({
+    find "$userdata_dir/providers/antigravity" "$sentinel_dir" \( -name antigravity-oauth-token -o -name acp_token.json -o -name credentials.toml \) -print
+    find "$HOME/.local/share/devin" -maxdepth 1 -name credentials.toml -print
+    find "$HOME/.t3/caches" -maxdepth 1 -name 'acp-auth-*.json' -print
+  } 2>/dev/null || true)"
   if [ -n "$leaked" ]; then
     echo "[bake] provider credential files survived the wipe; refusing to snapshot:" >&2
     echo "$leaked" >&2
@@ -530,7 +537,13 @@ node -e '
 staged_sessions="$sentinel_dir/provider-sessions"
 if [ -d "$staged_sessions" ]; then
   while IFS= read -r -d '' staged; do
-    dest="$userdata_dir/${staged#"$staged_sessions"/}"
+    # Staging mirrors $HOME (e.g. .t3/userdata/providers/..., .local/share/devin/credentials.toml).
+    # Older sentinels staged paths relative to ~/.t3/userdata (providers/...): keep installing those there.
+    rel="${staged#"$staged_sessions"/}"
+    case "$rel" in
+      .*) dest="$HOME/$rel" ;;
+      *) dest="$userdata_dir/$rel" ;;
+    esac
     if ! cmp -s "$staged" "$dest"; then
       (umask 077 && mkdir -p "$(dirname "$dest")")
       install -m 600 "$staged" "$dest"

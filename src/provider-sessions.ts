@@ -17,15 +17,15 @@ import type { SentinelConfig } from "./config.ts";
 import type { SandboxProvider } from "./providers/types.ts";
 
 /**
- * Persists provider sign-ins (e.g. Antigravity's Google OAuth token) across disposable chat VMs.
+ * Persists provider sign-ins (Antigravity's Google OAuth token, Devin's CLI credentials) across disposable chat VMs.
  *
  * - Capture: when a VM reports an instance listed in `t3.persistProviderSessions` as authenticated,
  *   `exec` lists which credential files exist (names and byte counts only), each file is copied out
  *   with the provider's `download` (`boat scp`), and it is stored on the sentinel host under
- *   `<stateDir>/credentials/<instanceId>/<file>` (dir 0700, file 0600, atomic rename). Contents never
+ *   `<stateDir>/credentials/<instanceId>/<name>` (dir 0700, file 0600, atomic rename). Contents never
  *   travel through `exec` output: Boat keeps every command's stdout/stderr in `boat history`.
  * - Inject: fresh VMs get the stored files staged into `~/.t3-sentinel/provider-sessions/` before
- *   `provision-base.sh` runs; the script installs them (0600) under `~/.t3/userdata/` and restarts t3.
+ *   `provision-base.sh` runs; the script installs them (0600) at the same path under `$HOME` before t3 starts.
  * - Forget: sign-out through the Hub or `sentinel forget-session` deletes the stored copy.
  *
  * Credential contents never reach state.json, logs, errors or API responses.
@@ -34,22 +34,36 @@ import type { SandboxProvider } from "./providers/types.ts";
 /** Instance IDs become directory names and shell arguments. */
 export const PROVIDER_INSTANCE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 
-/** Remote root for staged credentials inside a VM; mirrors the layout under `~/.t3/userdata/`. */
+/** Remote root for staged credentials inside a VM; mirrors the layout under the VM user's `$HOME`. */
 export const STAGED_SESSIONS_DIR = "~/.t3-sentinel/provider-sessions";
 
 const MAX_CREDENTIAL_BYTES = 64 * 1024;
 const FILE_NAME_RE = /^[A-Za-z0-9._-]+$/;
+/** Home-relative VM paths: plain segments only (no `..`, no leading `/`), safe inside double quotes. */
+const HOME_PATH_RE = /^(?!.*(?:^|\/)\.\.?(?:\/|$))[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/;
 
 interface CredentialFileSpec {
+  /** File name under `<stateDir>/credentials/<instanceId>/`; also the label the listing prints. */
   name: string;
+  /** Path of the file inside the VM, relative to the VM user's home. */
+  homePath: (instanceId: string) => string;
   /** Returns an ISO expiry to compare tokens by, or null when the content does not parse. */
   expiry?: (content: Buffer) => string | null;
+  /**
+   * Not a credential by itself (e.g. T3's "signed in" marker): captured, stored and staged only
+   * together with a credential file of the same instance.
+   */
+  companion?: boolean;
 }
 
 interface DriverCredentialSpec {
-  /** Directory relative to `~/.t3/userdata/` that holds the credential files for one instance. */
-  userdataDir: (instanceId: string) => string;
   files: CredentialFileSpec[];
+}
+
+interface ResolvedFile {
+  spec: CredentialFileSpec;
+  /** Validated home-relative VM path. */
+  homePath: string;
 }
 
 function sha256Hex(data: string | Buffer): string {
@@ -69,20 +83,54 @@ function antigravityTokenExpiry(content: Buffer): string | null {
 }
 
 /**
- * Credential locations per T3 provider driver. Add a driver here to make it syncable.
- * Antigravity: T3 hashes the instance ID (sha256 hex) into the profile directory and, for
- * `oauth-personal`, forces the CLI to keep its sign-in in a file instead of the OS keyring.
+ * Credential locations per T3 provider driver, or `acpRegistry:<agentId>` for ACP Registry agents
+ * (one driver runs many agents, each storing its sign-in its own way). Add an entry to make it syncable.
+ *
+ * - Antigravity: T3 hashes the instance ID (sha256 hex) into the profile directory and, for
+ *   `oauth-personal`, forces the CLI to keep its sign-in in a file instead of the OS keyring.
+ * - Devin (`acpRegistry:devin`): the Devin CLI keeps its sign-in in `$XDG_DATA_HOME/devin/credentials.toml`
+ *   (`devin auth status` prints this path; T3 spawns `devin acp` with the default XDG dirs), and
+ *   `devin acp` falls back to these stored CLI credentials when the host passes none. The tokens
+ *   do not expire by default, so the last capture wins. T3 itself shows ACP agents as signed in only
+ *   after it confirmed a sign-in, recorded in `~/.t3/caches/acp-auth-<sha256(JSON instance ID)>.json`
+ *   (a binding hash and a boolean, no secret); it travels with the credential so new VMs show
+ *   "Signed in" instead of an unknown status.
  */
 export const DRIVER_CREDENTIALS: Record<string, DriverCredentialSpec> = {
   antigravity: {
-    userdataDir: (instanceId) => `providers/antigravity/${sha256Hex(instanceId)}/antigravity-acp`,
     files: [
-      { name: "antigravity-oauth-token", expiry: antigravityTokenExpiry },
+      {
+        name: "antigravity-oauth-token",
+        homePath: (id) => `${antigravityDir(id)}/antigravity-oauth-token`,
+        expiry: antigravityTokenExpiry,
+      },
       // Legacy name the 1.5 CLI no longer writes; still a credential if present
-      { name: "acp_token.json" },
+      { name: "acp_token.json", homePath: (id) => `${antigravityDir(id)}/acp_token.json` },
+    ],
+  },
+  "acpRegistry:devin": {
+    files: [
+      { name: "credentials.toml", homePath: () => ".local/share/devin/credentials.toml" },
+      { name: "acp-auth.json", homePath: (id) => acpAuthFlagPath(id), companion: true },
     ],
   },
 };
+
+function antigravityDir(instanceId: string): string {
+  return `.t3/userdata/providers/antigravity/${sha256Hex(instanceId)}/antigravity-acp`;
+}
+
+/** T3's per-instance "ACP sign-in confirmed" marker (`makeAcpRegistryAuthenticationState`). */
+function acpAuthFlagPath(instanceId: string): string {
+  return `.t3/caches/acp-auth-${sha256Hex(JSON.stringify(instanceId))}.json`;
+}
+
+/** The spec's files with their VM paths; entries with an unsafe name or path are dropped. */
+function resolveFiles(spec: DriverCredentialSpec, instanceId: string): ResolvedFile[] {
+  return spec.files
+    .map((f) => ({ spec: f, homePath: f.homePath(instanceId) }))
+    .filter((f) => FILE_NAME_RE.test(f.spec.name) && HOME_PATH_RE.test(f.homePath));
+}
 
 export interface StagedCredential {
   instanceId: string;
@@ -109,6 +157,8 @@ export class ProviderSessionStore {
   private readonly baseDir: string;
   private readonly enabled: Set<string>;
   private readonly settingsDrivers = new Map<string, string>();
+  /** ACP Registry instances: instance ID -> `config.agentId` (null for `source: local` agents). */
+  private readonly settingsAgentIds = new Map<string, string | null>();
   private readonly observedDrivers = new Map<string, string>();
   /** `${sandboxId}\0${instanceId}` -> last auth status seen from that VM. */
   private readonly lastStatus = new Map<string, string>();
@@ -132,10 +182,17 @@ export class ProviderSessionStore {
     if (config.t3.settingsFile && existsSync(config.t3.settingsFile)) {
       try {
         const settings = JSON.parse(readFileSync(config.t3.settingsFile, "utf8")) as {
-          providerInstances?: Record<string, { driver?: unknown }>;
+          providerInstances?: Record<string, { driver?: unknown; config?: { agentId?: unknown; source?: unknown } }>;
         };
         for (const [id, inst] of Object.entries(settings.providerInstances ?? {})) {
           if (typeof inst?.driver === "string") this.settingsDrivers.set(id, inst.driver);
+          if (inst?.driver === "acpRegistry") {
+            const agentId = inst.config?.agentId;
+            this.settingsAgentIds.set(
+              id,
+              inst.config?.source !== "local" && typeof agentId === "string" ? agentId : null,
+            );
+          }
         }
       } catch {
         console.warn("[sessions] could not read providerInstances from t3.settingsFile; assuming driver = instance ID");
@@ -151,12 +208,29 @@ export class ProviderSessionStore {
     return [...this.enabled];
   }
 
+  /** `DRIVER_CREDENTIALS` key for an instance: its driver, or `acpRegistry:<agentId>`. */
+  private specKey(instanceId: string): string {
+    // Unknown driver: T3 names registry agents `acpRegistry_<agentId>` by default, other built-ins by driver
+    const driver =
+      this.settingsDrivers.get(instanceId) ??
+      this.observedDrivers.get(instanceId) ??
+      (instanceId.startsWith("acpRegistry_") ? "acpRegistry" : instanceId);
+    if (driver !== "acpRegistry") return driver;
+    // Without a settings entry, fall back to T3's default instance ID for registry agents
+    const agentId = this.settingsAgentIds.has(instanceId)
+      ? this.settingsAgentIds.get(instanceId)
+      : instanceId.startsWith("acpRegistry_")
+        ? instanceId.slice("acpRegistry_".length)
+        : null;
+    return `acpRegistry:${agentId ?? "?"}`;
+  }
+
   private specFor(instanceId: string): DriverCredentialSpec | null {
-    const driver = this.settingsDrivers.get(instanceId) ?? this.observedDrivers.get(instanceId) ?? instanceId;
-    const spec = DRIVER_CREDENTIALS[driver];
+    const specKey = this.specKey(instanceId);
+    const spec = Object.hasOwn(DRIVER_CREDENTIALS, specKey) ? DRIVER_CREDENTIALS[specKey] : undefined;
     if (!spec && !this.warnedDrivers.has(instanceId)) {
       this.warnedDrivers.add(instanceId);
-      console.warn(`[sessions] persistProviderSessions: driver "${driver}" of instance "${instanceId}" is not supported; skipping`);
+      console.warn(`[sessions] persistProviderSessions: "${specKey}" of instance "${instanceId}" is not supported; skipping`);
     }
     return spec ?? null;
   }
@@ -200,26 +274,28 @@ export class ProviderSessionStore {
     return this.enabledInstances().filter((id) => this.storedFiles(id).length > 0);
   }
 
-  private storedFiles(instanceId: string): Array<{ spec: CredentialFileSpec; path: string }> {
+  /** Stored files of an instance; empty unless at least one is a credential (not only a companion). */
+  private storedFiles(instanceId: string): Array<ResolvedFile & { path: string }> {
     const spec = this.specFor(instanceId);
     if (!spec) return [];
     const dir = this.instanceDir(instanceId);
-    return spec.files.map((f) => ({ spec: f, path: join(dir, f.name) })).filter((f) => existsSync(f.path));
+    const files = resolveFiles(spec, instanceId)
+      .map((f) => ({ ...f, path: join(dir, f.spec.name) }))
+      .filter((f) => existsSync(f.path));
+    return files.some((f) => !f.spec.companion) ? files : [];
   }
 
   /** Stored credentials to stage into a fresh VM before `provision-base.sh` runs. */
   stagedCredentials(): StagedCredential[] {
     const out: StagedCredential[] = [];
     for (const instanceId of this.enabledInstances()) {
-      const spec = this.specFor(instanceId);
-      if (!spec) continue;
-      const rel = spec.userdataDir(instanceId);
       for (const f of this.storedFiles(instanceId)) {
+        const remotePath = `${STAGED_SESSIONS_DIR}/${f.homePath}`;
         out.push({
           instanceId,
           localPath: f.path,
-          remoteDir: `${STAGED_SESSIONS_DIR}/${rel}`,
-          remotePath: `${STAGED_SESSIONS_DIR}/${rel}/${f.spec.name}`,
+          remoteDir: remotePath.slice(0, remotePath.lastIndexOf("/")),
+          remotePath,
         });
       }
     }
@@ -294,12 +370,17 @@ export class ProviderSessionStore {
     const spec = this.specFor(instanceId);
     if (!spec || this.suppressed.has(key(sandboxId, instanceId)) || !this.canDownload()) return;
     const gen = this.generation.get(instanceId) ?? 0;
-    const rel = spec.userdataDir(instanceId);
-    const names = spec.files.map((f) => f.name).filter((n) => FILE_NAME_RE.test(n));
-    // Prints "<name> <bytes>" per existing file; `wc -c` outputs only the count
+    const files = resolveFiles(spec, instanceId);
+    const names = files.map((f) => f.spec.name);
+    // Prints "<name> <bytes>" per existing file; `wc -c` outputs only the count. Names and paths are
+    // validated plain segments (`FILE_NAME_RE`, `HOME_PATH_RE`), so they are safe in double quotes.
     const listing =
-      `cd "$HOME/.t3/userdata/${rel}" 2>/dev/null || exit 0; ` +
-      `for f in ${names.join(" ")}; do if [ -f "$f" ]; then printf '%s %s\\n' "$f" $(wc -c <"$f"); fi; done; true`;
+      files
+        .map(
+          (f) =>
+            `if [ -f "$HOME/${f.homePath}" ]; then printf '%s %s\\n' "${f.spec.name}" $(wc -c <"$HOME/${f.homePath}"); fi; `,
+        )
+        .join("") + "true";
 
     // A failed read is retried on the VM's next `authenticated` report
     const allowRetry = () => this.lastStatus.delete(key(sandboxId, instanceId));
@@ -317,15 +398,19 @@ export class ProviderSessionStore {
       allowRetry();
       return;
     }
-    if (present.length === 0) {
+    if (!files.some((f) => !f.spec.companion && present.includes(f.spec.name))) {
       console.log(`[sessions] ${sandboxId} reports ${instanceId} signed in but holds no credential file; nothing stored`);
       allowRetry();
       return;
     }
 
     const found = new Map<string, Buffer>();
-    for (const name of present) {
-      const content = await this.downloadOne(sandboxId, `~/.t3/userdata/${rel}/${name}`, timeoutSecs);
+    for (const f of files) {
+      if (!present.includes(f.spec.name)) continue;
+      const name = f.spec.name;
+      const content = await this.downloadOne(sandboxId, `~/${f.homePath}`, timeoutSecs);
+      // A companion (e.g. a marker T3 is rewriting) never blocks storing the credential itself
+      if (!content && f.spec.companion) continue;
       if (!content) {
         console.warn(`[sessions] could not copy ${instanceId} ${name} from ${sandboxId}`);
         allowRetry();

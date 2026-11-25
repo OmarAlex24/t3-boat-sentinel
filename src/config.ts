@@ -167,9 +167,10 @@ export interface SentinelConfig {
     /** Optional managed provider instance IDs to pre-install into `baseSnapshot` during `bake base` (e.g. ["antigravity"]); every bake verifies them. */
     installProviders?: string[];
     /**
-     * Optional provider instance IDs whose sign-in is kept across chat VMs (e.g. ["antigravity"]).
+     * Optional provider instance IDs whose sign-in is kept across chat VMs (e.g. ["antigravity", "acpRegistry_devin"]).
      * The credential file is captured from a signed-in VM into `<stateDir>/credentials/<instanceId>/`
-     * (0600) and copied into every new VM; never into snapshots. Supported drivers: antigravity.
+     * (0600) and copied into every new VM; never into snapshots. Supported: driver antigravity, and
+     * driver acpRegistry with agentId devin (see `DRIVER_CREDENTIALS`).
      */
     persistProviderSessions?: string[];
   };
