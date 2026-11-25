@@ -13,6 +13,8 @@ import type { KlavClient } from "./klav.ts";
 import { LifecycleManager } from "./lifecycle.ts";
 import { formatRpcFailure } from "./hub-mcp.ts";
 import { buildPlaceholderThread, failPlaceholderThread, placeholderInputFrom } from "./hub-placeholder.ts";
+import { chatThreadIdOf, threadGoneError } from "./hub.ts";
+import { REPO_SYNC_MARKER, buildRepoSyncScript, parseRepoSyncOutput } from "./repo-sync.ts";
 import {
   applySettingsOverlay,
   applySettingsUpdate,
@@ -47,6 +49,8 @@ class MockBoat implements BoatClient {
   resumeGate: Promise<void> | null = null;
   /** When set, `resume` fails with it. */
   resumeError: Error | null = null;
+  /** Answers an exec before the defaults; return undefined to fall through. */
+  execHook?: (id: string, script: string) => Promise<BoatExecResult> | undefined;
   private seq = 1;
 
   async create(name: string, size: string, fromSnapshot?: string): Promise<string> {
@@ -108,6 +112,12 @@ class MockBoat implements BoatClient {
 
   async exec(id: string, script: string): Promise<BoatExecResult> {
     this.execScripts.push(script);
+    const hooked = this.execHook?.(id, script);
+    if (hooked) return hooked;
+    if (script.includes(REPO_SYNC_MARKER)) {
+      // A VM whose workdir is not a checkout, like most fixtures here
+      return { exitCode: 0, stdout: JSON.stringify({ status: "skipped", reason: "not-a-repository" }), stderr: "" };
+    }
     if (script.includes("BAKE_CLEAN=1")) {
       if (this.onBeforeBakeStop) await this.onBeforeBakeStop(id);
       return {
@@ -188,6 +198,12 @@ class MockBoat implements BoatClient {
 
 const tempDirs: string[] = [];
 const cleanups: Array<() => void> = [];
+
+/** The chat a request a fake VM received names, top-level or in `resource`. */
+function extractThreadIdForTest(payload: unknown): string | undefined {
+  const p = (payload ?? {}) as { threadId?: string; resource?: { threadId?: string } };
+  return p.threadId ?? p.resource?.threadId;
+}
 
 function makeTestConfig(port = 0): SentinelConfig {
   const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-test-"));
@@ -908,8 +924,11 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       lateShellItemAfterReject?: boolean;
       /** Fail `orchestration.getThreadProjection` (the Hub then has no copy of a sleeping chat). */
       failProjection?: boolean;
+      /** Attachment ids this VM holds: `assets.createUrl` for any other attachment fails as T3 does. */
+      attachments?: string[];
     } = {},
   ) {
+    let assetSeq = 0;
     let vmSettings = (opts.configSnapshot?.settings ?? null) as Record<string, unknown> | null;
     const seenMethods: Array<{ tag: string; payload: unknown }> = [];
     const acks: string[] = [];
@@ -1128,6 +1147,15 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
             );
             return;
           }
+          if (frame.tag === "assets.createUrl") {
+            const resource = (frame.payload?.resource ?? {}) as Record<string, unknown>;
+            const exit =
+              resource._tag === "attachment" && !(opts.attachments ?? []).includes(String(resource.attachmentId))
+                ? { _tag: "Failure", cause: [{ _tag: "Fail", error: { _tag: "AssetAttachmentNotFoundError", resource } }] }
+                : { _tag: "Success", value: { relativeUrl: `/api/assets/tok-${vmTag}-${++assetSeq}/image.png`, expiresAt: 1 } };
+            ws.sendText(JSON.stringify({ _tag: "Exit", requestId: frame.id, exit }));
+            return;
+          }
           if (frame.tag === "terminal.open") {
             ws.sendText(
               JSON.stringify({
@@ -1230,7 +1258,12 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
   async function startHubWithVm(
     vm: ReturnType<typeof startFakeVmT3Server>,
     dirPrefix: string,
-    opts: { persistProviderSessions?: string[]; beforeStart?: (dir: string) => void; maxSandboxes?: number } = {},
+    opts: {
+      persistProviderSessions?: string[];
+      beforeStart?: (dir: string) => void;
+      patchConfig?: (cfg: SentinelConfig) => SentinelConfig;
+      maxSandboxes?: number;
+    } = {},
   ) {
     const dir = mkdtempSync(join(tmpdir(), dirPrefix));
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
@@ -1239,12 +1272,13 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     boat.snapshots.add("env-my-app");
     boat.upstreamBaseUrl = vm.url;
     const base = makeTestConfig(0);
-    const cfg: SentinelConfig = {
+    const unpatched: SentinelConfig = {
       ...base,
       stateDir: dir,
       t3: { ...base.t3, ...(opts.persistProviderSessions ? { persistProviderSessions: opts.persistProviderSessions } : {}) },
       hub: { host: "boat.boat.example.com", label: "Boat", maxSandboxes: opts.maxSandboxes ?? 5 },
     };
+    const cfg = opts.patchConfig ? opts.patchConfig(unpatched) : unpatched;
     opts.beforeStart?.(dir);
     const handle = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
     handle.lifecycle.providerSessions.debounceMs = 10;
@@ -1595,6 +1629,74 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       const shell = await client2.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "shell");
       const threads = (shell.values as Array<{ snapshot: { threads: Array<{ id: string }> } }>)[0].snapshot.threads;
       expect(threads.map((t) => t.id)).toContain("thread-s");
+    });
+
+    test("chat-scoped RPCs for a booting chat wait for its VM instead of failing as gone; the boot logs its sync phase", async () => {
+      const vm = startFakeVmT3Server("vm-scoped");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-scoped-");
+      boat.execHook = (_id, script) =>
+        script.includes(REPO_SYNC_MARKER)
+          ? Promise.resolve({
+              exitCode: 0,
+              stdout: JSON.stringify({ status: "synced", reason: "", from: "a".repeat(40), to: "b".repeat(40), branch: "main", discarded: 0 }),
+              stderr: "",
+            })
+          : undefined;
+      const release = holdCreate(boat);
+      cleanups.push(release);
+      const logs: string[] = [];
+      const origLog = console.log;
+      console.log = (...args: unknown[]) => {
+        logs.push(args.map(String).join(" "));
+        origLog(...args);
+      };
+      cleanups.push(() => (console.log = origLog));
+      const client = await connectHubClient(handle, cfg);
+      const hubProjectId = await subscribeHubShell(client);
+
+      client.request("launch", "orchestration.launchThread", clientLaunchPayload("thread-sc", hubProjectId));
+      expect(exitOf(await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "launch"))._tag).toBe("Success");
+      client.request("secret", "secrets.answerRequest", { threadId: "thread-sc", turnItemId: "ti-1", answer: { type: "decline" } });
+      await Bun.sleep(100);
+      // Not the "VM gone" error: it waits for the VM
+      expect(client.inbox.some((f) => f._tag === "Exit" && f.requestId === "secret")).toBe(false);
+
+      release();
+      expect(exitOf(await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "secret"))._tag).toBe("Success");
+      const secretIdx = vm.seenMethods.findIndex((m) => m.tag === "secrets.answerRequest");
+      expect(secretIdx).toBeGreaterThan(vm.seenMethods.findIndex((m) => m.tag === "orchestration.launchThread"));
+      // Sync-to-remote still runs in the background boot, before T3 starts, and is its own timed phase
+      expect(boat.execScripts.some((s) => s.includes(REPO_SYNC_MARKER))).toBe(true);
+      const ready = logs.find((l) => l.includes("ready for thread=thread-sc"));
+      expect(ready).toMatch(/create=\d+ms .*provision=\d+ms sync=\d+ms .*total=\d+ms/);
+    });
+
+    test("a chat-scoped RPC for a sleeping chat wakes its VM; a chat whose start failed gets the gone error", async () => {
+      const vm = startFakeVmT3Server("vm-scoped-sleep");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-scoped-sleep-");
+      const client = await connectHubClient(handle, cfg);
+      await launchThreadOnHub(client, "thread-ss");
+      const sandboxId = handle.state.listHubSandboxes()[0].sandboxId;
+      await handle.hub!.sleepHubSandbox(sandboxId);
+
+      client.request("secret", "secrets.answerRequest", { threadId: "thread-ss", turnItemId: "ti-1", answer: { type: "decline" } });
+      expect(exitOf(await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "secret"))._tag).toBe("Success");
+      expect(boat.resumed).toEqual([sandboxId]);
+      expect(vm.seenMethods.some((m) => m.tag === "secrets.answerRequest")).toBe(true);
+
+      boat.createError = new Error("no capacity");
+      const hubProjectId = handle.state.getHubSandbox(sandboxId)!.hubProjectId;
+      client.request("launch-f", "orchestration.launchThread", clientLaunchPayload("thread-sf", hubProjectId));
+      await client.waitForFrame(shellThreadUpdate("thread-sf", (t) => t.status === "failed"));
+      client.request("secret-f", "secrets.answerRequest", { threadId: "thread-sf", turnItemId: "ti-2", answer: { type: "decline" } });
+      const gone = exitOf(await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "secret-f")) as unknown as {
+        _tag: string;
+        cause: Array<{ error?: { _tag: string } }>;
+      };
+      expect(gone._tag).toBe("Failure");
+      expect(gone.cause[0].error?._tag).toBe("SecretRequestError");
     });
 
     test("a failed chat stays even if its VM reports the thread after the failure", async () => {
@@ -2891,6 +2993,157 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     });
   });
 
+  test("a new chat VM syncs its repo before .env, bootCmd and T3; a resumed VM is never synced", async () => {
+    const vm = startFakeVmT3Server("vm-sync");
+    cleanups.push(() => vm.server.stop(true));
+    const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-sync-", {
+      // With the LLM proxy, waking a VM re-enters provisioning: the one wake path that could sync
+      patchConfig: (c) => ({ ...c, llmProxy: { host: "boat-llm.boat.example.com", upstreamUrl: "http://127.0.0.1:1", upstreamApiKey: "k" } }),
+    });
+    boat.execHook = (_id, script) =>
+      script.includes(REPO_SYNC_MARKER)
+        ? Promise.resolve({
+            exitCode: 0,
+            stdout: JSON.stringify({ status: "synced", reason: "", from: "a".repeat(40), to: "b".repeat(40), branch: "main", discarded: 2 }),
+            stderr: "",
+          })
+        : undefined;
+    const client = await connectHubClient(handle, cfg);
+    client.request("setup", "subscribeWorktreeSetup", { threadId: "thread-sync" });
+    await launchThreadOnHub(client, "thread-sync");
+
+    const syncAt = boat.execScripts.findIndex((s) => s.includes(REPO_SYNC_MARKER));
+    expect(syncAt).toBeGreaterThanOrEqual(0);
+    expect(boat.execScripts.filter((s) => s.includes(REPO_SYNC_MARKER)).length).toBe(1);
+    expect(syncAt).toBeLessThan(boat.execScripts.indexOf("git fetch origin")); // the project's bootCmd
+    expect(syncAt).toBeLessThan(boat.execScripts.findIndex((s) => s.includes("provision-base.sh")));
+    expect(boat.execScripts[syncAt]).toContain("'/home/user/my-app'");
+    // The chat's setup panel says which commit it starts on
+    const done = await client.waitForFrame(
+      (f) => f._tag === "Chunk" && f.requestId === "setup" && JSON.stringify(f.values).includes('"phase":"done"'),
+    );
+    expect(JSON.stringify(done.values)).toContain("ready on origin/main (bbbbbbb)");
+
+    await handle.hub!.sleepHubSandbox("sb-1");
+    expect(handle.state.getHubSandbox("sb-1")?.phase).toBe("sleeping");
+    const provisionsBefore = boat.execScripts.filter((s) => s.includes("provision-base.sh")).length;
+    await handle.hub!.wakeHubSandbox("sb-1");
+    expect(boat.execScripts.filter((s) => s.includes("provision-base.sh")).length).toBe(provisionsBefore + 1);
+    expect(boat.execScripts.filter((s) => s.includes(REPO_SYNC_MARKER)).length).toBe(1);
+  });
+
+  test("a sync that hangs past its timeout does not hold the chat: the VM boots on the snapshot's code", async () => {
+    const vm = startFakeVmT3Server("vm-sync-hang");
+    cleanups.push(() => vm.server.stop(true));
+    const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-sync-hang-");
+    handle.lifecycle.repoSyncTimeoutMs = 300;
+    boat.execHook = (_id, script) => (script.includes(REPO_SYNC_MARKER) ? new Promise<BoatExecResult>(() => {}) : undefined);
+    const client = await connectHubClient(handle, cfg);
+    client.request("setup", "subscribeWorktreeSetup", { threadId: "thread-hang" });
+    const started = Date.now();
+    await launchThreadOnHub(client, "thread-hang");
+    expect(Date.now() - started).toBeLessThan(4_000);
+    expect(handle.state.getHubSandbox("sb-1")?.phase).toBe("running");
+    expect(boat.execScripts.some((s) => s.includes("provision-base.sh"))).toBe(true);
+    const done = await client.waitForFrame(
+      (f) => f._tag === "Chunk" && f.requestId === "setup" && JSON.stringify(f.values).includes('"phase":"done"'),
+    );
+    expect(JSON.stringify(done.values)).toContain("could not be updated from origin (timeout)");
+  });
+
+  test("no sync when the project opts out, or when the VM clones the repo itself (no project snapshot)", async () => {
+    const vm = startFakeVmT3Server("vm-sync-off");
+    cleanups.push(() => vm.server.stop(true));
+    const off = await startHubWithVm(vm, "t3-sentinel-hub-sync-off-", {
+      patchConfig: (c) => ({ ...c, projects: { "my-app": { ...c.projects["my-app"], syncToRemoteOnStart: false } } }),
+    });
+    await off.handle.hub!.spawnSandboxForThread("my-app", "thread-off");
+    expect(off.boat.execScripts.some((s) => s.includes(REPO_SYNC_MARKER))).toBe(false);
+
+    const clone = await startHubWithVm(vm, "t3-sentinel-hub-sync-clone-");
+    clone.boat.snapshots.delete("env-my-app"); // falls back to base-t3 + bakeCmd at boot
+    await clone.handle.hub!.spawnSandboxForThread("my-app", "thread-clone");
+    expect(clone.boat.created[0].from).toBe("base-t3");
+    expect(clone.boat.execScripts.some((s) => s.includes(REPO_SYNC_MARKER))).toBe(false);
+  });
+
+  test("chat-scoped RPCs with no explicit route reach only their chat's VM; a gone VM gets a typed error, never another VM", async () => {
+    const vm1 = startFakeVmT3Server("vm1");
+    const vm2 = startFakeVmT3Server("vm2", { attachments: ["att-on-vm2"] });
+    cleanups.push(() => vm1.server.stop(true));
+    cleanups.push(() => vm2.server.stop(true));
+    const { cfg, handle, boat } = await startHubWithVm(vm1, "t3-sentinel-hub-chat-routing-");
+    boat.hostPublic = async (id: string) => (id === "sb-2" ? vm2.url : vm1.url);
+    const client = await connectHubClient(handle, cfg);
+    // Launched in order: thread-A -> sb-1 (vm1, also the VM the generic fallback picks), thread-B -> sb-2 (vm2)
+    await launchThreadOnHub(client, "thread-A");
+    const hubProjectId = handle.state.getHubSandbox("sb-1")!.hubProjectId;
+    client.request("launch-thread-B", "orchestration.launchThread", { threadId: "thread-B", projectId: hubProjectId, title: "B", workspaceStrategy: { type: "root" } });
+    expect(((await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "launch-thread-B")).exit as Record<string, unknown>)._tag).toBe("Success");
+    expect(handle.state.getHubSandbox("sb-1")?.threadIds).toEqual(["thread-A"]);
+    expect(handle.state.getHubSandbox("sb-2")?.threadIds).toEqual(["thread-B"]);
+    const seen = (vm: ReturnType<typeof startFakeVmT3Server>, tag: string) =>
+      vm.seenMethods.filter((m) => m.tag === tag).map((m) => extractThreadIdForTest(m.payload));
+    const exitOf = async (id: string) => (await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === id)).exit as Record<string, unknown>;
+    const hubBase = `http://127.0.0.1:${handle.server.port}`;
+
+    // 1. assets.createUrl nests the chat in `resource.threadId`: each chat's image is signed by its own VM
+    client.request("asset-b", "assets.createUrl", { resource: { _tag: "media-file", threadId: "thread-B", path: "/home/user/.t3/userdata/providers/antigravity/h/image.png" } });
+    client.request("asset-a", "assets.createUrl", { resource: { _tag: "tool-output-image", threadId: "thread-A", itemId: "item-1", index: 0 } });
+    const assetB = await exitOf("asset-b");
+    const assetA = await exitOf("asset-a");
+    expect((assetB.value as { relativeUrl: string }).relativeUrl).toStartWith("/api/assets/tok-vm2-");
+    expect((assetA.value as { relativeUrl: string }).relativeUrl).toStartWith("/api/assets/tok-vm1-");
+    expect(seen(vm1, "assets.createUrl")).toEqual(["thread-A"]);
+    expect(seen(vm2, "assets.createUrl")).toEqual(["thread-B"]);
+    // ...and the token it issued still routes the image GET back to that VM
+    const imgB = await fetch(`${hubBase}${(assetB.value as { relativeUrl: string }).relativeUrl}`, { headers: { host: cfg.hub!.host } });
+    expect(((await imgB.json()) as { vmTag: string }).vmTag).toBe("vm2");
+
+    // 2. A secret typed into thread-B's card goes to vm2 only, and thread-A's to vm1 only
+    client.request("secret-b", "secrets.answerRequest", { threadId: "thread-B", turnItemId: "ti-b", answer: { type: "save", secret: "s3cret-b" } });
+    client.request("secret-a", "secrets.answerRequest", { threadId: "thread-A", turnItemId: "ti-a", answer: { type: "decline" } });
+    expect((await exitOf("secret-b"))._tag).toBe("Success");
+    expect((await exitOf("secret-a"))._tag).toBe("Success");
+    expect(seen(vm1, "secrets.answerRequest")).toEqual(["thread-A"]);
+    expect(seen(vm2, "secrets.answerRequest")).toEqual(["thread-B"]);
+    expect(JSON.stringify(vm1.seenMethods)).not.toContain("s3cret-b");
+
+    // 3. An attachment the Hub can't place: each VM is asked in turn; the one holding it signs the URL
+    client.request("att", "assets.createUrl", { resource: { _tag: "attachment", attachmentId: "att-on-vm2", disposition: "inline" } });
+    const att = await exitOf("att");
+    expect((att.value as { relativeUrl: string }).relativeUrl).toStartWith("/api/assets/tok-vm2-");
+    const attGet = await fetch(`${hubBase}${(att.value as { relativeUrl: string }).relativeUrl}`, { headers: { host: cfg.hub!.host } });
+    expect(((await attGet.json()) as { vmTag: string }).vmTag).toBe("vm2");
+    client.request("att-missing", "assets.createUrl", { resource: { _tag: "attachment", attachmentId: "att-nowhere" } });
+    expect((await exitOf("att-missing")).cause).toEqual([
+      { _tag: "Fail", error: { _tag: "AssetAttachmentNotFoundError", resource: { _tag: "attachment", attachmentId: "att-nowhere" } } },
+    ]);
+
+    // 4. A pull request review thread id is not a chat: still served by any VM
+    client.request("pr", "pullRequests.threadComments", { cwd: "/home/user/my-app", number: 1, threadId: "PRRT_kw" });
+    expect((await exitOf("pr"))._tag).toBe("Success");
+
+    // 5. thread-B's VM goes away; vm1 keeps running and must see none of thread-B's requests
+    await handle.hub!.destroyHubSandbox("sb-2", "test");
+    const vm1Before = vm1.seenMethods.length;
+    const mediaB = { _tag: "media-file", threadId: "thread-B", path: "/home/user/.t3/userdata/providers/antigravity/h/image.png" };
+    client.request("gone-asset", "assets.createUrl", { resource: mediaB });
+    client.request("gone-secret", "secrets.answerRequest", { threadId: "thread-B", turnItemId: "ti-b", answer: { type: "save", secret: "s3cret-late" } });
+    client.request("gone-peer", "peerLinks.answerRequest", { threadId: "thread-B", turnItemId: "ti-p", answer: { type: "decline" } });
+    client.request("gone-preview", "preview.open", { threadId: "thread-B" });
+    client.request("gone-list", "preview.list", { threadId: "thread-B" });
+    expect((await exitOf("gone-asset")).cause).toEqual([{ _tag: "Fail", error: { _tag: "AssetWorkspaceContextNotFoundError", resource: mediaB } }]);
+    expect((await exitOf("gone-secret")).cause).toEqual([{ _tag: "Fail", error: { _tag: "SecretRequestError", reason: "not_found" } }]);
+    expect((await exitOf("gone-peer")).cause).toEqual([{ _tag: "Fail", error: { _tag: "PeerLinkRequestError", reason: "not_found" } }]);
+    const previewCause = (await exitOf("gone-preview")).cause as Array<{ _tag: string; defect?: string }>;
+    expect(previewCause[0]._tag).toBe("Die");
+    expect(previewCause[0].defect).toContain("no longer exists");
+    expect((await exitOf("gone-list")).value).toEqual({ sessions: [], serverEpoch: "boat-hub", revision: 0 });
+    expect(JSON.stringify(vm1.seenMethods.slice(vm1Before))).not.toContain("thread-B");
+    expect(JSON.stringify(vm1.seenMethods)).not.toContain("s3cret-late");
+  });
+
   test("spawns 1 fresh Boat VM per chat behind 1 single Environment, routes RPCs strictly to owning VM, and destroys only the settled VM", async () => {
     const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-hub-"));
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
@@ -4096,6 +4349,145 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     expect(added.structuredContent.ok).toBe(true);
     expect(added.structuredContent.fallbackReady).toBe(true);
     expect((added.structuredContent.repositoryIdentity as { owner: string; name: string }).name).toBe("new-svc");
+  });
+});
+
+describe("chat routing helpers", () => {
+  test("finds the chat top-level or in an asset resource, and skips ids that are not chats", () => {
+    expect(chatThreadIdOf("secrets.answerRequest", { threadId: "t1", turnItemId: "i" })).toBe("t1");
+    expect(chatThreadIdOf("assets.createUrl", { resource: { _tag: "media-file", threadId: "t2", path: "a.png" } })).toBe("t2");
+    expect(chatThreadIdOf("assets.createUrl", { resource: { _tag: "draft-workspace-file", cwd: "/w", path: "a.png" } })).toBeNull();
+    expect(chatThreadIdOf("assets.createUrl", { resource: { _tag: "attachment", attachmentId: "x" } })).toBeNull();
+    expect(chatThreadIdOf("pullRequests.replyToThread", { threadId: "PRRT_1", body: "ok" })).toBeNull();
+    expect(chatThreadIdOf("peerLinks.subscribeThread", { environmentId: "e", threadId: "t3" })).toBeNull();
+    expect(chatThreadIdOf("peerLinks.answerRequest", { threadId: "t4", turnItemId: "i", answer: { type: "decline" } })).toBe("t4");
+  });
+
+  test("gone-VM errors are members of each RPC's own error union", () => {
+    expect(threadGoneError("agentFeedback.answerRequest", { threadId: "t" })).toEqual({ _tag: "AgentFeedbackRequestError", reason: "not_found" });
+    expect(threadGoneError("guestShare.create", { threadId: "t" })).toEqual({ _tag: "GuestShareCreateError", reason: "thread_unavailable" });
+    expect(threadGoneError("mcpApps.callTool", { threadId: "t", itemId: "i" })).toEqual({ _tag: "McpAppRequestError", threadId: "t", reason: "session-stopped" });
+    expect(threadGoneError("provider.mcpSignIn.start", { threadId: "t", server: "linear" })?._tag).toBe("ProviderMcpSignInError");
+    expect(threadGoneError("provider.uploadFeedback", { threadId: "t" })).toEqual({ _tag: "ProviderUploadFeedbackError", threadId: "t" });
+    // No fitting member: the caller sends an untyped Die
+    expect(threadGoneError("device.open", { threadId: "t" })).toBeNull();
+  });
+});
+
+describe("repo sync to remote (fresh chat VMs)", () => {
+  // Real git, isolated from the machine's config
+  const gitEnv = {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_AUTHOR_NAME: "t",
+    GIT_AUTHOR_EMAIL: "t@example.com",
+    GIT_COMMITTER_NAME: "t",
+    GIT_COMMITTER_EMAIL: "t@example.com",
+  };
+  const git = (cwd: string, ...args: string[]) => {
+    const r = Bun.spawnSync(["git", ...args], { cwd, env: gitEnv });
+    if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr.toString()}`);
+    return r.stdout.toString().trim();
+  };
+  const runSync = (workdir: string, keep: string[] = []) => {
+    const r = Bun.spawnSync(["bash", "-c", buildRepoSyncScript(workdir, 30, keep)], { env: gitEnv });
+    return { result: parseRepoSyncOutput(r.stdout.toString()), raw: r.stdout.toString() + r.stderr.toString() };
+  };
+
+  /** An origin with `main`, a pusher clone, and a "snapshot" checkout baked from it. */
+  function setupRepos() {
+    const root = mkdtempSync(join(tmpdir(), "t3-sentinel-sync-"));
+    tempDirs.push(root);
+    const origin = join(root, "origin.git");
+    git(root, "init", "-q", "--bare", "-b", "main", origin);
+    const pusher = join(root, "pusher");
+    git(root, "clone", "-q", origin, pusher);
+    git(pusher, "checkout", "-q", "-b", "main");
+    writeFileSync(join(pusher, "app.ts"), "v1\n");
+    writeFileSync(join(pusher, ".gitignore"), "node_modules/\n");
+    writeFileSync(join(pusher, "bun.lock"), "lock-v1\n");
+    git(pusher, "add", ".");
+    git(pusher, "commit", "-q", "-m", "v1");
+    git(pusher, "push", "-q", "origin", "main");
+    const work = join(root, "work");
+    git(root, "clone", "-q", origin, work);
+    const pushNew = (content: string) => {
+      writeFileSync(join(pusher, "app.ts"), content);
+      git(pusher, "commit", "-q", "-am", content.trim());
+      git(pusher, "push", "-q", "origin", "main");
+      return git(pusher, "rev-parse", "HEAD");
+    };
+    return { root, origin, work, pushNew };
+  }
+
+  test("a dirty snapshot is reset to origin's default branch; ignored caches and sentinel's files survive", () => {
+    const { work, pushNew } = setupRepos();
+    const baked = git(work, "rev-parse", "HEAD");
+    // What a bake leaves: a rewritten lockfile, a stray file, an installed cache
+    writeFileSync(join(work, "bun.lock"), "lock-rewritten-by-install\n");
+    writeFileSync(join(work, "stray.log"), "x\n");
+    mkdirSync(join(work, "node_modules", "pkg"), { recursive: true });
+    writeFileSync(join(work, "node_modules", "pkg", "index.js"), "cached\n");
+    writeFileSync(join(work, "sentinel-placed.json"), "{}\n");
+    const latest = pushNew("v2\n");
+
+    const { result, raw } = runSync(work, [join(work, "sentinel-placed.json")]);
+    // bun.lock and stray.log; the kept file is not counted
+    expect(result).toEqual({ status: "synced", from: baked, to: latest, branch: "main", discarded: 2 });
+    expect(readFileSync(join(work, "app.ts"), "utf8")).toBe("v2\n");
+    expect(readFileSync(join(work, "bun.lock"), "utf8")).toBe("lock-v1\n");
+    expect(existsSync(join(work, "stray.log"))).toBe(false);
+    expect(existsSync(join(work, "node_modules", "pkg", "index.js"))).toBe(true);
+    expect(existsSync(join(work, "sentinel-placed.json"))).toBe(true);
+    expect(git(work, "status", "--porcelain")).toBe("?? sentinel-placed.json");
+    // Only SHAs, a branch and a count: no paths, no remote URL
+    expect(raw).not.toContain(work);
+    expect(raw).not.toContain("origin.git");
+  });
+
+  test("a diverged snapshot on another branch ends on origin's default branch, tracking it", () => {
+    const { work, pushNew } = setupRepos();
+    git(work, "checkout", "-q", "-b", "bake-branch");
+    writeFileSync(join(work, "app.ts"), "local\n");
+    git(work, "commit", "-q", "-am", "local-only");
+    const local = git(work, "rev-parse", "HEAD");
+    const latest = pushNew("v3\n");
+
+    const { result } = runSync(work);
+    expect(result).toEqual({ status: "synced", from: local, to: latest, branch: "main", discarded: 0 });
+    expect(git(work, "rev-parse", "--abbrev-ref", "HEAD")).toBe("main");
+    expect(git(work, "rev-parse", "--abbrev-ref", "main@{upstream}")).toBe("origin/main");
+  });
+
+  test("skips what is not a fresh checkout of a remote, and reports a failed fetch without the URL", () => {
+    const { root, work } = setupRepos();
+    expect(runSync(join(root, "missing")).result).toEqual({ status: "skipped", reason: "no-workdir" });
+    const plain = join(root, "plain");
+    mkdirSync(plain);
+    expect(runSync(plain).result).toEqual({ status: "skipped", reason: "not-a-repository" });
+    mkdirSync(join(work, "sub"));
+    expect(runSync(join(work, "sub")).result).toEqual({ status: "skipped", reason: "not-repo-root" });
+    const local = join(root, "local-only");
+    git(root, "init", "-q", "-b", "main", local);
+    expect(runSync(local).result).toEqual({ status: "skipped", reason: "no-origin" });
+
+    git(work, "remote", "set-url", "origin", "https://x-access-token:ghs_secret@127.0.0.1:1/nope.git");
+    const before = git(work, "rev-parse", "HEAD");
+    writeFileSync(join(work, "stray.log"), "x\n");
+    const failed = runSync(work);
+    expect(failed.result).toEqual({ status: "failed", reason: "fetch-failed" });
+    expect(failed.raw).not.toContain("ghs_secret");
+    // Nothing was touched
+    expect(git(work, "rev-parse", "HEAD")).toBe(before);
+    expect(existsSync(join(work, "stray.log"))).toBe(true);
+  });
+
+  test("unexpected output is a failure, never a throw", () => {
+    expect(parseRepoSyncOutput("")).toEqual({ status: "failed", reason: "no-result" });
+    expect(parseRepoSyncOutput("{not json")).toEqual({ status: "failed", reason: "no-result" });
+    expect(parseRepoSyncOutput(JSON.stringify({ status: "synced", to: "zz", branch: "main" }))).toEqual({ status: "failed", reason: "no-result" });
   });
 });
 
