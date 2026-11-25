@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type {
+  CommandOptions,
   CreateSandboxOptions,
   ExecResult,
   ExposedEndpoint,
@@ -51,8 +52,13 @@ export class BoatProvider implements SandboxProvider, LegacyBoatClient {
     return "boat";
   }
 
-  private async output(args: string[], timeoutMs: number): Promise<{ ok: boolean; stdout: string; stderr: string }> {
+  private async output(
+    args: string[],
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<{ ok: boolean; stdout: string; stderr: string }> {
     const sub = args[0] ?? "";
+    if (signal?.aborted) throw new Error(`boat ${sub} aborted`);
     const proc = Bun.spawn([this.bin, "--json", ...args], {
       stdout: "pipe",
       stderr: "pipe",
@@ -66,23 +72,36 @@ export class BoatProvider implements SandboxProvider, LegacyBoatClient {
         // ignore
       }
     }, timeoutMs);
+    // A cancelled caller kills the local `boat` process instead of leaving it to run out its timeout
+    const onAbort = () => {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // ignore
+      }
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
 
+    let result: { ok: boolean; stdout: string; stderr: string };
     try {
       const [stdout, stderr, exitCode] = await Promise.all([
         new Response(proc.stdout).text(),
         new Response(proc.stderr).text(),
         proc.exited,
       ]);
-      return { ok: exitCode === 0, stdout, stderr };
+      result = { ok: exitCode === 0, stdout, stderr };
     } catch (err) {
       throw new Error(`boat ${sub} failed: ${String(err)}`);
     } finally {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
     }
+    if (signal?.aborted) throw new Error(`boat ${sub} aborted`);
+    return result;
   }
 
-  private async run(args: string[], timeoutMs: number): Promise<string> {
-    const res = await this.output(args, timeoutMs);
+  private async run(args: string[], timeoutMs: number, signal?: AbortSignal): Promise<string> {
+    const res = await this.output(args, timeoutMs, signal);
     if (!res.ok) {
       const sub = args[0] ?? "";
       const detail = (res.stderr.trim() || res.stdout.trim()).slice(0, 600);
@@ -218,10 +237,11 @@ export class BoatProvider implements SandboxProvider, LegacyBoatClient {
     return { url: baseUrl, headers };
   }
 
-  async exec(id: string, script: string, timeoutSecs = 120): Promise<ExecResult> {
+  async exec(id: string, script: string, timeoutSecs = 120, opts?: CommandOptions): Promise<ExecResult> {
     const res = await this.output(
       ["exec", id, "--timeout", String(timeoutSecs), "--", "bash", "-lc", script],
       (timeoutSecs + 60) * 1000,
+      opts?.signal,
     );
     try {
       const v = BoatProvider.lastJson<{ exitCode?: number | null; stdout?: string; stderr?: string }>(res.stdout);
@@ -235,8 +255,8 @@ export class BoatProvider implements SandboxProvider, LegacyBoatClient {
     }
   }
 
-  async execOk(id: string, script: string, timeoutSecs = 120): Promise<string> {
-    const r = await this.exec(id, script, timeoutSecs);
+  async execOk(id: string, script: string, timeoutSecs = 120, opts?: CommandOptions): Promise<string> {
+    const r = await this.exec(id, script, timeoutSecs, opts);
     if (r.exitCode !== 0) {
       const detail = (r.stderr.trim() || r.stdout.trim()).slice(-600);
       throw new Error(`remote command failed (exit ${r.exitCode}): ${detail}`);
@@ -244,8 +264,8 @@ export class BoatProvider implements SandboxProvider, LegacyBoatClient {
     return r.stdout;
   }
 
-  async upload(id: string, localPath: string, remotePath: string): Promise<void> {
-    await this.run(["scp", localPath, `${id}:${remotePath}`], 1800_000);
+  async upload(id: string, localPath: string, remotePath: string, opts?: CommandOptions): Promise<void> {
+    await this.run(["scp", localPath, `${id}:${remotePath}`], 1800_000, opts?.signal);
   }
 
   /** `boat scp <id>:<remote> <local>`: the bytes travel as a file transfer, not as `boat exec` output. */

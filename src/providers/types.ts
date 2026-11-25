@@ -24,6 +24,10 @@ export interface ExposedEndpoint {
   expiresAt?: string;
 }
 
+export interface CommandOptions {
+  signal?: AbortSignal;
+}
+
 export interface CreateSandboxOptions {
   name: string;
   size: string;
@@ -57,9 +61,10 @@ export interface SandboxProvider {
     opts?: { visibility?: "private" | "public" },
   ): Promise<ExposedEndpoint>;
 
-  exec(id: string, script: string, timeoutSecs?: number): Promise<ExecResult>;
-  execOk(id: string, script: string, timeoutSecs?: number): Promise<string>;
-  upload(id: string, localPath: string, remotePath: string): Promise<void>;
+  /** `opts.signal` stops waiting on the command; providers that can also stop it remotely or locally do so. */
+  exec(id: string, script: string, timeoutSecs?: number, opts?: CommandOptions): Promise<ExecResult>;
+  execOk(id: string, script: string, timeoutSecs?: number, opts?: CommandOptions): Promise<string>;
+  upload(id: string, localPath: string, remotePath: string, opts?: CommandOptions): Promise<void>;
   /**
    * Copies one file out of the sandbox by file transfer, never through command output (which
    * providers such as Boat keep in their command history). Optional: providers without a
@@ -95,9 +100,9 @@ export interface LegacyBoatClient {
   saveSnapshot(id: string, name: string): Promise<void>;
   namedSnapshots(): Promise<string[]>;
   hostPublic(id: string, port: number): Promise<string>;
-  exec(id: string, script: string, timeoutSecs?: number): Promise<ExecResult>;
-  execOk(id: string, script: string, timeoutSecs?: number): Promise<string>;
-  upload(id: string, localPath: string, remotePath: string): Promise<void>;
+  exec(id: string, script: string, timeoutSecs?: number, opts?: CommandOptions): Promise<ExecResult>;
+  execOk(id: string, script: string, timeoutSecs?: number, opts?: CommandOptions): Promise<string>;
+  upload(id: string, localPath: string, remotePath: string, opts?: CommandOptions): Promise<void>;
   download?(id: string, remotePath: string, localPath: string, timeoutSecs?: number): Promise<void>;
 }
 
@@ -116,9 +121,9 @@ export function asSandboxProvider(client: SandboxProvider | LegacyBoatClient): S
     list: () => client.list(),
     delete: (id) => client.delete(id),
     exposePort: async (id, port) => ({ url: await client.hostPublic(id, port) }),
-    exec: (id, script, timeoutSecs) => client.exec(id, script, timeoutSecs),
-    execOk: (id, script, timeoutSecs) => client.execOk(id, script, timeoutSecs),
-    upload: (id, localPath, remotePath) => client.upload(id, localPath, remotePath),
+    exec: (id, script, timeoutSecs, opts) => client.exec(id, script, timeoutSecs, opts),
+    execOk: (id, script, timeoutSecs, opts) => client.execOk(id, script, timeoutSecs, opts),
+    upload: (id, localPath, remotePath, opts) => client.upload(id, localPath, remotePath, opts),
     ...(typeof client.download === "function"
       ? {
           download: (id: string, remotePath: string, localPath: string, timeoutSecs?: number) =>
