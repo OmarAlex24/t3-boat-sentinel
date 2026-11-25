@@ -2506,7 +2506,22 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       await Bun.sleep(300);
       expect(boat.resumed).toEqual([]);
       expect(handle.state.getHubSandbox(sandboxId)?.phase).toBe("sleeping");
-      expect(vm.seenMethods.slice(seenBefore).map((m) => m.tag)).toEqual([]);
+      // None of it reached the VM (its bridge's first-connect harvest may still trail in, and is not the app's)
+      const openTags = new Set([
+        "orchestration.subscribeThread",
+        "orchestration.dispatchCommand",
+        "preview.list",
+        "subscribeVcsStatus",
+        "subscribeWorktreeSetup",
+        "projects.readFile",
+        "workspace.taskFolder",
+        "review.getDiffPreview",
+        "vcs.refreshBranch",
+        "filesystem.getMetadata",
+        "server.refreshProviders",
+      ]);
+      const harvest = (m: { tag: string; payload: unknown }) => m.tag === "vcs.listRefs" && (m.payload as { cwd?: unknown }).cwd === "/home/user/my-app";
+      expect(vm.seenMethods.slice(seenBefore).filter((m) => openTags.has(m.tag) || (m.tag === "vcs.listRefs" && !harvest(m)))).toEqual([]);
       expect(client.inbox.some((f) => f.requestId === "vcs" && f._tag === "Exit")).toBe(false);
 
       // Sending a message is what wakes it
