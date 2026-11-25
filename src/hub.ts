@@ -41,6 +41,19 @@ import {
   type StagedAttachment,
 } from "./hub-attachments.ts";
 import {
+  DEVICE_HUB_PREFIX,
+  HubMediaProxy,
+  MEDIA_GONE_CLOSE,
+  MEDIA_RETRY_CLOSE,
+  PREVIEW_STREAM_PREFIX,
+  isMediaPath,
+  mediaThreadId,
+  newMediaWsData,
+  withoutHubTicket,
+  type HubMediaWsData,
+  type MediaTarget,
+} from "./hub-media.ts";
+import {
   buildPlaceholderThread,
   failPlaceholderThread,
   placeholderInputFrom,
@@ -101,6 +114,19 @@ export interface HubWsData {
   localStreams: Map<string, { rawId: string | number; tag: string; payload?: unknown }>;
   /** Active upstream-forwarded RPC requests owned by this client: String(clientReqId) -> { sandboxId, upReqId }. */
   upstreamRequests: Map<string, { sandboxId: string; upReqId: string }>;
+}
+
+/** Data of any socket the Hub upgrades: its RPC socket, or a media socket piped to a VM. */
+export type HubSocketData = HubWsData | HubMediaWsData;
+export type { HubMediaWsData } from "./hub-media.ts";
+
+/** An event stream the Hub opens on every open VM bridge for one client request. */
+interface FanoutStream {
+  rawId: string | number;
+  tag: string;
+  payload: unknown;
+  /** sandboxId -> upstream request id on that VM. */
+  upstream: Map<string, string>;
 }
 
 interface RpcClientFrame {
@@ -206,6 +232,12 @@ const THREAD_ROUTED_METHODS = new Set([
 
 const WORKSPACE_ROUTED_PREFIXES = ["vcs.", "git.", "projects.", "review."];
 
+/**
+ * Event streams every chat VM publishes for its own chats only: the Hub merges them from every open
+ * VM. Preview events carry their `threadId` and that VM's `serverEpoch`, and the app keeps both per chat.
+ */
+const FANOUT_SUBSCRIPTIONS = new Set(["subscribePreviewEvents"]);
+
 /** Sign-out RPCs (`{ instanceId }` payload); a successful one forgets the stored provider session. */
 const PROVIDER_LOGOUT_METHODS = new Set(["provider.auth.logout", "server.logoutAcpRegistry"]);
 
@@ -230,7 +262,6 @@ const NO_VM_PROVIDER_SETUP_DETAIL =
   "Provider setup runs inside a Boat chat VM, and none is running. Start a thread on Boat, then try again.";
 
 const KEEP_OPEN_SUBSCRIPTIONS = new Set([
-  "subscribePreviewEvents",
   "scheduledTasks.subscribe",
   "subscribeDeviceState",
   "subscribeDiscoveredLocalServers",
@@ -634,6 +665,24 @@ class HubVmBridge {
     this.sendRaw({ _tag: "Interrupt", requestId: upReqId });
   }
 
+  /**
+   * Opens a stream the Hub consumes itself: each chunk is acked here, then handed to `onValues`.
+   * `onEnd` runs once when the VM ends it or the connection goes away (not after `sendInterrupt`).
+   */
+  openStream(tag: string, payload: unknown, onValues: (values: unknown[]) => void, onEnd: () => void): string {
+    const upReqId = `hub-s-${++this.reqCounter}`;
+    this.pending.set(upReqId, {
+      tag,
+      onChunk: (values) => {
+        this.sendRaw({ _tag: "Ack", requestId: upReqId });
+        onValues(values);
+      },
+      resolve: () => onEnd(),
+    });
+    this.sendRaw({ _tag: "Request", id: upReqId, tag, payload, headers: [] });
+    return upReqId;
+  }
+
   private sendRaw(frame: Record<string, unknown>): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       try {
@@ -769,6 +818,14 @@ export class HubServer {
   /** Each thread's projection, read from its VM before the VM went to sleep (also on disk). */
   private readonly projectionCache = new Map<string, Record<string, unknown>>();
   private readonly urlTokenToSandbox = new Map<string, string>();
+  /** Preview streams and device-hub sockets, piped to the VM that runs the chat. */
+  private readonly media = new HubMediaProxy((data) => this.resolveMediaTarget(data));
+  /** How long a media socket waits for its chat's VM to finish booting or waking. */
+  mediaJoinTimeoutMs = 60_000;
+  /** Client event streams merged from every open VM, per client: request key -> stream. */
+  private readonly fanoutStreams = new Map<ServerWebSocket<HubWsData>, Map<string, FanoutStream>>();
+  /** The app's last browser-profile report, replayed to each VM whose bridge opens. */
+  private lastPreviewProfiles: unknown = undefined;
   private readonly stagedAttachments = new Map<string, StagedAttachment>();
   private readonly stagedUploadTokens = new Map<string, string>(); // uploadToken -> attachmentId
   /** Asset URL tokens the Hub signed for a staged upload (the client checks an upload before sending) -> attachment id. */
@@ -955,6 +1012,7 @@ export class HubServer {
       bridge.stop();
     }
     this.bridges.clear();
+    this.media.closeAll(MEDIA_RETRY_CLOSE, "The Hub is restarting");
     this.lifecycle.providerSessions.stop();
   }
 
@@ -1341,7 +1399,7 @@ export class HubServer {
     };
   }
 
-  async handleHttp(req: Request, server: Bun.Server<HubWsData>): Promise<Response | undefined> {
+  async handleHttp(req: Request, server: Bun.Server<HubSocketData>): Promise<Response | undefined> {
     if (req.method === "OPTIONS") {
       return withCors(new Response(null, { status: 204 }));
     }
@@ -1472,12 +1530,30 @@ export class HubServer {
       return withCors(new Response("Not Found", { status: 404 }));
     }
 
-    // 9. WebSocket upgrade
-    if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
-      const isMedia = path.startsWith("/api/device-hub/") || path.startsWith("/api/preview-stream/");
-      const ticketUse: TicketUse = isMedia ? "media" : "rpc";
+    // 9. Media routes (preview stream, device hub): piped to the chat's VM, sockets and HTTP alike
+    const isUpgrade = req.headers.get("upgrade")?.toLowerCase() === "websocket";
+    if (isMediaPath(path)) {
+      // `<img>`, downloads and WebSockets can't set headers: the app sends a `media` wsTicket instead
       const wsTicket = url.searchParams.get("wsTicket");
-      const ticketClientId = wsTicket ? this.auth.checkTicket(wsTicket, ticketUse) : null;
+      const clientId =
+        (wsTicket ? this.auth.checkTicket(wsTicket, "media") : null) ?? authenticateClient(hub.clients, req.headers)?.id ?? null;
+      if (!clientId) {
+        return withCors(Response.json({ error: "unauthorized" }, { status: 401 }));
+      }
+      if (path.startsWith(PREVIEW_STREAM_PREFIX) && !mediaThreadId(url)) {
+        return withCors(new Response("Not Found", { status: 404 }));
+      }
+      if (!isUpgrade) return this.proxyMediaHttp(req, url);
+      // Upgrade first: past auth, every failure is a close code the preview client knows how to read
+      const upgraded = server.upgrade(req, { data: newMediaWsData(clientId, url) });
+      if (!upgraded) return withCors(new Response("WebSocket upgrade failed", { status: 400 }));
+      return undefined;
+    }
+
+    // 10. WebSocket upgrade
+    if (isUpgrade) {
+      const wsTicket = url.searchParams.get("wsTicket");
+      const ticketClientId = wsTicket ? this.auth.checkTicket(wsTicket, "rpc") : null;
       const bearerClient = ticketClientId ? null : authenticateClient(hub.clients, req.headers);
       const clientId = ticketClientId ?? bearerClient?.id ?? null;
       if (!clientId) {
@@ -1495,7 +1571,7 @@ export class HubServer {
       return undefined;
     }
 
-    // 10. Other authenticated HTTP requests -> forward to any running sandbox if available
+    // 11. Other authenticated HTTP requests -> forward to any running sandbox if available
     if (!authenticateClient(hub.clients, req.headers)) {
       return withCors(Response.json({ error: "unauthorized" }, { status: 401 }));
     }
@@ -1530,8 +1606,27 @@ export class HubServer {
       this.bridges.get(ref.sandboxId)?.sendInterrupt(ref.upReqId);
     }
     this.removeWorktreeSetupSubsForWs(ws);
+    for (const key of Array.from(this.fanoutStreams.get(ws)?.keys() ?? [])) this.closeFanoutStream(ws, key);
+    this.fanoutStreams.delete(ws);
     ws.data.upstreamRequests.clear();
     ws.data.localStreams.clear();
+  }
+
+  onMediaOpen(ws: ServerWebSocket<HubMediaWsData>): void {
+    this.media.open(ws);
+  }
+
+  onMediaMessage(ws: ServerWebSocket<HubMediaWsData>, msg: string | Buffer): void {
+    this.media.message(ws, msg);
+  }
+
+  onMediaClose(ws: ServerWebSocket<HubMediaWsData>, code?: number, reason?: string): void {
+    this.media.close(ws, code, reason);
+  }
+
+  /** Open media sockets piped to a VM (every VM when omitted). */
+  mediaSocketCount(sandboxId?: string): number {
+    return this.media.count(sandboxId);
   }
 
   onWsMessage(ws: ServerWebSocket<HubWsData>, msg: string | Buffer): void {
@@ -1572,6 +1667,7 @@ export class HubServer {
       const reqKey = String(rawReqId);
       ws.data.localStreams.delete(reqKey);
       this.removeWorktreeSetupSub(ws, reqKey);
+      this.closeFanoutStream(ws, reqKey);
       const ref = ws.data.upstreamRequests.get(reqKey);
       if (ref) {
         ws.data.upstreamRequests.delete(reqKey);
@@ -1732,6 +1828,10 @@ export class HubServer {
       await this.handleWorkspaceRpc(ws, reqId, tag, payload, headers);
       return;
     }
+    if (FANOUT_SUBSCRIPTIONS.has(tag)) {
+      this.openFanoutStream(ws, reqId, tag, payload);
+      return;
+    }
     if (KEEP_OPEN_SUBSCRIPTIONS.has(tag)) {
       ws.data.localStreams.set(reqKey, { rawId: reqId, tag, payload });
       const live = this.anyRunningSandbox();
@@ -1741,7 +1841,27 @@ export class HubServer {
       }
       return;
     }
-    if (tag === "server.reportClientActivity" || tag === "preview.reportProfiles" || tag === "preview.reportStatus") {
+    if (tag === "preview.reportStatus") {
+      // A desktop-run tab's navigation, for the chat's VM; never wakes a VM just for this
+      const sandboxId = this.threadToSandbox.get(extractThreadId(payload) ?? "");
+      const bridge = sandboxId ? this.bridges.get(sandboxId) : undefined;
+      if (bridge?.isOpen() && this.state.getHubSandbox(sandboxId!)?.phase === "running") {
+        bridge.forwardToClient(ws, reqId, tag, payload, headers);
+      } else {
+        sendRpcExitSuccess(ws, reqId, undefined);
+      }
+      return;
+    }
+    if (tag === "preview.reportProfiles") {
+      // Browser profiles the app knows: every VM's server browser opens tabs with them
+      this.lastPreviewProfiles = payload;
+      for (const bridge of this.bridges.values()) {
+        if (bridge.isOpen()) void bridge.callUnary(tag, payload, 10_000);
+      }
+      sendRpcExitSuccess(ws, reqId, undefined);
+      return;
+    }
+    if (tag === "server.reportClientActivity") {
       sendRpcExitSuccess(ws, reqId, undefined);
       return;
     }
@@ -3394,6 +3514,7 @@ export class HubServer {
     const reason = redactForLog(ctx.err);
     this.bridges.get(sandboxId)?.stop();
     this.bridges.delete(sandboxId);
+    this.media.closeSandbox(sandboxId, MEDIA_RETRY_CLOSE, "The chat's VM could not wake");
 
     if (ctx.newKlavSandbox && this.klav) {
       await releaseVmForwarder(this.boat, sandboxId, { termTimeoutSecs: this.forwarderTermTimeoutSecs }).catch(() => {});
@@ -3516,6 +3637,8 @@ export class HubServer {
     await this.cacheThreadProjections(sb).catch(() => {});
     this.bridges.get(sandboxId)?.stop();
     this.bridges.delete(sandboxId);
+    // A paused VM sends no close: end its media sockets here; the preview reconnects once it wakes
+    this.media.closeSandbox(sandboxId, MEDIA_RETRY_CLOSE, "The chat's VM is asleep");
 
     // No live credentials in a sleeping VM: stop the forwarder while its control socket still answers,
     // then end the Klav sandbox on the issuer side. The wake provisions a fresh one.
@@ -3572,6 +3695,7 @@ export class HubServer {
 
     this.bridges.get(sandboxId)?.stop();
     this.bridges.delete(sandboxId);
+    this.media.closeSandbox(sandboxId, MEDIA_GONE_CLOSE, "This chat's Boat VM no longer exists");
     this.settingsReplays.delete(sandboxId);
     this.replayedSettings.delete(sandboxId);
     this.wakeStatus.delete(sandboxId);
@@ -3652,6 +3776,10 @@ export class HubServer {
       (sandboxId) => {
         this.adoptLocalProviderStreams(sandboxId);
         this.adoptKeepOpenStreams(sandboxId);
+        this.adoptFanoutStreams(sandboxId);
+        if (this.lastPreviewProfiles !== undefined) {
+          void this.bridges.get(sandboxId)?.callUnary("preview.reportProfiles", this.lastPreviewProfiles, 10_000);
+        }
         this.replaySettingsOverlay(sandboxId);
       },
     );
@@ -4467,6 +4595,106 @@ export class HubServer {
 
   private anyRunningSandbox(): HubSandboxRecord | undefined {
     return this.state.listHubSandboxes().find((s) => s.phase === "running");
+  }
+
+  /**
+   * The VM a media socket or request goes to. A preview stream goes to its chat's VM only, never
+   * another chat's; it joins a boot or wake under way (bounded) but never starts a wake itself: the
+   * client reconnects every few seconds, and the preview RPCs (`preview.list`, `preview.open`)
+   * already wake the chat. The device hub names no chat and goes to any running VM.
+   */
+  private async resolveMediaTarget(data: HubMediaWsData): Promise<MediaTarget> {
+    if (data.threadId === null) {
+      const sb = this.anyRunningSandbox();
+      return sb ? { ok: true, sandbox: sb } : { ok: false, code: MEDIA_RETRY_CLOSE, reason: "No Boat VM is running" };
+    }
+    return this.mediaTargetForThread(data.threadId);
+  }
+
+  private async mediaTargetForThread(threadId: string): Promise<MediaTarget> {
+    const gone: MediaTarget = { ok: false, code: MEDIA_GONE_CLOSE, reason: "This chat's Boat VM no longer exists" };
+    if (!this.threadHasVm(threadId)) return gone;
+    const boundId = this.threadToSandbox.get(threadId);
+    const starting =
+      this.pendingThreads.get(threadId)?.ready ??
+      this.inFlightSpawns.get(threadId) ??
+      (boundId ? this.inFlightWakes.get(boundId) : undefined);
+    if (starting) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        starting.catch(() => undefined),
+        new Promise((resolve) => (timer = setTimeout(resolve, this.mediaJoinTimeoutMs))),
+      ]);
+      clearTimeout(timer);
+    }
+    if (!this.threadHasVm(threadId)) return gone;
+    const sandboxId = this.threadToSandbox.get(threadId);
+    const sb = sandboxId ? this.state.getHubSandbox(sandboxId) : undefined;
+    if (sb?.phase === "running" && !this.inFlightSleeps.has(sb.sandboxId)) return { ok: true, sandbox: sb };
+    return {
+      ok: false,
+      code: MEDIA_RETRY_CLOSE,
+      reason: sb?.phase === "sleeping" ? "The chat's VM is asleep" : "The chat's VM is still starting",
+    };
+  }
+
+  /** Preview downloads and file-chooser uploads, and device-hub HTTP: to the same VM as the socket. */
+  private async proxyMediaHttp(req: Request, url: URL): Promise<Response> {
+    const threadId = mediaThreadId(url);
+    const target = threadId
+      ? await this.mediaTargetForThread(threadId)
+      : await this.resolveMediaTarget({ threadId: null } as HubMediaWsData);
+    if (!target.ok) {
+      const status = target.code === MEDIA_GONE_CLOSE ? 404 : 503;
+      return withCors(new Response(target.reason, { status }));
+    }
+    const sb = this.state.getHubSandbox(target.sandbox.sandboxId);
+    if (!sb) return withCors(new Response("Not Found", { status: 404 }));
+    return this.proxyHttpToSandbox(sb, req, withoutHubTicket(url), false);
+  }
+
+  /** Opens a merged event stream for a client on every open VM bridge (more join as they open). */
+  private openFanoutStream(ws: ServerWebSocket<HubWsData>, reqId: string | number, tag: string, payload: unknown): void {
+    const key = String(reqId);
+    this.closeFanoutStream(ws, key);
+    let streams = this.fanoutStreams.get(ws);
+    if (!streams) this.fanoutStreams.set(ws, (streams = new Map()));
+    streams.set(key, { rawId: reqId, tag, payload: payload ?? {}, upstream: new Map() });
+    for (const [sandboxId, bridge] of this.bridges) {
+      if (bridge.isOpen()) this.attachFanoutStream(ws, key, sandboxId, bridge);
+    }
+  }
+
+  private attachFanoutStream(ws: ServerWebSocket<HubWsData>, key: string, sandboxId: string, bridge: HubVmBridge): void {
+    const stream = this.fanoutStreams.get(ws)?.get(key);
+    if (!stream || stream.upstream.has(sandboxId) || !this.clients.has(ws)) return;
+    let upReqId = "";
+    upReqId = bridge.openStream(
+      stream.tag,
+      stream.payload,
+      (values) => sendRpcFrame(ws, { _tag: "Chunk", requestId: stream.rawId, values }),
+      // The VM ended it or went away: forget it quietly; the bridge's next open subscribes again
+      () => {
+        if (stream.upstream.get(sandboxId) === upReqId) stream.upstream.delete(sandboxId);
+      },
+    );
+    stream.upstream.set(sandboxId, upReqId);
+  }
+
+  private adoptFanoutStreams(sandboxId: string): void {
+    const bridge = this.bridges.get(sandboxId);
+    if (!bridge?.isOpen()) return;
+    for (const [ws, streams] of this.fanoutStreams) {
+      for (const key of streams.keys()) this.attachFanoutStream(ws, key, sandboxId, bridge);
+    }
+  }
+
+  private closeFanoutStream(ws: ServerWebSocket<HubWsData>, key: string): void {
+    const streams = this.fanoutStreams.get(ws);
+    const stream = streams?.get(key);
+    if (!streams || !stream) return;
+    streams.delete(key);
+    for (const [sandboxId, upReqId] of stream.upstream) this.bridges.get(sandboxId)?.sendInterrupt(upReqId);
   }
 
   private async proxyHttpToSandbox(

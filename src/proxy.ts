@@ -483,7 +483,7 @@ export class SlotProxy {
   }
 }
 
-function safeCloseCode(code: number): number {
+export function safeCloseCode(code: number): number {
   if (
     code === 1000 ||
     (code >= 3000 && code <= 4999) ||
