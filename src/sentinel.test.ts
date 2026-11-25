@@ -1163,6 +1163,21 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
                 ],
               }),
             );
+            // As T3 0.1.13 does: a second snapshot that only resolves the projects' repository identity.
+            // Its `threads` is empty and the app keeps the threads it already has.
+            ws.sendText(
+              JSON.stringify({
+                _tag: "Chunk",
+                requestId: frame.id,
+                values: [
+                  {
+                    kind: "snapshot",
+                    snapshot: { schemaVersion: 2, snapshotSequence: 1, projects: [vmProjectRow], threads: [], archivedThreads: [] },
+                    resolvedRepositoryIdentityRoots: [vmProjectRow.workspaceRoot],
+                  },
+                ],
+              }),
+            );
             return;
           }
           if (frame.tag === "server.getConfig") {

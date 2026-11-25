@@ -3819,6 +3819,9 @@ export class HubServer {
             };
           });
         }
+        // T3 0.1.13 follows the snapshot with one that only resolves the projects' repository identity:
+        // its `threads` is empty and the app keeps the threads it has, so it neither lists nor removes chats
+        if ("resolvedRepositoryIdentityRoots" in item) continue;
         const listed = new Set<string>();
         for (const t of snap.threads ?? []) {
           const rewritten = rewriteProjectIds(t, sb.vmProjectId, sb.hubProjectId) as Record<string, unknown>;
