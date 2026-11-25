@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
@@ -154,6 +155,12 @@ class MockBoat implements BoatClient {
   }
 
   async upload(): Promise<void> {}
+
+  downloads: Array<{ id: string; remotePath: string; localPath: string }> = [];
+  async download(id: string, remotePath: string, localPath: string): Promise<void> {
+    this.downloads.push({ id, remotePath, localPath });
+    throw new Error("no such file");
+  }
 }
 
 const tempDirs: string[] = [];
@@ -1065,22 +1072,29 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       { instanceId: "claudeAgent", driver: "claudeAgent", enabled: true, installed: true },
       { instanceId: "antigravity", driver: "antigravity", enabled: true, installed: true, auth: { status } },
     ];
+    const AG_VM_PATH = `~/.t3/userdata/providers/antigravity/${AG_HASH}/antigravity-acp/antigravity-oauth-token`;
     const storedPath = (dir: string) => join(dir, "credentials", "antigravity", "antigravity-oauth-token");
+    /** The capture's exec only lists files ("<name> <bytes>"); contents come over `download`. */
+    const isCredentialListing = (script: string) => script.includes("antigravity-oauth-token") && script.includes("wc -c");
+    const listingFor = (content: string | null) =>
+      content ? `antigravity-oauth-token ${Buffer.byteLength(content)}\n` : "";
 
-    /** Answers the credential read with `vmToken.current` and counts reads. */
+    /** Serves `vmToken.current` as the VM's credential file and counts listings (one per capture). */
     function serveVmToken(boat: MockBoat, vmToken: { current: string | null }) {
       const reads = { count: 0 };
       const original = boat.exec.bind(boat);
       boat.exec = async (id: string, script: string) => {
-        if (script.includes("antigravity-oauth-token") && script.includes("base64")) {
+        if (isCredentialListing(script)) {
           reads.count++;
           expect(script).toContain(`providers/antigravity/${AG_HASH}/antigravity-acp`);
-          const stdout = vmToken.current
-            ? `antigravity-oauth-token:${Buffer.from(vmToken.current).toString("base64")}\n`
-            : "";
-          return { exitCode: 0, stdout, stderr: "" };
+          return { exitCode: 0, stdout: listingFor(vmToken.current), stderr: "" };
         }
         return original(id, script);
+      };
+      boat.download = async (_id: string, remotePath: string, localPath: string) => {
+        expect(remotePath).toBe(AG_VM_PATH);
+        if (vmToken.current === null) throw new Error("no such file");
+        writeFileSync(localPath, vmToken.current);
       };
       return reads;
     }
@@ -1155,11 +1169,8 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       const provider = {
         name: "fake",
         capabilities: new Set(),
-        exec: async () => ({
-          exitCode: 0,
-          stdout: `antigravity-oauth-token:${Buffer.from(vmContent).toString("base64")}\n`,
-          stderr: "",
-        }),
+        exec: async () => ({ exitCode: 0, stdout: listingFor(vmContent), stderr: "" }),
+        download: async (_id: string, _remote: string, local: string) => writeFileSync(local, vmContent),
       } as unknown as SandboxProvider;
       const store = new ProviderSessionStore(cfg, provider);
 
@@ -1251,13 +1262,17 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       let mode: "fail" | "ok" | "hang" = "fail";
       let attempts = 0;
       const original = boat.exec.bind(boat);
+      const token = agToken("ya29.RETRY-SECRET", "2026-12-01T00:00:00Z");
       boat.exec = async (id: string, script: string) => {
-        if (!(script.includes("antigravity-oauth-token") && script.includes("base64"))) return original(id, script);
+        if (!isCredentialListing(script)) return original(id, script);
         attempts++;
         if (mode === "fail") return { exitCode: 1, stdout: "", stderr: "boom" };
+        return { exitCode: 0, stdout: listingFor(token), stderr: "" };
+      };
+      // The hung teardown pull is the file copy itself
+      boat.download = async (_id: string, _remote: string, local: string) => {
         if (mode === "hang") return new Promise<never>(() => {});
-        const token = agToken("ya29.RETRY-SECRET", "2026-12-01T00:00:00Z");
-        return { exitCode: 0, stdout: `antigravity-oauth-token:${Buffer.from(token).toString("base64")}\n`, stderr: "" };
+        writeFileSync(local, token);
       };
       const client = await connectHubClient(handle, cfg);
       await launchThreadOnHub(client, "thread-ag-hang");
@@ -1278,6 +1293,111 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       expect(Date.now() - started).toBeLessThan(2_000);
       expect(attempts).toBe(3);
       expect(boat.deleted).toContain(sandboxId);
+    });
+
+    test("credential bytes never travel through exec output: capture and the teardown pull list with exec and copy with download", async () => {
+      const vm = startFakeVmT3Server("vm-ag-noexec", {
+        configSnapshot: { providers: agProviders("authenticated"), settings: {} },
+      });
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat, dir } = await startHubWithVm(vm, "t3-sentinel-ag-noexec-", {
+        persistProviderSessions: ["antigravity"],
+      });
+      // A fixture home stands in for the VM: credential scripts run for real against it
+      const home = mkdtempSync(join(tmpdir(), "t3-sentinel-ag-vmhome-"));
+      cleanups.push(() => rmSync(home, { recursive: true, force: true }));
+      const vmTokenPath = join(home, AG_VM_PATH.slice(2));
+      mkdirSync(dirname(vmTokenPath), { recursive: true });
+      // The legacy file is a credential too: both must come over download
+      writeFileSync(join(dirname(vmTokenPath), "acp_token.json"), '{"legacy":"LEGACY-SECRET"}');
+      let token = agToken("ya29.NOEXEC-SECRET", "2026-11-25T10:00:00Z");
+      writeFileSync(vmTokenPath, token);
+      const tokens = [token];
+
+      const execs: Array<{ script: string; stdout: string; stderr: string }> = [];
+      const original = boat.exec.bind(boat);
+      boat.exec = async (id: string, script: string) => {
+        let res: { exitCode: number | null; stdout: string; stderr: string };
+        if (script.includes("antigravity-acp")) {
+          const p = Bun.spawnSync(["bash", "-c", script], { env: { ...process.env, HOME: home } });
+          res = { exitCode: p.exitCode, stdout: p.stdout.toString(), stderr: p.stderr.toString() };
+        } else {
+          res = await original(id, script);
+        }
+        execs.push({ script, stdout: res.stdout, stderr: res.stderr });
+        return res;
+      };
+      const downloads: Array<{ remotePath: string; localPath: string; mode: number }> = [];
+      boat.download = async (_id: string, remotePath: string, localPath: string) => {
+        downloads.push({ remotePath, localPath, mode: statSync(localPath).mode & 0o777 });
+        writeFileSync(localPath, readFileSync(join(home, remotePath.replace(/^~\//, ""))));
+      };
+
+      const client = await connectHubClient(handle, cfg);
+      client.request("cfg", "subscribeServerConfig", {});
+      await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "cfg");
+      await launchThreadOnHub(client, "thread-ag-noexec");
+      await waitFor(() => existsSync(storedPath(dir)));
+      await handle.lifecycle.providerSessions.settle();
+      expect(readFileSync(storedPath(dir), "utf8")).toBe(token);
+      expect(readFileSync(join(dir, "credentials", "antigravity", "acp_token.json"), "utf8")).toContain("LEGACY-SECRET");
+
+      token = agToken("ya29.REFRESHED-NOEXEC-SECRET", "2026-11-25T18:00:00Z");
+      tokens.push(token);
+      writeFileSync(vmTokenPath, token);
+      await handle.hub!.destroyHubSandbox(handle.state.listHubSandboxes()[0].sandboxId, "test");
+      expect(readFileSync(storedPath(dir), "utf8")).toBe(token);
+
+      // Two captures (sign-in, teardown pull), two files each, all over download
+      const credScripts = execs.filter((e) => /antigravity-oauth-token|acp_token/.test(e.script));
+      expect(credScripts.length).toBe(2);
+      expect(downloads.length).toBe(4);
+      for (const e of credScripts) {
+        expect(e.script).not.toMatch(/\b(base64|cat|head|tail|xxd|od|dd|less|more|strings|openssl)\b/);
+        expect(e.stdout).toMatch(/^(?:(?:antigravity-oauth-token|acp_token\.json) \d+\n)+$/);
+      }
+      for (const e of execs) {
+        const seen = `${e.script}\n${e.stdout}\n${e.stderr}`;
+        expect(seen).not.toContain("SECRET");
+        for (const t of tokens) expect(seen).not.toContain(Buffer.from(t).toString("base64").slice(0, 24));
+      }
+      // Temp files: created 0600 inside the 0700 credentials dir before the copy, deleted afterwards
+      for (const d of downloads) {
+        expect(dirname(d.localPath)).toBe(join(dir, "credentials"));
+        expect(d.mode).toBe(0o600);
+        expect(existsSync(d.localPath)).toBe(false);
+      }
+      expect(readdirSync(join(dir, "credentials")).filter((n) => n.endsWith(".tmp"))).toEqual([]);
+    });
+
+    test("a provider without a file download never captures (no exec), warning once", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-ag-nodl-"));
+      cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+      const base = makeTestConfig(0);
+      const cfg: SentinelConfig = { ...base, stateDir: dir, t3: { ...base.t3, persistProviderSessions: ["antigravity"] } };
+      let execs = 0;
+      const provider = {
+        name: "fake-sdk",
+        capabilities: new Set(),
+        exec: async () => {
+          execs++;
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      } as unknown as SandboxProvider;
+      const store = new ProviderSessionStore(cfg, provider);
+      const warnings: string[] = [];
+      const warn = console.warn;
+      console.warn = (...args: unknown[]) => void warnings.push(args.map(String).join(" "));
+      try {
+        await store.capture("vm-a", "antigravity");
+        store.markInjected("vm-b", ["antigravity"]);
+        await store.pullBeforeDestroy("vm-b");
+      } finally {
+        console.warn = warn;
+      }
+      expect(execs).toBe(0);
+      expect(existsSync(storedPath(dir))).toBe(false);
+      expect(warnings.filter((w) => w.includes("no file download")).length).toBe(1);
     });
 
     test("a successful sign-out forwarded by the Hub deletes the stored copy; forget-session API validates input", async () => {

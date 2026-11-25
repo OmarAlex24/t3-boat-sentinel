@@ -8,6 +8,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
@@ -19,8 +20,10 @@ import type { SandboxProvider } from "./providers/types.ts";
  * Persists provider sign-ins (e.g. Antigravity's Google OAuth token) across disposable chat VMs.
  *
  * - Capture: when a VM reports an instance listed in `t3.persistProviderSessions` as authenticated,
- *   its credential files are read over `exec` and stored on the sentinel host under
- *   `<stateDir>/credentials/<instanceId>/<file>` (dir 0700, file 0600, atomic rename).
+ *   `exec` lists which credential files exist (names and byte counts only), each file is copied out
+ *   with the provider's `download` (`boat scp`), and it is stored on the sentinel host under
+ *   `<stateDir>/credentials/<instanceId>/<file>` (dir 0700, file 0600, atomic rename). Contents never
+ *   travel through `exec` output: Boat keeps every command's stdout/stderr in `boat history`.
  * - Inject: fresh VMs get the stored files staged into `~/.t3-sentinel/provider-sessions/` before
  *   `provision-base.sh` runs; the script installs them (0600) under `~/.t3/userdata/` and restarts t3.
  * - Forget: sign-out through the Hub or `sentinel forget-session` deletes the stored copy.
@@ -114,6 +117,7 @@ export class ProviderSessionStore {
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly generation = new Map<string, number>();
   private readonly warnedDrivers = new Set<string>();
+  private warnedNoDownload = false;
   /** In-flight captures, so tests and teardown can await them. */
   private readonly inFlight = new Set<Promise<void>>();
 
@@ -177,6 +181,18 @@ export class ProviderSessionStore {
     }
     const created = Date.parse(sandboxCreatedAt);
     return !Number.isNaN(at) && !Number.isNaN(created) && created <= at;
+  }
+
+  /** False (with a one-time warning) when the provider cannot copy files out without exec output. */
+  private canDownload(): boolean {
+    if (typeof this.boat.download === "function") return true;
+    if (!this.warnedNoDownload) {
+      this.warnedNoDownload = true;
+      console.warn(
+        `[sessions] provider ${this.boat.name} has no file download; provider sign-ins will not be captured from its VMs`,
+      );
+    }
+    return false;
   }
 
   /** Lists stored instance IDs (names only, never contents). */
@@ -270,50 +286,52 @@ export class ProviderSessionStore {
   }
 
   /**
-   * Reads the instance's credential files from a VM and stores them. Never throws; failures are
-   * logged without the command output (which could hold the token).
+   * Copies the instance's credential files out of a VM and stores them. `exec` only learns which
+   * files exist and their sizes; the bytes come over `download` (file transfer), never through
+   * command output. Never throws; failures are logged as constant strings.
    */
   async capture(sandboxId: string, instanceId: string, timeoutSecs = 30): Promise<void> {
     const spec = this.specFor(instanceId);
-    if (!spec || this.suppressed.has(key(sandboxId, instanceId))) return;
+    if (!spec || this.suppressed.has(key(sandboxId, instanceId)) || !this.canDownload()) return;
     const gen = this.generation.get(instanceId) ?? 0;
     const rel = spec.userdataDir(instanceId);
     const names = spec.files.map((f) => f.name).filter((n) => FILE_NAME_RE.test(n));
-    const script =
+    // Prints "<name> <bytes>" per existing file; `wc -c` outputs only the count
+    const listing =
       `cd "$HOME/.t3/userdata/${rel}" 2>/dev/null || exit 0; ` +
-      `for f in ${names.join(" ")}; do if [ -f "$f" ]; then printf '%s:' "$f"; base64 -w0 "$f"; printf '\\n'; fi; done; true`;
+      `for f in ${names.join(" ")}; do if [ -f "$f" ]; then printf '%s %s\\n' "$f" $(wc -c <"$f"); fi; done; true`;
 
     // A failed read is retried on the VM's next `authenticated` report
     const allowRetry = () => this.lastStatus.delete(key(sandboxId, instanceId));
-    let stdout: string;
+    let present: string[];
     try {
-      const res = await this.boat.exec(sandboxId, script, timeoutSecs);
+      const res = await this.boat.exec(sandboxId, listing, timeoutSecs);
       if (res.exitCode !== 0) {
-        console.warn(`[sessions] could not read ${instanceId} credentials from ${sandboxId} (exit ${res.exitCode})`);
+        console.warn(`[sessions] could not list ${instanceId} credentials on ${sandboxId} (exit ${res.exitCode})`);
         allowRetry();
         return;
       }
-      stdout = res.stdout;
+      present = parseListing(res.stdout, names);
     } catch {
-      console.warn(`[sessions] could not read ${instanceId} credentials from ${sandboxId}`);
+      console.warn(`[sessions] could not list ${instanceId} credentials on ${sandboxId}`);
+      allowRetry();
+      return;
+    }
+    if (present.length === 0) {
+      console.log(`[sessions] ${sandboxId} reports ${instanceId} signed in but holds no credential file; nothing stored`);
       allowRetry();
       return;
     }
 
     const found = new Map<string, Buffer>();
-    for (const line of stdout.split(/\r?\n/)) {
-      const idx = line.indexOf(":");
-      if (idx <= 0) continue;
-      const name = line.slice(0, idx);
-      if (!names.includes(name)) continue;
-      const content = Buffer.from(line.slice(idx + 1).trim(), "base64");
-      if (content.length === 0 || content.length > MAX_CREDENTIAL_BYTES) continue;
+    for (const name of present) {
+      const content = await this.downloadOne(sandboxId, `~/.t3/userdata/${rel}/${name}`, timeoutSecs);
+      if (!content) {
+        console.warn(`[sessions] could not copy ${instanceId} ${name} from ${sandboxId}`);
+        allowRetry();
+        return;
+      }
       found.set(name, content);
-    }
-    if (found.size === 0) {
-      console.log(`[sessions] ${sandboxId} reports ${instanceId} signed in but holds no credential file; nothing stored`);
-      allowRetry();
-      return;
     }
     // A sign-out (or forget) happened while reading: drop this copy
     if ((this.generation.get(instanceId) ?? 0) !== gen || this.suppressed.has(key(sandboxId, instanceId))) return;
@@ -321,6 +339,30 @@ export class ProviderSessionStore {
     for (const fileSpec of spec.files) {
       const content = found.get(fileSpec.name);
       if (content) this.store(instanceId, fileSpec, content, sandboxId);
+    }
+  }
+
+  /**
+   * Downloads one file into a 0600 temp file inside the 0700 credentials dir, reads it into memory
+   * and always deletes the temp file. Returns null on any failure or an empty/oversized file.
+   */
+  private async downloadOne(sandboxId: string, remotePath: string, timeoutSecs: number): Promise<Buffer | null> {
+    let tmp: string | null = null;
+    try {
+      mkdirSync(this.baseDir, { recursive: true, mode: 0o700 });
+      chmodSync(this.baseDir, 0o700);
+      tmp = join(this.baseDir, `.download-${randomBytes(6).toString("hex")}.tmp`);
+      closeSync(openSync(tmp, "wx", 0o600));
+      chmodSync(tmp, 0o600);
+      await this.boat.download!(sandboxId, remotePath, tmp, timeoutSecs);
+      chmodSync(tmp, 0o600);
+      const size = statSync(tmp).size;
+      if (size === 0 || size > MAX_CREDENTIAL_BYTES) return null;
+      return readFileSync(tmp);
+    } catch {
+      return null;
+    } finally {
+      if (tmp) rmSync(tmp, { force: true });
     }
   }
 
@@ -369,7 +411,7 @@ export class ProviderSessionStore {
       const k = key(sandboxId, id);
       return this.lastStatus.get(k) === "authenticated" && !this.suppressed.has(k);
     });
-    if (ids.length === 0) return;
+    if (ids.length === 0 || !this.canDownload()) return;
     for (const id of ids) {
       const t = this.timers.get(key(sandboxId, id));
       if (t) {
@@ -432,6 +474,19 @@ export class ProviderSessionStore {
     for (const t of this.timers.values()) clearTimeout(t);
     this.timers.clear();
   }
+}
+
+/** Names from a "<name> <bytes>" listing that are expected credential files of a plausible size. */
+function parseListing(stdout: string, names: string[]): string[] {
+  const out: string[] = [];
+  for (const line of stdout.split(/\r?\n/)) {
+    const [name, bytes] = line.trim().split(/\s+/);
+    if (!name || !names.includes(name) || out.includes(name)) continue;
+    const size = Number(bytes);
+    if (!Number.isInteger(size) || size <= 0 || size > MAX_CREDENTIAL_BYTES) continue;
+    out.push(name);
+  }
+  return out;
 }
 
 function key(sandboxId: string, instanceId: string): string {
