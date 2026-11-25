@@ -1026,11 +1026,27 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       deletedAt: null,
     };
     let configStream: { ws: { sendText(data: string): unknown }; requestId: string } | null = null;
+    // Preview media, like T3's /api/preview-stream: who connected (and how), and what they sent
+    const mediaConnections: Array<{ path: string; query: Record<string, string>; authorization: string | null }> = [];
+    const mediaMessages: string[] = [];
+    const previewEventStreams: Array<{ ws: { sendText(data: string): unknown }; requestId: string }> = [];
     const server = Bun.serve({
       port: 0,
       hostname: "127.0.0.1",
       fetch(req, srv) {
         const url = new URL(req.url);
+        if (url.pathname.startsWith("/api/preview-stream/") || url.pathname.startsWith("/api/device-hub/")) {
+          mediaConnections.push({
+            path: url.pathname,
+            query: Object.fromEntries(url.searchParams),
+            authorization: req.headers.get("authorization"),
+          });
+          if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
+            (srv as unknown as Bun.Server<{ media: boolean }>).upgrade(req, { data: { media: true } });
+            return undefined;
+          }
+          return Response.json({ vmTag, media: url.pathname });
+        }
         if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
           srv.upgrade(req);
           return undefined;
@@ -1052,7 +1068,19 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
         return Response.json({ ok: true, vmTag });
       },
       websocket: {
+        open(ws) {
+          // A preview stream starts with a JPEG frame; this one names the VM that drew it
+          if ((ws.data as { media?: boolean } | undefined)?.media) ws.sendBinary(new TextEncoder().encode(`frame-from-${vmTag}`));
+        },
         message(ws, raw) {
+          if ((ws.data as { media?: boolean } | undefined)?.media) {
+            const text = typeof raw === "string" ? raw : new TextDecoder().decode(raw);
+            mediaMessages.push(text);
+            const msg = JSON.parse(text) as { type?: string };
+            if (msg.type === "ack") ws.sendText(JSON.stringify({ type: "control", acked: vmTag }));
+            if (msg.type === "host-setup") ws.close(4503, JSON.stringify({ need: "libraries", command: "t3 browser setup" }));
+            return;
+          }
           const frame = JSON.parse(String(raw)) as { _tag: string; id?: string; tag?: string; payload?: Record<string, unknown> };
           if (frame._tag === "Ping") {
             ws.sendText(JSON.stringify({ _tag: "Pong" }));
@@ -1182,6 +1210,10 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
             }
             return;
           }
+          if (frame.tag === "subscribePreviewEvents") {
+            previewEventStreams.push({ ws, requestId: frame.id });
+            return;
+          }
           if (frame.tag === "scheduledTasks.subscribe") {
             ws.sendText(JSON.stringify({ _tag: "Chunk", requestId: frame.id, values: [{ tasks: [] }] }));
             return;
@@ -1282,6 +1314,11 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       if (!configStream) throw new Error("no open subscribeServerConfig stream on fake VM");
       configStream.ws.sendText(JSON.stringify({ _tag: "Chunk", requestId: configStream.requestId, values }));
     };
+    const pushPreviewEvent = (event: Record<string, unknown>) => {
+      for (const stream of previewEventStreams) {
+        stream.ws.sendText(JSON.stringify({ _tag: "Chunk", requestId: stream.requestId, values: [event] }));
+      }
+    };
     return {
       server,
       url: `http://127.0.0.1:${server.port}`,
@@ -1292,6 +1329,10 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       getSettings: () => vmSettings,
       uploads,
       threads,
+      mediaConnections,
+      mediaMessages,
+      previewEventStreams,
+      pushPreviewEvent,
     };
   }
 
@@ -3674,6 +3715,187 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     expect((await exitOf("gone-list")).value).toEqual({ sessions: [], serverEpoch: "boat-hub", revision: 0 });
     expect(JSON.stringify(vm1.seenMethods.slice(vm1Before))).not.toContain("thread-B");
     expect(JSON.stringify(vm1.seenMethods)).not.toContain("s3cret-late");
+  });
+
+  describe("preview streams reach the chat's own VM", () => {
+    type HubClient = Awaited<ReturnType<typeof connectHubClient>>;
+    const until = async (cond: () => boolean, timeoutMs = 5_000) => {
+      const start = Date.now();
+      while (!cond()) {
+        if (Date.now() - start > timeoutMs) throw new Error("condition not met in time");
+        await Bun.sleep(10);
+      }
+    };
+
+    async function mediaTicket(client: HubClient, cfg: SentinelConfig): Promise<string> {
+      const res = await fetch(`${client.base}/api/auth/websocket-ticket/media`, {
+        method: "POST",
+        headers: { host: cfg.hub!.host, authorization: `Bearer ${client.bearer}` },
+      });
+      return ((await res.json()) as { ticket: string }).ticket;
+    }
+
+    /** Opens a media socket on the Hub like the app's preview pane, and records what it gets. */
+    async function openMedia(handle: SentinelServerHandle, cfg: SentinelConfig, pathAndQuery: string) {
+      const ws = new WebSocket(`ws://127.0.0.1:${handle.server.port}${pathAndQuery}`, {
+        headers: { host: cfg.hub!.host },
+      } as unknown as string[]);
+      ws.binaryType = "arraybuffer";
+      cleanups.push(() => ws.close());
+      const messages: string[] = [];
+      const binary: string[] = [];
+      let closed: { code: number; reason: string } | null = null;
+      ws.addEventListener("message", (ev) => {
+        if (typeof ev.data === "string") messages.push(ev.data);
+        else binary.push(new TextDecoder().decode(ev.data as ArrayBuffer));
+      });
+      ws.addEventListener("close", (ev) => (closed = { code: ev.code, reason: ev.reason }));
+      await new Promise<void>((resolve) => {
+        ws.addEventListener("open", () => resolve());
+        ws.addEventListener("close", () => resolve());
+      });
+      return { ws, messages, binary, closed: () => closed as { code: number; reason: string } | null };
+    }
+
+    /** Two chats on two VMs: thread-A on sb-1 (vm1, also the generic fallback), thread-B on sb-2 (vm2). */
+    async function twoChats(prefix: string) {
+      const vm1 = startFakeVmT3Server(`${prefix}1`);
+      const vm2 = startFakeVmT3Server(`${prefix}2`);
+      cleanups.push(() => vm1.server.stop(true));
+      cleanups.push(() => vm2.server.stop(true));
+      const hub = await startHubWithVm(vm1, `t3-sentinel-hub-${prefix}-`);
+      hub.boat.hostPublic = async (id: string) => (id === "sb-2" ? vm2.url : vm1.url);
+      const client = await connectHubClient(hub.handle, hub.cfg);
+      await launchThreadOnHub(client, "thread-A");
+      const hubProjectId = hub.handle.state.getHubSandbox("sb-1")!.hubProjectId;
+      client.request("launch-thread-B", "orchestration.launchThread", { threadId: "thread-B", projectId: hubProjectId, title: "B", workspaceStrategy: { type: "root" } });
+      await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "launch-thread-B");
+      expect(hub.handle.state.getHubSandbox("sb-2")?.threadIds).toEqual(["thread-B"]);
+      return { vm1, vm2, client, ...hub };
+    }
+
+    test("a preview opened in chat B streams from VM B only, both ways, and ends with 4404 once B's VM is gone", async () => {
+      const { vm1, vm2, client, cfg, handle } = await twoChats("vm-pv");
+      const hub = handle.hub!;
+      const exitOf = async (id: string) => (await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === id)).exit as Record<string, unknown>;
+
+      // Preview RPCs name the chat: B's go to vm2 only, even though vm1 is the generic fallback
+      client.request("open-b", "preview.open", { threadId: "thread-B", url: "http://localhost:4321/" });
+      client.request("status-b", "preview.reportStatus", { threadId: "thread-B", tabId: "tab-1", navStatus: { _tag: "Idle" }, canGoBack: false, canGoForward: false });
+      expect((await exitOf("open-b"))._tag).toBe("Success");
+      expect((await exitOf("status-b"))._tag).toBe("Success");
+      expect(vm2.seenMethods.filter((m) => m.tag.startsWith("preview.")).map((m) => m.tag)).toEqual(["preview.open", "preview.reportStatus"]);
+      expect(vm1.seenMethods.some((m) => m.tag.startsWith("preview."))).toBe(false);
+      // The localhost URL is the VM's own, so it goes through untouched
+      expect((vm2.seenMethods.find((m) => m.tag === "preview.open")!.payload as { url: string }).url).toBe("http://localhost:4321/");
+
+      // Preview events: each VM publishes its own chats', and the app gets all of them on one stream
+      client.request("pev", "subscribePreviewEvents", {});
+      await until(() => vm1.previewEventStreams.length === 1 && vm2.previewEventStreams.length === 1);
+      const opened = { type: "opened", threadId: "thread-B", tabId: "tab-1", createdAt: "now", serverEpoch: "epoch-vm2", revision: 1, snapshot: { threadId: "thread-B", tabId: "tab-1" } };
+      vm2.pushPreviewEvent(opened);
+      const chunk = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "pev");
+      expect(chunk.values).toEqual([opened]);
+      await until(() => vm2.acks.some((id) => id.startsWith("hub-s-")));
+
+      // The pane's media socket: through the Hub to vm2, with vm2's own token and not the Hub's ticket
+      const ticket = await mediaTicket(client, cfg);
+      const pane = await openMedia(handle, cfg, `/api/preview-stream/ws?threadId=thread-B&tabId=tab-1&maxWidth=800&maxHeight=600&wsTicket=${ticket}`);
+      await until(() => pane.binary.length > 0);
+      expect(pane.binary).toEqual([`frame-from-vm-pv2`]);
+      expect(vm2.mediaConnections).toHaveLength(1);
+      expect(vm2.mediaConnections[0]).toEqual({
+        path: "/api/preview-stream/ws",
+        query: { threadId: "thread-B", tabId: "tab-1", maxWidth: "800", maxHeight: "600" },
+        authorization: `Bearer ${handle.state.getHubSandbox("sb-2")!.upstreamToken}`,
+      });
+      expect(vm1.mediaConnections).toHaveLength(0);
+      expect(hub.mediaSocketCount("sb-2")).toBe(1);
+      // The client's ack reaches vm2 as sent, and vm2's answer comes back
+      pane.ws.send(JSON.stringify({ type: "ack" }));
+      await until(() => pane.messages.length > 0);
+      expect(vm2.mediaMessages).toEqual([JSON.stringify({ type: "ack" })]);
+      expect(JSON.parse(pane.messages[0])).toEqual({ type: "control", acked: "vm-pv2" });
+
+      // A download from that tab goes to vm2 too, without the Hub's ticket
+      const dl = await fetch(`${client.base}/api/preview-stream/download?threadId=thread-B&tabId=tab-1&id=d1&wsTicket=${ticket}`, { headers: { host: cfg.hub!.host } });
+      expect(await dl.json()).toEqual({ vmTag: "vm-pv2", media: "/api/preview-stream/download" });
+      expect(vm2.mediaConnections[1].query).toEqual({ threadId: "thread-B", tabId: "tab-1", id: "d1" });
+      // No ticket, no stream
+      const noTicket = await fetch(`${client.base}/api/preview-stream/ws?threadId=thread-B&tabId=tab-1`, { headers: { host: cfg.hub!.host, upgrade: "websocket", connection: "Upgrade", "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==", "sec-websocket-version": "13" } });
+      expect(noTicket.status).toBe(401);
+
+      // The VM's own close code reaches the app unchanged (4503: the browser needs host setup)
+      const setup = await openMedia(handle, cfg, `/api/preview-stream/ws?threadId=thread-B&tabId=tab-2&maxWidth=800&maxHeight=600&wsTicket=${ticket}`);
+      await until(() => setup.binary.length > 0);
+      setup.ws.send(JSON.stringify({ type: "host-setup" }));
+      await until(() => setup.closed() !== null);
+      expect(setup.closed()!.code).toBe(4503);
+      expect(JSON.parse(setup.closed()!.reason)).toEqual({ need: "libraries", command: "t3 browser setup" });
+
+      // B's VM goes away: its open stream ends with 4404 (tab gone), and so does a new one; vm1 sees nothing
+      await hub.destroyHubSandbox("sb-2", "test");
+      await until(() => pane.closed() !== null);
+      expect(pane.closed()!.code).toBe(4404);
+      const late = await openMedia(handle, cfg, `/api/preview-stream/ws?threadId=thread-B&tabId=tab-1&maxWidth=800&maxHeight=600&wsTicket=${ticket}`);
+      await until(() => late.closed() !== null);
+      expect(late.closed()!.code).toBe(4404);
+      const lateDl = await fetch(`${client.base}/api/preview-stream/download?threadId=thread-B&tabId=tab-1&id=d1&wsTicket=${ticket}`, { headers: { host: cfg.hub!.host } });
+      expect(lateDl.status).toBe(404);
+      expect(vm1.mediaConnections).toHaveLength(0);
+      expect(hub.mediaSocketCount()).toBe(0);
+
+      // Chat A still streams from vm1, and its preview events still arrive
+      const paneA = await openMedia(handle, cfg, `/api/preview-stream/ws?threadId=thread-A&tabId=tab-9&maxWidth=800&maxHeight=600&wsTicket=${ticket}`);
+      await until(() => paneA.binary.length > 0);
+      expect(paneA.binary).toEqual(["frame-from-vm-pv1"]);
+      vm1.pushPreviewEvent({ ...opened, threadId: "thread-A", serverEpoch: "epoch-vm1" });
+      const chunkA = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "pev");
+      expect((chunkA.values as Array<{ threadId: string }>)[0].threadId).toBe("thread-A");
+
+      // Closing the event stream ends it on the VMs
+      client.ws.send(JSON.stringify({ _tag: "Interrupt", requestId: "pev" }));
+      await exitOf("pev");
+      const before = vm1.previewEventStreams.length;
+      vm1.pushPreviewEvent({ ...opened, threadId: "thread-A" });
+      await Bun.sleep(50);
+      expect(client.inbox.some((f) => f._tag === "Chunk" && f.requestId === "pev")).toBe(false);
+      expect(vm1.previewEventStreams.length).toBe(before);
+    });
+
+    test("a preview of a sleeping chat is told to retry (1013) and does not wake the VM; once awake it streams", async () => {
+      const vm = startFakeVmT3Server("vm-pv-sleep");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-pv-sleep-");
+      const client = await connectHubClient(handle, cfg);
+      await launchThreadOnHub(client, "thread-zz");
+      const sandboxId = handle.state.listHubSandboxes()[0].sandboxId;
+      const ticket = await mediaTicket(client, cfg);
+      const path = `/api/preview-stream/ws?threadId=thread-zz&tabId=tab-1&maxWidth=800&maxHeight=600&wsTicket=${ticket}`;
+
+      // A stream open when the VM goes to sleep is ended (a paused VM never closes it itself)
+      const pane = await openMedia(handle, cfg, path);
+      await until(() => pane.binary.length > 0);
+      await handle.hub!.sleepHubSandbox(sandboxId);
+      await until(() => pane.closed() !== null);
+      expect(pane.closed()!.code).toBe(1013);
+
+      // Reconnecting while asleep: retry later, and no wake
+      const asleep = await openMedia(handle, cfg, path);
+      await until(() => asleep.closed() !== null);
+      expect(asleep.closed()!.code).toBe(1013);
+      expect(asleep.closed()!.reason).toContain("asleep");
+      expect(boat.resumed).toHaveLength(0);
+      expect(vm.mediaConnections.filter((c) => c.path === "/api/preview-stream/ws")).toHaveLength(1);
+
+      // The preview RPC wakes the chat, and the next reconnect streams again
+      client.request("list", "preview.list", { threadId: "thread-zz" });
+      await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "list");
+      expect(boat.resumed).toEqual([sandboxId]);
+      const awake = await openMedia(handle, cfg, path);
+      await until(() => awake.binary.length > 0);
+      expect(awake.binary).toEqual(["frame-from-vm-pv-sleep"]);
+    });
   });
 
   test("spawns 1 fresh Boat VM per chat behind 1 single Environment, routes RPCs strictly to owning VM, and destroys only the settled VM", async () => {
