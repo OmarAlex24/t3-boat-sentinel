@@ -60,6 +60,12 @@ export interface SandboxProvider {
   exec(id: string, script: string, timeoutSecs?: number): Promise<ExecResult>;
   execOk(id: string, script: string, timeoutSecs?: number): Promise<string>;
   upload(id: string, localPath: string, remotePath: string): Promise<void>;
+  /**
+   * Copies one file out of the sandbox by file transfer, never through command output (which
+   * providers such as Boat keep in their command history). Optional: providers without a
+   * transfer that keeps contents out of logs leave it undefined, and callers must degrade.
+   */
+  download?(id: string, remotePath: string, localPath: string, timeoutSecs?: number): Promise<void>;
 
   /** Present when `capabilities.has("pause")`. */
   pause?(id: string): Promise<void>;
@@ -92,6 +98,7 @@ export interface LegacyBoatClient {
   exec(id: string, script: string, timeoutSecs?: number): Promise<ExecResult>;
   execOk(id: string, script: string, timeoutSecs?: number): Promise<string>;
   upload(id: string, localPath: string, remotePath: string): Promise<void>;
+  download?(id: string, remotePath: string, localPath: string, timeoutSecs?: number): Promise<void>;
 }
 
 export function isSandboxProvider(value: SandboxProvider | LegacyBoatClient): value is SandboxProvider {
@@ -112,6 +119,12 @@ export function asSandboxProvider(client: SandboxProvider | LegacyBoatClient): S
     exec: (id, script, timeoutSecs) => client.exec(id, script, timeoutSecs),
     execOk: (id, script, timeoutSecs) => client.execOk(id, script, timeoutSecs),
     upload: (id, localPath, remotePath) => client.upload(id, localPath, remotePath),
+    ...(typeof client.download === "function"
+      ? {
+          download: (id: string, remotePath: string, localPath: string, timeoutSecs?: number) =>
+            client.download!(id, remotePath, localPath, timeoutSecs),
+        }
+      : {}),
     pause: (id) => client.stop(id),
     resume: (id, size) => client.resume(id, size),
     saveSnapshot: (id, name) => client.saveSnapshot(id, name),

@@ -64,6 +64,8 @@ interface PendingUpstreamCall {
   vmProjectId?: string;
   hubProjectId?: string;
   tag?: string;
+  /** Called with the upstream Exit before it is relayed to the client. */
+  onExit?: (exit: { _tag: "Success"; value: unknown } | { _tag: "Failure"; cause: unknown }) => void;
 }
 
 interface StagedAttachment {
@@ -106,6 +108,9 @@ const THREAD_ROUTED_METHODS = new Set([
 ]);
 
 const WORKSPACE_ROUTED_PREFIXES = ["vcs.", "git.", "projects.", "review."];
+
+/** Sign-out RPCs (`{ instanceId }` payload); a successful one forgets the stored provider session. */
+const PROVIDER_LOGOUT_METHODS = new Set(["provider.auth.logout", "server.logoutAcpRegistry"]);
 
 const KEEP_OPEN_SUBSCRIPTIONS = new Set([
   "subscribePreviewEvents",
@@ -475,6 +480,7 @@ class HubVmBridge {
     tag: string,
     payload: unknown,
     headers: unknown = [],
+    onExit?: PendingUpstreamCall["onExit"],
   ): string {
     const upReqId = `hub-f-${++this.reqCounter}`;
     const rewrittenPayload = rewriteProjectIds(payload, this.sandbox.hubProjectId, this.sandbox.vmProjectId);
@@ -484,6 +490,7 @@ class HubVmBridge {
       vmProjectId: this.sandbox.vmProjectId,
       hubProjectId: this.sandbox.hubProjectId,
       tag,
+      onExit,
     });
     clientWs.data.upstreamRequests.set(String(clientReqId), { sandboxId: this.sandbox.sandboxId, upReqId });
     this.sendRaw({ _tag: "Request", id: upReqId, tag, payload: rewrittenPayload, headers });
@@ -541,6 +548,13 @@ class HubVmBridge {
       if (call.resolve) {
         call.resolve(frame.exit);
         return;
+      }
+      if (call.onExit) {
+        try {
+          call.onExit(frame.exit);
+        } catch (err) {
+          console.warn("[hub] upstream exit hook failed:", err instanceof Error ? err.message : err);
+        }
       }
       if (call.clientWs && call.clientReqId !== undefined) {
         call.clientWs.data.upstreamRequests.delete(String(call.clientReqId));
@@ -603,6 +617,7 @@ export class HubServer {
     Set<{ ws: ServerWebSocket<HubWsData>; reqKey: string; reqId: string | number }>
   >();
   private readonly activeProjectClones = new Map<string, ProjectCloneSnapshotState>();
+  private readonly destroyingSandboxes = new Set<string>();
 
   private readonly boat: SandboxProvider;
   private readonly mcp: HubMcpHandler;
@@ -691,6 +706,21 @@ export class HubServer {
       bridge.stop();
     }
     this.bridges.clear();
+    this.lifecycle.providerSessions.stop();
+  }
+
+  /**
+   * For a sign-out of a synced provider instance, returns a hook that forgets the stored session
+   * once the VM confirms it. A mere `unauthenticated` status never deletes it (it can be transient).
+   */
+  private signOutHook(tag: string, payload: unknown): PendingUpstreamCall["onExit"] {
+    if (!PROVIDER_LOGOUT_METHODS.has(tag)) return undefined;
+    const instanceId = (payload as { instanceId?: unknown } | null)?.instanceId;
+    if (typeof instanceId !== "string" || !this.lifecycle.providerSessions.isEnabled(instanceId)) return undefined;
+    return (exit) => {
+      if (exit._tag !== "Success") return;
+      this.lifecycle.providerSessions.forget(instanceId);
+    };
   }
 
   createPairingLink(): { url: string; code: string; expiresAt: string } {
@@ -1429,7 +1459,7 @@ export class HubServer {
     if (live) {
       try {
         const bridge = await this.ensureBridgeOpen(live);
-        bridge.forwardToClient(ws, reqId, tag, payload, headers);
+        bridge.forwardToClient(ws, reqId, tag, payload, headers, this.signOutHook(tag, payload));
         return;
       } catch {
         // fall through
@@ -1888,6 +1918,7 @@ export class HubServer {
         watchdogSecret,
         llmToken,
         mintToken: true,
+        injectProviderSessions: true,
       });
 
       if (!provisioned.upstreamToken) {
@@ -1929,10 +1960,15 @@ export class HubServer {
         sleepingSince: null,
       };
 
+      const injected = provisioned.injectedProviderSessions ?? [];
+      // The VM already holds the stored copy: its first `authenticated` report needs no re-read
+      this.lifecycle.providerSessions.markInjected(sandboxId, injected);
       this.state.setHubSandbox(record);
       this.threadToSandbox.set(threadId, sandboxId);
       this.attachBridge(record);
       await this.bridges.get(sandboxId)!.waitUntilOpen(20_000);
+      // T3 may still report the status it probed before the sign-in was placed; re-check in the background
+      for (const instanceId of injected) this.refreshInjectedProvider(sandboxId, instanceId);
 
       emitStage("done", `Boat VM ${sandboxId} (${size}) ready`, 100);
       console.log(`[hub] sandbox ${sandboxId} ready for thread=${threadId} (project=${projectKey})`);
@@ -2066,15 +2102,33 @@ export class HubServer {
 
   async destroyHubSandbox(sandboxId: string, reason: string): Promise<void> {
     const sb = this.state.getHubSandbox(sandboxId);
-    if (!sb) return;
+    if (!sb || this.destroyingSandboxes.has(sandboxId)) return;
+    this.destroyingSandboxes.add(sandboxId);
+    try {
+      await this.doDestroyHubSandbox(sb, reason);
+    } finally {
+      this.destroyingSandboxes.delete(sandboxId);
+    }
+  }
+
+  private async doDestroyHubSandbox(sb: HubSandboxRecord, reason: string): Promise<void> {
+    const sandboxId = sb.sandboxId;
     console.log(`[hub] destroying sandbox ${sandboxId} (project=${sb.project}, reason=${reason})`);
+
+    // Best effort, bounded (~10s): the CLI may have refreshed the token since it was captured
+    if (sb.phase === "running") {
+      await this.lifecycle.providerSessions.pullBeforeDestroy(sandboxId).catch(() => {});
+    }
+    this.lifecycle.providerSessions.forgetSandbox(sandboxId);
 
     this.bridges.get(sandboxId)?.stop();
     this.bridges.delete(sandboxId);
 
-    const threadIds = [...sb.threadIds];
-    const worktreePaths = [...sb.worktreePaths];
-    const klavAgent = sb.klavAgentName;
+    // Threads may have been bound while the pull ran
+    const current = this.state.getHubSandbox(sandboxId) ?? sb;
+    const threadIds = [...current.threadIds];
+    const worktreePaths = [...current.worktreePaths];
+    const klavAgent = current.klavAgentName;
 
     this.state.removeHubSandbox(sandboxId);
     this.mcp.recordThreadsDestroyed(threadIds, reason);
@@ -2256,8 +2310,40 @@ export class HubServer {
   }
 
   private handleVmProviderStatuses(sandboxId: string, providers: unknown[]): void {
-    if (!this.state.getHubSandbox(sandboxId)) return;
+    const sb = this.state.getHubSandbox(sandboxId);
+    if (!sb) return;
     this.applyProviderStatuses(providers);
+    this.observeProviderSessions(sb, providers);
+  }
+
+  /** Feeds a booted VM's provider list to the session store (capture on `authenticated`). */
+  private observeProviderSessions(sb: HubSandboxRecord, providers: unknown[]): void {
+    // Records only exist once provisioning finished; skip VMs that are not live
+    if (sb.phase !== "running" || this.destroyingSandboxes.has(sb.sandboxId)) return;
+    this.lifecycle.providerSessions.observe(sb.sandboxId, providers, sb.createdAt);
+  }
+
+  /** Re-checks one provider on the VM it was injected into and caches the answer. Never throws. */
+  private refreshInjectedProvider(sandboxId: string, instanceId: string): void {
+    const bridge = this.bridges.get(sandboxId);
+    if (!bridge) return;
+    const input = { instanceId };
+    void bridge
+      .callUnary("server.refreshProviders", input, 150_000)
+      .then((exit) => {
+        if (exit._tag !== "Success" || !exit.value || typeof exit.value !== "object") {
+          console.warn(`[sessions] refresh of ${instanceId} on ${sandboxId} after injection did not succeed`);
+          return;
+        }
+        if (!this.state.getHubSandbox(sandboxId)) return;
+        const value = exit.value as Record<string, unknown>;
+        this.cacheRefreshedProviders(input, value);
+        if (Array.isArray(value.providers)) {
+          const sb = this.state.getHubSandbox(sandboxId);
+          if (sb) this.observeProviderSessions(sb, value.providers);
+        }
+      })
+      .catch(() => {});
   }
 
   /**
@@ -2276,6 +2362,12 @@ export class HubServer {
     const exit = await bridge.callUnary("server.refreshProviders", input, 150_000);
     if (exit._tag !== "Success" || !exit.value || typeof exit.value !== "object") return null;
     const value = exit.value as Record<string, unknown>;
+    this.cacheRefreshedProviders(input, value);
+    return value;
+  }
+
+  /** Merges a `server.refreshProviders` reply into the Hub's cached provider list. */
+  private cacheRefreshedProviders(input: Record<string, unknown>, value: Record<string, unknown>): void {
     const replied = value.providers;
     // An empty reply (omitProviders / modelCatalogOnly) and per-cwd snapshots are not the machine list
     if (Array.isArray(replied) && replied.length > 0 && input.cwd === undefined) {
@@ -2295,7 +2387,6 @@ export class HubServer {
       }
       this.applyProviderStatuses(next);
     }
-    return value;
   }
 
   private handleTemplatesHarvested(
@@ -2317,6 +2408,10 @@ export class HubServer {
       // Push updated real ServerConfig to any already-connected clients
       this.broadcastProviderStatuses();
     }
+    // The first snapshot is not sent to onProviderStatuses; a VM may already be signed in (e.g. after a Hub restart)
+    const providers = templates.serverConfig?.providers;
+    const live = this.state.getHubSandbox(sandbox.sandboxId);
+    if (live && Array.isArray(providers)) this.observeProviderSessions(live, providers);
     // Also harvest vcsRefs for this project if missing
     const project = this.state.getAllProjects(this.config)[sandbox.project];
     const bridge = this.bridges.get(sandbox.sandboxId);

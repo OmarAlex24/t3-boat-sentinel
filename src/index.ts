@@ -254,6 +254,14 @@ async function main(): Promise<void> {
       break;
     }
 
+    case "forget-session": {
+      const instanceId = rest[0];
+      if (!instanceId) throw new Error("Usage: sentinel forget-session <instanceId>");
+      const res = await callControlApi(localBase, config.controlSecret, "/api/forget-session", { instanceId });
+      console.log(JSON.stringify(res, null, 2));
+      break;
+    }
+
     case "spawn": {
       const [project, slot] = rest;
       if (!project) throw new Error("Usage: sentinel spawn <project> [slot]");
@@ -300,7 +308,7 @@ async function main(): Promise<void> {
 
     default:
       console.error(
-        `Unknown command "${cmd}". Commands: init | serve | mcp | bake <target> | pair <slot> | token <hub> [label] | revoke <slot> [clientId] | spawn <project> [slot] | wake <slot> | sleep <slot> | reset <slot> | status`,
+        `Unknown command "${cmd}". Commands: init | serve | mcp | bake <target> | pair <slot> | token <hub> [label] | revoke <slot> [clientId] | forget-session <instanceId> | spawn <project> [slot] | wake <slot> | sleep <slot> | reset <slot> | status`,
       );
       process.exit(1);
   }

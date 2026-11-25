@@ -55,6 +55,11 @@ t3:
   # fails instead of saving a snapshot that would show them as "Not found".
   # prepareAcpAgents: [devin]
   # installProviders: [antigravity]
+  # Optional provider instances whose sign-in follows you across chat VMs (supported driver: antigravity).
+  # Sign in once in any Hub chat: sentinel copies the credential file to `<stateDir>/credentials/<instanceId>/`
+  # (0600) and places it in every new VM before T3 starts. It is never baked into a snapshot. Signing out in
+  # T3, or `sentinel forget-session <instanceId>`, deletes the stored copy.
+  # persistProviderSessions: [antigravity]
 
 boat:
   # Optional explicit path to boat binary (auto-detects ~/.ascii/bin/boat or PATH)

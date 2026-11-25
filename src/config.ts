@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import YAML from "yaml";
+import { PROVIDER_INSTANCE_ID_RE } from "./provider-sessions.ts";
 
 export interface SlotConfig {
   name: string;
@@ -152,6 +153,12 @@ export interface SentinelConfig {
     prepareAcpAgents?: string[];
     /** Optional managed provider instance IDs to pre-install into `baseSnapshot` during `bake base` (e.g. ["antigravity"]); every bake verifies them. */
     installProviders?: string[];
+    /**
+     * Optional provider instance IDs whose sign-in is kept across chat VMs (e.g. ["antigravity"]).
+     * The credential file is captured from a signed-in VM into `<stateDir>/credentials/<instanceId>/`
+     * (0600) and copied into every new VM; never into snapshots. Supported drivers: antigravity.
+     */
+    persistProviderSessions?: string[];
   };
   boat: {
     bin?: string;
@@ -227,6 +234,15 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
     settingsFile: parsed.t3?.settingsFile ? resolve(parsed.t3.settingsFile) : undefined,
     prepareAcpAgents: Array.isArray(parsed.t3?.prepareAcpAgents) ? parsed.t3.prepareAcpAgents.map(String) : undefined,
     installProviders: Array.isArray(parsed.t3?.installProviders) ? parsed.t3.installProviders.map(String) : undefined,
+    persistProviderSessions: Array.isArray(parsed.t3?.persistProviderSessions)
+      ? parsed.t3.persistProviderSessions.map((id) => {
+          const s = String(id).trim();
+          if (!PROVIDER_INSTANCE_ID_RE.test(s)) {
+            throw new Error(`Invalid provider instance ID "${s}" in t3.persistProviderSessions`);
+          }
+          return s;
+        })
+      : undefined,
   };
 
   const boat = {

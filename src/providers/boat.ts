@@ -247,4 +247,9 @@ export class BoatProvider implements SandboxProvider, LegacyBoatClient {
   async upload(id: string, localPath: string, remotePath: string): Promise<void> {
     await this.run(["scp", localPath, `${id}:${remotePath}`], 1800_000);
   }
+
+  /** `boat scp <id>:<remote> <local>`: the bytes travel as a file transfer, not as `boat exec` output. */
+  async download(id: string, remotePath: string, localPath: string, timeoutSecs = 60): Promise<void> {
+    await this.run(["scp", `${id}:${remotePath}`, localPath], timeoutSecs * 1000);
+  }
 }

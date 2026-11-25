@@ -11,6 +11,7 @@ import {
 } from "./providers/types.ts";
 import type { ProjectConfig, SentinelConfig } from "./config.ts";
 import type { KlavClient } from "./klav.ts";
+import { ProviderSessionStore, STAGED_SESSIONS_DIR } from "./provider-sessions.ts";
 import type { SlotRecord, StateStore } from "./state.ts";
 import { ensureT3Project, launchT3Thread, type LaunchThreadOptions } from "./t3rpc.ts";
 
@@ -56,6 +57,8 @@ export class LifecycleManager {
   private bakeTimer: ReturnType<typeof setInterval> | null = null;
 
   private readonly boat: SandboxProvider;
+  /** Provider sign-ins synced across chat VMs (`t3.persistProviderSessions`). */
+  readonly providerSessions: ProviderSessionStore;
 
   constructor(
     private readonly config: SentinelConfig,
@@ -64,6 +67,7 @@ export class LifecycleManager {
     private readonly klav?: KlavClient,
   ) {
     this.boat = asSandboxProvider(provider);
+    this.providerSessions = new ProviderSessionStore(config, this.boat);
   }
 
   getProvider(): SandboxProvider {
@@ -101,6 +105,7 @@ export class LifecycleManager {
     if (this.bakeTimer) clearInterval(this.bakeTimer);
     this.reaperTimer = null;
     this.bakeTimer = null;
+    this.providerSessions.stop();
   }
 
   private withSlotLock<T>(slotName: string, fn: () => Promise<T>): Promise<T> {
@@ -226,6 +231,7 @@ export class LifecycleManager {
             effectiveProject,
             perSandboxWatchdogSecret,
             perSandboxLlmToken,
+            true,
             true,
           );
 
@@ -851,15 +857,40 @@ export class LifecycleManager {
     watchdogSecret: string;
     llmToken: string | null;
     mintToken: boolean;
+    /**
+     * Fresh VMs only: stage stored provider sign-ins (`t3.persistProviderSessions`) so T3 starts
+     * signed in. Never set on wake, where the VM's own copy may be newer.
+     */
+    injectProviderSessions?: boolean;
   }): Promise<{
     descriptor?: Record<string, unknown>;
     authSession?: Record<string, unknown>;
     upstreamToken?: string;
+    /** Instance IDs whose stored sign-in was staged into this VM. */
+    injectedProviderSessions?: string[];
   }> {
     const { sandboxId, watchdogSlotKey, environmentId, label, projectName, project, watchdogSecret, llmToken, mintToken } = opts;
-    await this.boat.execOk(sandboxId, "mkdir -p ~/.t3-sentinel && chmod 700 ~/.t3-sentinel", 30);
+    const staged = opts.injectProviderSessions ? this.providerSessions.stagedCredentials() : [];
+    const stagingDirs = [...new Set(staged.map((c) => c.remoteDir))];
+    // Staging dirs live under the 0700 ~/.t3-sentinel; provision-base.sh installs the files 0600 and removes them
+    const mkdirs = stagingDirs.map((d) => ` && mkdir -p ${d}`).join("");
+    await this.boat.execOk(sandboxId, `mkdir -p ~/.t3-sentinel && chmod 700 ~/.t3-sentinel${mkdirs}`, 30);
     await this.boat.upload(sandboxId, PROVISION_SCRIPT, "~/.t3-sentinel/provision-base.sh");
     await this.boat.upload(sandboxId, WATCHDOG_SCRIPT, "~/.t3-sentinel/watchdog.mjs");
+
+    const injected = new Set<string>();
+    for (const cred of staged) {
+      try {
+        await this.boat.upload(sandboxId, cred.localPath, cred.remotePath);
+        injected.add(cred.instanceId);
+      } catch {
+        // Never block a launch on a missing sign-in: drop anything staged (no partial files) and boot signed out
+        console.warn(`[sessions] could not copy stored ${cred.instanceId} session into ${sandboxId}; continuing signed out`);
+        injected.clear();
+        await this.boat.exec(sandboxId, `rm -rf ${STAGED_SESSIONS_DIR}`, 30).catch(() => {});
+        break;
+      }
+    }
 
     const tmpDir = mkdtempSync(join(tmpdir(), "t3-sentinel-boot-"));
     try {
@@ -954,7 +985,10 @@ export class LifecycleManager {
     if (parsed.descriptor || parsed.authSession) {
       this.state.setTemplates(parsed.descriptor ?? null, parsed.authSession ?? null);
     }
-    return parsed;
+    if (injected.size > 0) {
+      console.log(`[sessions] copied stored ${[...injected].join(", ")} session(s) into ${sandboxId}`);
+    }
+    return { ...parsed, injectedProviderSessions: [...injected] };
   }
 
   private async provisionRunningVm(
@@ -964,6 +998,7 @@ export class LifecycleManager {
     watchdogSecret: string,
     llmToken: string | null,
     mintToken: boolean,
+    injectProviderSessions = false,
   ): Promise<void> {
     const slot = this.state.getSlot(slotName)!;
     const parsed = await this.provisionStandaloneVm({
@@ -976,6 +1011,7 @@ export class LifecycleManager {
       watchdogSecret,
       llmToken,
       mintToken,
+      injectProviderSessions,
     });
 
     this.state.updateSlot(slotName, (s) => {

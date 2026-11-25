@@ -270,6 +270,9 @@ export class SandboxSdkProvider implements SandboxProvider {
     );
   }
 
+  // No `download`: the SDK surface used here has no file read known to keep contents out of the
+  // provider's command logs, so features that pull files from a VM (provider session capture) stay off.
+
   async pause(id: string): Promise<void> {
     const sdk = await this.ensureSdk();
     if (typeof sdk.pause === "function") {
