@@ -43,6 +43,8 @@ export interface T3Contracts {
   exported(name: string): unknown;
   /** A whole `Exit` (success, typed Fail, Die, Interrupt), with the exit schema the app's RPC client uses. */
   decodeExit(tag: string, exit: unknown): DecodeResult;
+  /** A 2xx JSON body of an `EnvironmentHttpApi` endpoint (e.g. `auth`, `session`): valid if any success schema accepts it. */
+  decodeHttp(group: string, endpoint: string, body: unknown): DecodeResult;
   /** A frame the Hub sent for a request with this tag: each Chunk value, or the Exit. */
   decodeFrame(tag: string, frame: Record<string, unknown>): DecodeResult[];
 }
@@ -125,7 +127,8 @@ async function load(): Promise<T3Contracts | null> {
     : await extractServerChunks(asarPath, cacheDir);
 
   const schema = await importBySourceName(cacheDir, ["decodeUnknownExit", "toCodecJson"]);
-  const model = await importBySourceName(cacheDir, ["WsRpcGroup", "AttachmentCreateUploadUrlResult"]);
+  const model = await importBySourceName(cacheDir, ["WsRpcGroup", "AttachmentCreateUploadUrlResult", "EnvironmentHttpApi"]);
+  const httpApi = model("EnvironmentHttpApi") as { groups: Record<string, { endpoints: Record<string, { success: Set<unknown> }> }> };
   const decodeUnknownExit = schema("decodeUnknownExit") as (s: unknown) => (v: unknown) => { _tag: string; toString(): string };
   const toCodecJson = schema("toCodecJson") as (s: unknown) => unknown;
   const ExitSchema = schema("Exit") as (success: unknown, failure: unknown, defect: unknown) => unknown;
@@ -192,6 +195,17 @@ async function load(): Promise<T3Contracts | null> {
     },
     exported: (name) => model(name),
     decodeExit: (tag, exit) => run(exitSchema(tag), exit),
+    decodeHttp: (group, endpoint, body) => {
+      const def = httpApi.groups[group]?.endpoints[endpoint];
+      if (!def) throw new Error(`the app has no HTTP endpoint ${group}.${endpoint}`);
+      const errors: string[] = [];
+      for (const schema of def.success) {
+        const result = run(schema, body);
+        if (result.ok) return result;
+        errors.push(result.error ?? "");
+      }
+      return { ok: false, error: errors.join("\n") };
+    },
     decodeFrame: (tag, frame) => {
       if (frame._tag === "Chunk") {
         return ((frame.values as unknown[]) ?? []).map((v) => contracts.decodeSuccess(tag, v));

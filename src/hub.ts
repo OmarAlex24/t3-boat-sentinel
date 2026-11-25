@@ -1124,6 +1124,34 @@ export class HubServer {
     };
   }
 
+  /** `subscribeAuthAccess` snapshot: the Hub's paired clients as bearer-token sessions; no pairing links. */
+  private buildAuthAccessSnapshot(currentClientId: string): Record<string, unknown> {
+    const hub = this.state.getHub();
+    const connectedIds = new Set(Array.from(this.clients, (c) => c.data.clientId));
+    const session = this.buildAuthSession();
+    return {
+      version: 1,
+      revision: hub?.clients.length ?? 0,
+      type: "snapshot",
+      payload: {
+        pairingLinks: [],
+        clientSessions: (hub?.clients ?? []).map((c) => ({
+          sessionId: c.id,
+          subject: c.label,
+          scopes: session.scopes,
+          permissions: session.permissions,
+          method: "bearer-access-token",
+          client: { label: c.label, deviceType: "unknown" },
+          issuedAt: c.pairedAt,
+          expiresAt: session.expiresAt, // rolling, as `/api/auth/session` reports it
+          lastConnectedAt: null,
+          connected: connectedIds.has(c.id),
+          current: c.id === currentClientId,
+        })),
+      },
+    };
+  }
+
   private buildAuthSession(): Record<string, unknown> {
     const expiresAt = new Date(Date.now() + CLIENT_TOKEN_TTL_SECS * 1000).toISOString();
     const base = this.state.getTemplates().authSession ?? {
@@ -1217,6 +1245,15 @@ export class HubServer {
         },
       ],
       availableEditors: [],
+      // Required by the client's ServerConfig; the Hub exports no telemetry
+      observability: {
+        logsDirectoryPath: "/home/user/.t3/userdata/logs",
+        localTracingEnabled: false,
+        otlpTracesEnabled: false,
+        otlpMetricsEnabled: false,
+        otlpLogsEnabled: false,
+      },
+      // Every ServerSettings key has a decoding default; a VM's real settings replace these
       settings: {},
     };
   }
@@ -1588,23 +1625,7 @@ export class HubServer {
     }
     if (tag === "subscribeAuthAccess") {
       ws.data.localStreams.set(reqKey, { rawId: reqId, tag });
-      const hub = this.state.getHub();
-      sendRpcFrame(ws, {
-        _tag: "Chunk",
-        requestId: reqId,
-        values: [
-          {
-            revision: 1,
-            sessions: (hub?.clients ?? []).map((c) => ({
-              sessionId: c.id,
-              subject: c.label,
-              method: "bearer-access-token",
-              connected: true,
-              createdAt: c.pairedAt,
-            })),
-          },
-        ],
-      });
+      sendRpcFrame(ws, { _tag: "Chunk", requestId: reqId, values: [this.buildAuthAccessSnapshot(ws.data.clientId)] });
       return;
     }
     if (tag === "orchestration.subscribeShell") {
@@ -1628,12 +1649,13 @@ export class HubServer {
       return;
     }
     if (tag === "orchestration.getOlderSettledThreads") {
-      sendRpcExitSuccess(ws, reqId, { threads: [], nextCursor: null });
+      // The merged snapshot already lists every thread (VM shells are read without `omitOlderSettled`)
+      sendRpcExitSuccess(ws, reqId, { snapshotSequence: this.state.ensureHub().sequence, threads: [], counts: [] });
       return;
     }
     if (tag === "subscribeTerminalMetadata") {
       ws.data.localStreams.set(reqKey, { rawId: reqId, tag });
-      sendRpcFrame(ws, { _tag: "Chunk", requestId: reqId, values: [{ kind: "snapshot", threads: [] }] });
+      sendRpcFrame(ws, { _tag: "Chunk", requestId: reqId, values: [{ type: "snapshot", terminals: [] }] });
       return;
     }
     if (tag === "subscribeWorktreeSetup") {
@@ -1874,8 +1896,9 @@ export class HubServer {
         return;
       }
     }
-    if (tag.startsWith("pullRequests.") || tag.startsWith("peerLinks.") || tag.startsWith("sourceControl.")) {
-      sendRpcExitSuccess(ws, reqId, {});
+    if (tag === "peerLinks.list" || tag === "peerLinks.names") {
+      // No VM: no linked environments to list
+      sendRpcExitSuccess(ws, reqId, { links: [] });
       return;
     }
     sendRpcExitFailure(ws, reqId, `No active Boat sandbox to handle ${tag}; start a thread first.`);
@@ -2569,9 +2592,10 @@ export class HubServer {
       }
       sendRpcExitSuccess(ws, reqId, {
         isRepo: true,
-        hasOriginRemote: true,
+        hasPrimaryRemote: true,
         nextCursor: null,
-        branches: [
+        totalCount: 2,
+        refs: [
           { name: "main", current: true, isDefault: true, isRemote: false, worktreePath: null },
           { name: "origin/main", current: false, isDefault: true, isRemote: true, remoteName: "origin", worktreePath: null },
         ],
@@ -2584,7 +2608,7 @@ export class HubServer {
       return;
     }
     if (tag === "projects.listIgnoredFiles") {
-      sendRpcExitSuccess(ws, reqId, { paths: [] });
+      sendRpcExitSuccess(ws, reqId, { files: [], truncated: false });
       return;
     }
     if (tag === "subscribeVcsStatus" || tag === "subscribeVcsBranch") {

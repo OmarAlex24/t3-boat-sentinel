@@ -957,6 +957,17 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     const seenMethods: Array<{ tag: string; payload: unknown }> = [];
     const acks: string[] = [];
     const vmProjectId = `vm-proj-${vmTag}`;
+    /** This VM's project as T3 lists it in a shell snapshot (every key `OrchestrationProjectShell` requires). */
+    const vmProjectRow = {
+      id: vmProjectId,
+      title: "my-app",
+      workspaceRoot: "/home/user/my-app",
+      defaultModelSelection: null,
+      scripts: [],
+      createdAt: "2026-11-01T00:00:00.000Z",
+      updatedAt: "2026-11-01T00:00:00.000Z",
+      deletedAt: null,
+    };
     let configStream: { ws: { sendText(data: string): unknown }; requestId: string } | null = null;
     const server = Bun.serve({
       port: 0,
@@ -1059,7 +1070,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
                     snapshot: {
                       schemaVersion: 2,
                       snapshotSequence: 1,
-                      projects: [{ id: vmProjectId, title: "my-app", workspaceRoot: "/home/user/my-app" }],
+                      projects: [vmProjectRow],
                       threads: [...threads.values()],
                       archivedThreads: [],
                     },
@@ -1132,13 +1143,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
                 requestId: frame.id,
                 exit: {
                   _tag: "Success",
-                  value: {
-                    thread: { id: threadId, projectId: vmProjectId, title: "Cached chat" },
-                    runs: [],
-                    messages: [{ id: `vm-msg-${threadId}`, role: "user", text: "What we said before" }],
-                    turnItems: [],
-                    visibleTurnItems: [],
-                  },
+                  value: vmThreadProjection(threadId, vmProjectId),
                 },
               }),
             );
@@ -1243,6 +1248,29 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     )!;
     const { lastVisitedAt: _visited, ...row } = buildPlaceholderThread(input).shell;
     return { ...row, worktreePath, status: "running" };
+  }
+
+  /** A settled thread's projection as a T3 VM answers `getThreadProjection`: one earlier user message. */
+  function vmThreadProjection(threadId: string, projectId: string): Record<string, unknown> {
+    const input = placeholderInputFrom(
+      "launch",
+      {
+        title: "Cached chat",
+        modelSelection: { instanceId: "claudeAgent", model: "claude-opus-5-5" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        initialMessage: { messageId: `vm-msg-${threadId}`, text: "What we said before", attachments: [] },
+      },
+      threadId,
+      projectId,
+    )!;
+    const { projection } = buildPlaceholderThread(input);
+    const settled = <T extends Record<string, unknown>>(rows: T[]) => rows.map((r) => ({ ...r, runId: null }));
+    const turnItems = settled(projection.turnItems as Record<string, unknown>[]).filter((i) => i.type === "user_message");
+    const visible = (projection.visibleTurnItems as Array<{ item: Record<string, unknown> }>)
+      .filter((r) => r.item.type === "user_message")
+      .map((r) => ({ ...r, item: { ...r.item, runId: null } }));
+    return { ...projection, runs: [], messages: settled(projection.messages as Record<string, unknown>[]), turnItems, visibleTurnItems: visible };
   }
 
   /** Pairs with the Hub and opens one client WebSocket; returns helpers to send and await frames. */
@@ -2056,8 +2084,8 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       client2.request("shell", "orchestration.subscribeShell", { requestCompletionMarker: true });
       const shell = await client2.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "shell");
       const listed = (shell.values as Array<{ snapshot?: { threads: Array<Record<string, unknown>> } }>)[0].snapshot!.threads;
-      // Each row decodes as the app's `OrchestrationV2ThreadShell` (a bad row breaks the whole sidebar)
-      if (t3Contracts) for (const row of listed) expect(t3Contracts.decodeWith("OrchestrationV2ThreadShell", row)).toEqual({ ok: true });
+      // The whole merged snapshot decodes as the app's shell stream item (a bad row breaks the whole sidebar)
+      if (t3Contracts) expect(t3Contracts.decodeFrame("orchestration.subscribeShell", shell)).toEqual([{ ok: true }, { ok: true }]);
       const byId = new Map(listed.map((t) => [String(t.id), t]));
       expect([...byId.keys()].sort()).toEqual([...chats].sort());
       expect(byId.get("thread-sleep")).toMatchObject({ title: "Chat thread-sleep", projectId: hubProjectId, status: "running" });
@@ -2635,6 +2663,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
           },
         ],
       });
+      if (t3Contracts) expect(t3Contracts.decodeExit("server.updateSettings", dup)).toEqual({ ok: true });
       // The old flat payload is rejected like a T3 server's decoder rejects it
       const flat = await updateExit(a, "flat", { fastWorktreeCheckout: true });
       expect(flat).toEqual({ _tag: "Failure", cause: [{ _tag: "Die", defect: 'Missing key\n  at ["patch"]' }] });
@@ -5164,6 +5193,313 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       expect(log).toEqual([]);
       expect(handle.state.getHubSandbox("sb-np")!.klavAgentName).toBe("ksb-live");
       expect(handle.state.getHubSandbox("sb-np")!.phase).toBe("running");
+    });
+  });
+
+  describe("audit: answers the Hub builds itself decode with the T3 app's own schemas", () => {
+    // Every RPC value, stream item, typed error and HTTP body the Hub synthesizes (instead of
+    // forwarding a VM's answer), sent the way the app sends the request and decoded with the
+    // installed app's own schemas (exit schema, stream item schema, HTTP endpoint schemas).
+    type HubClient = Awaited<ReturnType<typeof connectHubClient>>;
+    const until = async (cond: () => boolean, timeoutMs = 5_000) => {
+      const start = Date.now();
+      while (!cond()) {
+        if (Date.now() - start > timeoutMs) throw new Error("condition not met in time");
+        await Bun.sleep(20);
+      }
+    };
+    const testWithApp = t3Contracts ? test : test.skip;
+    type Failure = { scenario: string; tag: string; error: string; value: unknown };
+    const cwd = "/home/user/my-app";
+
+    /** Sends RPCs as the app does and decodes every frame the Hub sends back for them. */
+    function auditor(client: HubClient, scenario: string) {
+      let seq = 0;
+      const failures: Failure[] = [];
+      const checked: string[] = [];
+      const tags = new Map<string, string>();
+      const check = (tag: string, frame: Record<string, unknown>) => {
+        checked.push(tag);
+        if (!t3Contracts) return;
+        const values = frame._tag === "Chunk" ? (frame.values as unknown[]) : [frame.exit];
+        t3Contracts.decodeFrame(tag, frame).forEach((r, i) => {
+          if (!r.ok) failures.push({ scenario, tag, error: r.error ?? "", value: values[i] });
+        });
+      };
+      /** One request and its first frame; `silent` for a stream the Hub keeps open with nothing to send. */
+      const call = async (tag: string, payload: unknown = {}, opts: { silent?: boolean } = {}) => {
+        const id = `audit-${scenario}-${++seq}`;
+        tags.set(id, tag);
+        client.request(id, tag, payload);
+        if (opts.silent) {
+          await Bun.sleep(30);
+          expect(client.inbox.some((f) => f.requestId === id)).toBe(false);
+          return null;
+        }
+        const frame = await client.waitForFrame((f) => f.requestId === id, 15_000);
+        check(tag, frame);
+        return frame as Record<string, unknown> & { exit?: { _tag: string; value?: any; cause?: any }; values?: any[] };
+      };
+      /** Frames an open stream received since (e.g. shell broadcasts). */
+      const drain = (tag: string, requestId: string) => {
+        for (let i = 0; i < client.inbox.length; ) {
+          if (client.inbox[i].requestId === requestId) check(tag, client.inbox.splice(i, 1)[0]);
+          else i++;
+        }
+      };
+      /** Later frames of every stream this auditor opened (pushes after the first frame). */
+      const drainAll = () => {
+        for (let i = 0; i < client.inbox.length; ) {
+          const tag = tags.get(String(client.inbox[i].requestId));
+          if (tag) check(tag, client.inbox.splice(i, 1)[0]);
+          else i++;
+        }
+      };
+      return { call, drain, drainAll, check, failures, checked };
+    }
+    const report = (failures: Failure[]) =>
+      failures.map((f) => `${f.scenario} ${f.tag}: ${f.error.replace(/\s+/g, " ").slice(0, 400)} <- ${JSON.stringify(f.value)?.slice(0, 300)}`);
+
+    test("environment RPCs with no VM: server config, lifecycle, auth access, shell, terminals, clones, workspace fallbacks", async () => {
+      const vm = startFakeVmT3Server("vm-audit-env");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle } = await startHubWithVm(vm, "t3-sentinel-hub-audit-env-");
+      const client = await connectHubClient(handle, cfg);
+      const other = await connectHubClient(handle, cfg); // a second paired client, connected
+      void other;
+      const a = auditor(client, "no-vm");
+      const hubProjectId = await subscribeHubShell(client);
+
+      const config = await a.call("server.getConfig");
+      expect(config!.exit!.value.observability).toMatchObject({ logsDirectoryPath: expect.any(String), localTracingEnabled: false });
+      await a.call("subscribeServerConfig");
+      await a.call("subscribeServerLifecycle");
+      const access = await a.call("subscribeAuthAccess");
+      const accessSnap = access!.values![0];
+      expect(accessSnap).toMatchObject({ version: 1, type: "snapshot", payload: { pairingLinks: [] } });
+      expect(accessSnap.payload.clientSessions).toHaveLength(2);
+      expect(accessSnap.payload.clientSessions.filter((c: { current: boolean }) => c.current)).toHaveLength(1);
+      expect(accessSnap.payload.clientSessions.every((c: { connected: boolean }) => c.connected)).toBe(true);
+      await a.call("orchestration.subscribeShell", { requestCompletionMarker: true });
+      await a.call("orchestration.getArchivedShellSnapshot", {});
+      const older = await a.call("orchestration.getOlderSettledThreads", { before: { settledAt: new Date().toISOString() }, limit: 10 });
+      expect(older!.exit!.value).toEqual({ snapshotSequence: expect.any(Number), threads: [], counts: [] });
+      const terminals = await a.call("subscribeTerminalMetadata", {});
+      expect(terminals!.values).toEqual([{ type: "snapshot", terminals: [] }]);
+      await a.call("subscribeWorktreeSetup", { threadId: "thread-none" });
+      await a.call("worktreeSetup.cancel", { threadId: "thread-none" });
+      await a.call("subscribeProjectClones", {});
+      await a.call("projectClone.cancel", { projectId: hubProjectId });
+      await a.call("projectClone.retry", { projectId: hubProjectId });
+      await a.call("server.reportClientActivity", {});
+      await a.call("preview.reportProfiles", {});
+      await a.call("preview.reportStatus", {});
+      await a.call("server.refreshProviders", {});
+      await a.call("server.getSettings", {});
+      await a.call("server.probe", {});
+      await a.call("server.updateSettings", { patch: {} });
+      const refs = await a.call("vcs.listRefs", { cwd });
+      expect(refs!.exit!.value).toMatchObject({ isRepo: true, hasPrimaryRemote: true, totalCount: 2 });
+      expect(refs!.exit!.value.refs.map((r: { name: string }) => r.name)).toEqual(["main", "origin/main"]);
+      await a.call("projects.listEntries", { cwd });
+      await a.call("projects.searchEntries", { cwd, query: "a", limit: 10 });
+      expect((await a.call("projects.listIgnoredFiles", { cwd }))!.exit!.value).toEqual({ files: [], truncated: false });
+      await a.call("subscribeVcsStatus", { cwd }, { silent: true });
+      await a.call("provider.install.subscribe", { instanceId: "claudeAgent" });
+      await a.call("provider.auth.subscribe", { instanceId: "claudeAgent" });
+      await a.call("provider.auth.start", { instanceId: "claudeAgent" });
+      await a.call("preview.list", { threadId: "thread-none" });
+      await a.call("orchestration.subscribePromptSuggestion", { threadId: "thread-none" }, { silent: true });
+      // Pull requests, peer links and source control with no VM: empty link lists, else a readable defect
+      expect((await a.call("peerLinks.list", {}))!.exit!.value).toEqual({ links: [] });
+      expect((await a.call("peerLinks.names", {}))!.exit!.value).toEqual({ links: [] });
+      const noVmTags = (t3Contracts?.rpcTags ?? ["pullRequests.list", "sourceControl.starred", "peerLinks.link"]).filter(
+        (t) => /^(pullRequests|peerLinks|sourceControl)\./.test(t) && t !== "peerLinks.list" && t !== "peerLinks.names",
+      );
+      for (const tag of noVmTags) {
+        if (t3Contracts?.isStream(tag)) continue;
+        const frame = await a.call(tag, {});
+        expect(frame!.exit!.cause[0]._tag).toBe("Die");
+      }
+      // An interrupted stream ends with an Interrupt cause
+      client.request("int-1", "subscribeServerConfig", {});
+      await client.waitForFrame((f) => f.requestId === "int-1");
+      client.ws.send(JSON.stringify({ _tag: "Interrupt", requestId: "int-1" }));
+      a.check("subscribeServerConfig", await client.waitForFrame((f) => f.requestId === "int-1" && f._tag === "Exit"));
+      a.drain("orchestration.subscribeShell", "shell");
+      expect(report(a.failures)).toEqual([]);
+    }, 20_000);
+
+    test("chats answered by the Hub: booting, failed, asleep; launch, thread views, commands, setup card, shell rows", async () => {
+      const vm = startFakeVmT3Server("vm-audit-chat");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-audit-chat-");
+      const client = await connectHubClient(handle, cfg);
+      const a = auditor(client, "booting");
+      client.request("shell", "orchestration.subscribeShell");
+      const first = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "shell");
+      a.check("orchestration.subscribeShell", first);
+      const hubProjectId = String((first.values as Array<{ snapshot: { projects: Array<{ id: string }> } }>)[0].snapshot.projects[0].id);
+
+      let release!: () => void;
+      boat.createGate = new Promise<void>((r) => (release = r));
+      cleanups.push(() => release());
+      await a.call("orchestration.launchThread", clientLaunchPayload("thread-b", hubProjectId, "Hello"));
+      await a.call("orchestration.subscribeThread", { threadId: "thread-b", requestCompletionMarker: true });
+      await a.call("orchestration.getThreadProjection", { threadId: "thread-b" });
+      await a.call("orchestration.getThreadFamily", { threadId: "thread-b" });
+      await a.call("orchestration.dispatchCommand", { type: "thread.visit", commandId: "cmd-v", threadId: "thread-b", visitedAt: new Date().toISOString() });
+      await a.call("subscribeWorktreeSetup", { threadId: "thread-b" });
+      await a.call("orchestration.launchThread", clientLaunchPayload("thread-b", hubProjectId, "Hello")); // re-sent after a socket loss
+      // Its start fails: failed row, failed setup card, failed run in the thread view
+      boat.createError = new Error("no capacity");
+      release();
+      await until(() => handle.state.getHub()?.pendingLaunches?.["thread-b"]?.phase === "failed");
+      await Bun.sleep(50);
+      a.drain("orchestration.subscribeShell", "shell");
+      a.drainAll(); // the thread view's failed snapshot, the failed setup card
+      await a.call("orchestration.getThreadProjection", { threadId: "thread-b" });
+      await a.call("subscribeWorktreeSetup", { threadId: "thread-b" });
+      boat.createError = null;
+      // Typed failures: a launch into an unknown project, a dispatch the Hub cannot route
+      await a.call("orchestration.launchThread", { ...clientLaunchPayload("thread-x", "no-such-project", "Hi"), commandId: "cmd-x" });
+      // A cloned repository becomes a project (result, clone snapshot, project row)
+      const clone = await a.call("projectClone.start", {
+        projectId: "11111111-2222-4333-8444-555555555555",
+        remoteUrl: "https://github.com/acme/widget.git",
+        destinationPath: "/home/user/widget",
+        title: "widget",
+      });
+      expect(clone!.exit!._tag).toBe("Success");
+      await a.call("subscribeProjectClones", {});
+      await Bun.sleep(50);
+      a.drain("orchestration.subscribeShell", "shell");
+      a.drainAll(); // clone progress pushes
+      expect(report(a.failures)).toEqual([]);
+
+      // A sleeping chat (its own Hub, so the project is the VM's), with and without a cached copy
+      const sleepy = await startHubWithVm(vm, "t3-sentinel-hub-audit-sleep-");
+      const client2 = await connectHubClient(sleepy.handle, sleepy.cfg);
+      const s = auditor(client2, "sleeping");
+      await launchThreadOnHub(client2, "thread-s");
+      const sbId = sleepy.handle.state.listHubSandboxes().find((x) => x.threadIds.includes("thread-s"))!.sandboxId;
+      await sleepy.handle.hub!.sleepHubSandbox(sbId);
+      sleepy.boat.resumeGate = new Promise<void>(() => {});
+      await s.call("orchestration.getThreadProjection", { threadId: "thread-s" });
+      await s.call("orchestration.getThreadFamily", { threadId: "thread-s" });
+      await s.call("orchestration.subscribeThread", { threadId: "thread-s" });
+      await s.call("orchestration.dispatchCommand", { type: "thread.visit", commandId: "cmd-v2", threadId: "thread-s", visitedAt: new Date().toISOString() });
+      s.drain("orchestration.subscribeShell", "shell");
+      s.drainAll();
+      expect(report(s.failures)).toEqual([]);
+
+      const vmNoCopy = startFakeVmT3Server("vm-audit-nocopy", { failProjection: true });
+      cleanups.push(() => vmNoCopy.server.stop(true));
+      const bare = await startHubWithVm(vmNoCopy, "t3-sentinel-hub-audit-nocopy-");
+      const client3 = await connectHubClient(bare.handle, bare.cfg);
+      const n = auditor(client3, "no-copy");
+      await launchThreadOnHub(client3, "thread-n");
+      await bare.handle.hub!.sleepHubSandbox(bare.handle.state.listHubSandboxes()[0].sandboxId);
+      let resume!: () => void;
+      bare.boat.resumeGate = new Promise<void>((r) => (resume = r));
+      // Its sidebar row stands in for the projection while it wakes; a wake failure says why
+      await n.call("orchestration.getThreadProjection", { threadId: "thread-n" });
+      bare.boat.resumeError = new Error("resume refused");
+      resume();
+      await bare.handle.hub!.wakeHubSandbox(bare.handle.state.listHubSandboxes()[0].sandboxId).catch(() => {});
+      await n.call("orchestration.getThreadProjection", { threadId: "thread-n" });
+      await n.call("orchestration.dispatchCommand", {
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        dispatchMode: { type: "start_immediately" },
+        commandId: "cmd-n",
+        threadId: "thread-n",
+        messageId: "msg-n",
+        text: "hi",
+        attachments: [],
+      });
+      n.drainAll();
+      expect(report(n.failures)).toEqual([]);
+    }, 20_000);
+
+    test("server self-update: progress items, the result and the typed failure", async () => {
+      const vm = startFakeVmT3Server("vm-audit-upd");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle } = await startHubWithVm(vm, "t3-sentinel-hub-audit-upd-");
+      const bakes = gateBakes(handle);
+      const client = await connectHubClient(handle, cfg);
+      const a = auditor(client, "self-update");
+      const target = "0.1.13-nightly.20261125.5245";
+      bakes.failOnce.add("my-app");
+      const failed = await a.call("server.updateServer", { targetVersion: target });
+      expect(failed!.exit!.cause[0].error._tag).toBe("ServerSelfUpdateError");
+      client.request("progress", "server.updateServerWithProgress", { targetVersion: target });
+      const done = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "progress", 15_000);
+      const chunks = client.inbox.filter((f) => f.requestId === "progress");
+      for (const f of chunks) a.check("server.updateServerWithProgress", f);
+      a.check("server.updateServerWithProgress", done);
+      expect(chunks.flatMap((f) => f.values as Array<{ type: string }>).map((v) => v.type)).toContain("complete");
+      expect(done.exit).toEqual({ _tag: "Success", value: null });
+      expect(report(a.failures)).toEqual([]);
+    }, 20_000);
+
+    testWithApp("typed errors the Hub builds for a chat whose VM is gone", () => {
+      const resource = { _tag: "media-file", threadId: "thread-gone", path: "/home/user/x.png" };
+      const cases: Array<[string, Record<string, unknown>]> = [
+        ["assets.createUrl", { resource }],
+        ["secrets.answerRequest", { threadId: "thread-gone" }],
+        ["agentFeedback.answerRequest", { threadId: "thread-gone" }],
+        ["peerLinks.answerRequest", { threadId: "thread-gone" }],
+        ["guestShare.create", { threadId: "thread-gone" }],
+        ["provider.mcpSignIn.start", { threadId: "thread-gone", server: "linear" }],
+        ["provider.mcpSignIn.complete", { threadId: "thread-gone", server: "linear" }],
+        ["provider.uploadFeedback", { threadId: "thread-gone" }],
+        ["workspace.addTaskFolderRepository", { threadId: "thread-gone" }],
+        ["scheduledTasks.upsert", { threadId: "thread-gone" }],
+        ["assets.persistChatAttachments", { threadId: "thread-gone" }],
+        ...t3Contracts!.rpcTags.filter((t) => t.startsWith("mcpApps.")).map((t): [string, Record<string, unknown>] => [t, { threadId: "thread-gone" }]),
+      ];
+      const failures = cases.flatMap(([tag, payload]) => {
+        const error = threadGoneError(tag, payload);
+        expect(error).not.toBeNull();
+        const r = t3Contracts!.decodeError(tag, error);
+        return r.ok ? [] : [`${tag}: ${r.error}`];
+      });
+      expect(failures).toEqual([]);
+    });
+
+    testWithApp("HTTP endpoints the Hub answers itself: descriptor, token, session, tickets, shell", async () => {
+      const vm = startFakeVmT3Server("vm-audit-http");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle } = await startHubWithVm(vm, "t3-sentinel-hub-audit-http-");
+      const base = `http://127.0.0.1:${handle.server.port}`;
+      const failures: string[] = [];
+      const decode = async (group: string, endpoint: string, res: Response) => {
+        expect(res.status).toBe(200);
+        const r = t3Contracts!.decodeHttp(group, endpoint, await res.json());
+        if (!r.ok) failures.push(`${group}.${endpoint}: ${r.error?.replace(/\s+/g, " ").slice(0, 400)}`);
+      };
+      const pair = await fetch(`${base}/api/pair`, {
+        method: "POST",
+        headers: { host: cfg.controlHost, authorization: `Bearer ${cfg.controlSecret}`, "content-type": "application/json" },
+        body: JSON.stringify({ slot: "hub" }),
+      });
+      const { code } = (await pair.json()) as { code: string };
+      const token = await fetch(`${base}/oauth/token`, {
+        method: "POST",
+        headers: { host: cfg.hub!.host, "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ subject_token: code, client_label: "Mac" }),
+      });
+      const tokenBody = (await token.clone().json()) as { access_token: string };
+      await decode("auth", "token", token);
+      const auth = { host: cfg.hub!.host, authorization: `Bearer ${tokenBody.access_token}` };
+      await decode("metadata", "descriptor", await fetch(`${base}/.well-known/t3/environment`, { headers: { host: cfg.hub!.host } }));
+      await decode("auth", "session", await fetch(`${base}/api/auth/session`, { headers: auth }));
+      await decode("auth", "webSocketTicket", await fetch(`${base}/api/auth/websocket-ticket`, { method: "POST", headers: auth }));
+      await decode("auth", "webSocketTicketFor", await fetch(`${base}/api/auth/websocket-ticket/rpc`, { method: "POST", headers: auth }));
+      await decode("orchestration", "shellSnapshot", await fetch(`${base}/api/orchestration/shell`, { headers: auth }));
+      expect(failures).toEqual([]);
     });
   });
 });
