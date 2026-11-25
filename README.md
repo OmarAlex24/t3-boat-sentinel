@@ -66,6 +66,7 @@ Disposable Boat VMs (`boat new --type large --from env-<project>`)
   If you start a chat before `env-<repo>` finishes baking, Sentinel automatically boots from `base-t3` and clones on first boot.
 - **Native Live Boot Progress in T3 Code:** Streams real-time VM creation, Klav setup, T3 server startup, and connection stages straight into T3 Code's native setup progress panel (`subscribeWorktreeSetup`) — no separate Mac CLI required.
 - **Immutable 2-Tier Golden Snapshots:** `base-t3` (Ubuntu + `t3` + watchdog + cached provider/ACP tool binaries + optional `klav-forward`) → `env-<project>` (always built cleanly from `base-t3`, smoke-tested, and wiped of per-VM DB/tokens while preserving pre-cached provider binaries). Supports daily UTC auto-bake (`baseBakeHourUtc` / `bakeHourUtc`).
+- **Provider Sign-ins That Follow You (`t3.persistProviderSessions`):** Sign in to Antigravity once in any Hub chat and every later chat VM starts signed in. Sentinel captures the credential file from the signed-in VM into `<stateDir>/credentials/<instanceId>/` (dir 0700, file 0600, atomic, newer `expiry` wins), copies it into each new VM before T3 starts, pulls the CLI's refreshed copy before a VM is destroyed, and never bakes it into a snapshot. Signing out in T3 (or `sentinel forget-session antigravity`) deletes the stored copy.
 - **Zero-Trust LLM Proxy (`llmProxy:`):** Forward Claude/OpenAI requests to a private LAN/Tailscale gateway (e.g., `cliproxy`) without ever letting Boat VMs join your LAN or see your real API key. Each running VM receives a unique `t3llm_...` token that immediately returns `401` the moment the VM sleeps or is destroyed.
 - **Zero-Knowledge Secrets with [Klav](https://klav.dev) (`klav:`):** Supports Klav ADR 0036/0042 (`mode: proxy` with `klav-proxy` + ephemeral `tag:klav-sandbox` Tailscale + `klav-forward`) so agents can call external APIs (e.g. Northflank, GitHub, Cloudflare) without plaintext secrets ever entering the sandbox, revoking access automatically when the chat ends.
 - **Auto-Delete on Settle or Archive:** Configure `deleteWhen: archived-or-settled` (or `archived`) and `archiveAction: delete` (or `stop`). After `archiveGraceSecs` (default 20s), the VM is permanently deleted ($0/hr idle, no standby pool required).
@@ -176,6 +177,7 @@ bun run sentinel bake my-app            # refresh env-my-app from base-t3
 bun run sentinel reset hub:<sandboxId>  # destroy one Hub VM immediately
 bun run sentinel reset hub              # destroy all live Hub VMs
 bun run sentinel revoke hub             # revoke paired device tokens
+bun run sentinel forget-session antigravity  # delete the stored Antigravity sign-in (t3.persistProviderSessions)
 ```
 
 ### As an MCP server (Claude Code / Codex / T3 Code / Personal Assistants)

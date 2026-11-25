@@ -53,6 +53,7 @@ bun run sentinel init         # creates sentinel.yaml (0600) with random control
   - `boat.deleteWhen: archived-or-settled`, `boat.archiveAction: delete`
   - `t3.version`: pin to match the user's T3 Desktop/Mobile version; `t3.channel`: `stable` or `nightly`.
   - Optional: `t3.prepareAcpAgents: [devin]`, `t3.installProviders: [antigravity]`.
+  - Optional: `t3.persistProviderSessions: [antigravity]` keeps the user's Antigravity sign-in across chat VMs (stored 0600 under `<stateDir>/credentials/`, never in snapshots; `sentinel forget-session antigravity` removes it).
 
 ### 3. Wire Cloudflare Tunnel + Wildcard DNS
 Create one Cloudflare Tunnel pointing `*.<domain>` → `http://127.0.0.1:8080` and add wildcard CNAME `*` → `<tunnel-id>.cfargotunnel.com` (proxied).

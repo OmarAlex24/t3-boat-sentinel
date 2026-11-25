@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
@@ -11,6 +12,8 @@ import type { KlavClient } from "./klav.ts";
 import { LifecycleManager } from "./lifecycle.ts";
 import { handleMcpRequest } from "./mcp.ts";
 import { SandboxSdkProvider, type ExternalSdkProviderLike } from "./providers/index.ts";
+import type { SandboxProvider } from "./providers/types.ts";
+import { ProviderSessionStore } from "./provider-sessions.ts";
 import { StateStore } from "./state.ts";
 
 class MockBoat implements BoatClient {
@@ -891,21 +894,29 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
         (v) => v.type === "providerStatuses" && providerById(v.payload?.providers, id)?.installed === installed,
       );
 
-  async function startHubWithVm(vm: ReturnType<typeof startFakeVmT3Server>, dirPrefix: string) {
+  async function startHubWithVm(
+    vm: ReturnType<typeof startFakeVmT3Server>,
+    dirPrefix: string,
+    opts: { persistProviderSessions?: string[]; beforeStart?: (dir: string) => void } = {},
+  ) {
     const dir = mkdtempSync(join(tmpdir(), dirPrefix));
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
     const boat = new MockBoat();
     boat.snapshots.add("base-t3");
     boat.snapshots.add("env-my-app");
     boat.upstreamBaseUrl = vm.url;
+    const base = makeTestConfig(0);
     const cfg: SentinelConfig = {
-      ...makeTestConfig(0),
+      ...base,
       stateDir: dir,
+      t3: { ...base.t3, ...(opts.persistProviderSessions ? { persistProviderSessions: opts.persistProviderSessions } : {}) },
       hub: { host: "boat.boat.example.com", label: "Boat", maxSandboxes: 5 },
     };
+    opts.beforeStart?.(dir);
     const handle = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+    handle.lifecycle.providerSessions.debounceMs = 10;
     cleanups.push(() => handle.stop());
-    return { cfg, handle };
+    return { cfg, handle, boat, dir };
   }
 
   async function launchThreadOnHub(client: Awaited<ReturnType<typeof connectHubClient>>, threadId: string) {
@@ -1043,6 +1054,234 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     expect(result._tag).toBe("Success");
     expect(result.value.providers).toEqual(cached);
     expect(handle.state.listHubSandboxes().length).toBe(0);
+  });
+
+  describe("persisted provider sessions (Antigravity sign-in sync)", () => {
+    const AG_HASH = createHash("sha256").update("antigravity").digest("hex");
+    const AG_STAGED = `~/.t3-sentinel/provider-sessions/providers/antigravity/${AG_HASH}/antigravity-acp/antigravity-oauth-token`;
+    const agToken = (access: string, expiry: string) =>
+      JSON.stringify({ token: { access_token: access, refresh_token: "1//refresh-SECRET", expiry } });
+    const agProviders = (status: string) => [
+      { instanceId: "claudeAgent", driver: "claudeAgent", enabled: true, installed: true },
+      { instanceId: "antigravity", driver: "antigravity", enabled: true, installed: true, auth: { status } },
+    ];
+    const storedPath = (dir: string) => join(dir, "credentials", "antigravity", "antigravity-oauth-token");
+
+    /** Answers the credential read with `vmToken.current` and counts reads. */
+    function serveVmToken(boat: MockBoat, vmToken: { current: string | null }) {
+      const reads = { count: 0 };
+      const original = boat.exec.bind(boat);
+      boat.exec = async (id: string, script: string) => {
+        if (script.includes("antigravity-oauth-token") && script.includes("base64")) {
+          reads.count++;
+          expect(script).toContain(`providers/antigravity/${AG_HASH}/antigravity-acp`);
+          const stdout = vmToken.current
+            ? `antigravity-oauth-token:${Buffer.from(vmToken.current).toString("base64")}\n`
+            : "";
+          return { exitCode: 0, stdout, stderr: "" };
+        }
+        return original(id, script);
+      };
+      return reads;
+    }
+
+    async function waitFor(pred: () => boolean, timeoutMs = 5_000) {
+      const start = Date.now();
+      while (!pred()) {
+        if (Date.now() - start > timeoutMs) throw new Error("condition not met in time");
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    }
+
+    test("captures an authenticated sign-in once at 0600, keeps it on unauthenticated, pulls before teardown, never into state.json", async () => {
+      const vm = startFakeVmT3Server("vm-ag-capture", {
+        configSnapshot: { providers: agProviders("authenticated"), settings: {} },
+      });
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat, dir } = await startHubWithVm(vm, "t3-sentinel-ag-capture-", {
+        persistProviderSessions: ["antigravity"],
+      });
+      const vmToken = { current: agToken("ya29.FIRST-SECRET", "2026-11-25T10:00:00.123456789-06:00") };
+      const reads = serveVmToken(boat, vmToken);
+      const client = await connectHubClient(handle, cfg);
+      client.request("cfg", "subscribeServerConfig", {});
+      await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "cfg");
+      await launchThreadOnHub(client, "thread-ag-capture");
+
+      await waitFor(() => existsSync(storedPath(dir)));
+      await handle.lifecycle.providerSessions.settle();
+      expect(reads.count).toBe(1);
+      expect(readFileSync(storedPath(dir), "utf8")).toBe(vmToken.current!);
+      expect(statSync(storedPath(dir)).mode & 0o777).toBe(0o600);
+      expect(statSync(join(dir, "credentials", "antigravity")).mode & 0o777).toBe(0o700);
+      expect(statSync(join(dir, "credentials")).mode & 0o777).toBe(0o700);
+
+      // Repeated authenticated statuses do not re-download
+      vm.pushConfigItems([{ version: 1, type: "providerStatuses", payload: { providers: agProviders("authenticated") } }]);
+      vm.pushConfigItems([{ version: 1, type: "providerStatuses", payload: { providers: agProviders("authenticated") } }]);
+      await new Promise((r) => setTimeout(r, 150));
+      await handle.lifecycle.providerSessions.settle();
+      expect(reads.count).toBe(1);
+
+      // A transient unauthenticated status keeps the stored copy
+      vm.pushConfigItems([{ version: 1, type: "providerStatuses", payload: { providers: agProviders("unauthenticated") } }]);
+      await new Promise((r) => setTimeout(r, 150));
+      await handle.lifecycle.providerSessions.settle();
+      expect(existsSync(storedPath(dir))).toBe(true);
+
+      // Signed in again: captured again
+      vm.pushConfigItems([{ version: 1, type: "providerStatuses", payload: { providers: agProviders("authenticated") } }]);
+      await waitFor(() => reads.count === 2);
+      await handle.lifecycle.providerSessions.settle();
+
+      // The CLI refreshed its token: teardown pulls the newer copy before the VM is deleted
+      vmToken.current = agToken("ya29.REFRESHED-SECRET", "2026-11-25T18:00:00Z");
+      const sandboxId = handle.state.listHubSandboxes()[0].sandboxId;
+      await handle.hub!.destroyHubSandbox(sandboxId, "test");
+      expect(reads.count).toBe(3);
+      expect(readFileSync(storedPath(dir), "utf8")).toBe(vmToken.current);
+      expect(boat.deleted).toContain(sandboxId);
+
+      const stateJson = readFileSync(join(dir, "state.json"), "utf8");
+      expect(stateJson).not.toContain("SECRET");
+    });
+
+    test("an older token never overwrites a newer one; unparsable expiry falls back to last write wins", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-ag-expiry-"));
+      cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+      const base = makeTestConfig(0);
+      const cfg: SentinelConfig = { ...base, stateDir: dir, t3: { ...base.t3, persistProviderSessions: ["antigravity"] } };
+      let vmContent = "";
+      const provider = {
+        name: "fake",
+        capabilities: new Set(),
+        exec: async () => ({
+          exitCode: 0,
+          stdout: `antigravity-oauth-token:${Buffer.from(vmContent).toString("base64")}\n`,
+          stderr: "",
+        }),
+      } as unknown as SandboxProvider;
+      const store = new ProviderSessionStore(cfg, provider);
+
+      const newer = agToken("ya29.NEWER", "2026-12-01T00:00:00Z");
+      vmContent = newer;
+      await store.capture("vm-new", "antigravity");
+      expect(readFileSync(storedPath(dir), "utf8")).toBe(newer);
+
+      vmContent = agToken("ya29.OLDER", "2026-11-01T00:00:00.000000001-06:00");
+      await store.capture("vm-old", "antigravity");
+      expect(readFileSync(storedPath(dir), "utf8")).toBe(newer);
+
+      const unparsable = agToken("ya29.NO-EXPIRY", "not-a-date");
+      vmContent = unparsable;
+      await store.capture("vm-other", "antigravity");
+      expect(readFileSync(storedPath(dir), "utf8")).toBe(unparsable);
+      expect(statSync(storedPath(dir)).mode & 0o777).toBe(0o600);
+    });
+
+    test("a new chat VM gets the stored sign-in staged before provision-base runs, then re-checks the provider", async () => {
+      const vm = startFakeVmT3Server("vm-ag-inject", {
+        configSnapshot: { providers: agProviders("authenticated"), settings: {} },
+        refreshProviders: agProviders("authenticated"),
+      });
+      cleanups.push(() => vm.server.stop(true));
+      const stored = agToken("ya29.STORED-SECRET", "2026-12-01T00:00:00Z");
+      const { cfg, handle, boat, dir } = await startHubWithVm(vm, "t3-sentinel-ag-inject-", {
+        persistProviderSessions: ["antigravity"],
+        beforeStart: (d) => {
+          mkdirSync(join(d, "credentials", "antigravity"), { recursive: true, mode: 0o700 });
+          writeFileSync(storedPath(d), stored, { mode: 0o600 });
+        },
+      });
+      const reads = serveVmToken(boat, { current: stored });
+      const order: string[] = [];
+      const uploads: Array<{ local: string; remote: string }> = [];
+      boat.upload = async (...args: unknown[]) => {
+        uploads.push({ local: String(args[1]), remote: String(args[2]) });
+        order.push(`upload:${String(args[2])}`);
+      };
+      const originalExec = boat.exec;
+      boat.exec = async (id: string, script: string) => {
+        if (script.includes("provision-base.sh")) order.push("provision");
+        return originalExec(id, script);
+      };
+
+      const client = await connectHubClient(handle, cfg);
+      await launchThreadOnHub(client, "thread-ag-inject");
+
+      const credUpload = uploads.find((u) => u.remote === AG_STAGED);
+      expect(credUpload?.local).toBe(storedPath(dir));
+      expect(boat.execScripts.some((sc) => sc.includes(`mkdir -p ${AG_STAGED.slice(0, AG_STAGED.lastIndexOf("/"))}`))).toBe(true);
+      expect(order.indexOf(`upload:${AG_STAGED}`)).toBeLessThan(order.indexOf("provision"));
+      await waitFor(() => vm.seenMethods.some((m) => m.tag === "server.refreshProviders"));
+      expect(vm.seenMethods.find((m) => m.tag === "server.refreshProviders")?.payload).toEqual({ instanceId: "antigravity" });
+      // The VM already holds the stored copy: no read-back on its first authenticated report
+      await new Promise((r) => setTimeout(r, 150));
+      await handle.lifecycle.providerSessions.settle();
+      expect(reads.count).toBe(0);
+    });
+
+    test("a failed credential upload never blocks the VM launch", async () => {
+      const vm = startFakeVmT3Server("vm-ag-inject-fail");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-ag-inject-fail-", {
+        persistProviderSessions: ["antigravity"],
+        beforeStart: (d) => {
+          mkdirSync(join(d, "credentials", "antigravity"), { recursive: true });
+          writeFileSync(storedPath(d), agToken("ya29.X", "2026-12-01T00:00:00Z"), { mode: 0o600 });
+        },
+      });
+      boat.upload = async (...args: unknown[]) => {
+        if (String(args[2]).includes("provider-sessions")) throw new Error("scp failed");
+      };
+      const client = await connectHubClient(handle, cfg);
+      await launchThreadOnHub(client, "thread-ag-inject-fail");
+      expect(handle.state.listHubSandboxes()[0]?.phase).toBe("running");
+      expect(boat.execScripts.some((sc) => sc.includes("rm -rf ~/.t3-sentinel/provider-sessions"))).toBe(true);
+    });
+
+    test("a successful sign-out forwarded by the Hub deletes the stored copy; forget-session API validates input", async () => {
+      const vm = startFakeVmT3Server("vm-ag-logout", {
+        configSnapshot: { providers: agProviders("authenticated"), settings: {} },
+      });
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat, dir } = await startHubWithVm(vm, "t3-sentinel-ag-logout-", {
+        persistProviderSessions: ["antigravity"],
+        beforeStart: (d) => {
+          mkdirSync(join(d, "credentials", "antigravity"), { recursive: true });
+          writeFileSync(storedPath(d), agToken("ya29.X", "2026-12-01T00:00:00Z"), { mode: 0o600 });
+        },
+      });
+      const reads = serveVmToken(boat, { current: agToken("ya29.X", "2026-12-01T00:00:00Z") });
+      const client = await connectHubClient(handle, cfg);
+      await launchThreadOnHub(client, "thread-ag-logout");
+      expect(existsSync(storedPath(dir))).toBe(true);
+
+      client.request("logout", "provider.auth.logout", { instanceId: "antigravity" });
+      const exit = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "logout");
+      expect((exit.exit as { _tag: string })._tag).toBe("Success");
+      expect(vm.seenMethods.some((m) => m.tag === "provider.auth.logout")).toBe(true);
+      expect(existsSync(storedPath(dir))).toBe(false);
+
+      // The VM still reports authenticated for a moment: it must not re-store the signed-out token
+      vm.pushConfigItems([{ version: 1, type: "providerStatuses", payload: { providers: agProviders("authenticated") } }]);
+      await new Promise((r) => setTimeout(r, 150));
+      await handle.lifecycle.providerSessions.settle();
+      expect(existsSync(storedPath(dir))).toBe(false);
+      expect(reads.count).toBe(0);
+
+      const base = `http://127.0.0.1:${handle.server.port}`;
+      const call = (body: unknown) =>
+        fetch(`${base}/api/forget-session`, {
+          method: "POST",
+          headers: { host: cfg.controlHost, authorization: `Bearer ${cfg.controlSecret}`, "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      const ok = await call({ instanceId: "antigravity" });
+      expect(await ok.json()).toEqual({ ok: true, instanceId: "antigravity", removed: false });
+      const bad = await call({ instanceId: "../etc" });
+      expect(bad.status).toBe(400);
+    });
   });
 
   test("spawns 1 fresh Boat VM per chat behind 1 single Environment, routes RPCs strictly to owning VM, and destroys only the settled VM", async () => {

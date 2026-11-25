@@ -3,6 +3,7 @@ import type { SentinelConfig } from "./config.ts";
 import type { HubServer } from "./hub.ts";
 import type { JobManager } from "./jobs.ts";
 import type { LifecycleManager, WatchdogEventPayload } from "./lifecycle.ts";
+import { PROVIDER_INSTANCE_ID_RE } from "./provider-sessions.ts";
 import type { SlotProxy } from "./proxy.ts";
 import {
   CloudflareAccessVerifier,
@@ -378,6 +379,16 @@ export class ControlPlane {
           this.hub?.notifyProjectRemoved(removedHubId);
         }
         return Response.json({ ok: true, removed: projName });
+      }
+
+      if (req.method === "POST" && path === "/api/forget-session") {
+        const body = (await req.json()) as { instanceId?: unknown };
+        const instanceId = typeof body.instanceId === "string" ? body.instanceId.trim() : "";
+        if (!PROVIDER_INSTANCE_ID_RE.test(instanceId)) {
+          return Response.json({ ok: false, error: "Invalid provider instance ID" }, { status: 400 });
+        }
+        const { removed } = this.lifecycle.providerSessions.forget(instanceId);
+        return Response.json({ ok: true, instanceId, removed });
       }
 
       if (req.method === "POST" && path === "/api/revoke") {

@@ -8,8 +8,11 @@
 #                  optionally install provider runtimes (T3_PREPARE_ACP_AGENTS / T3_INSTALL_PROVIDERS),
 #                  then re-probe providers and wait until their on-disk status caches report
 #                  `installed: true` (also for T3_VERIFY_ACP_AGENTS / T3_VERIFY_PROVIDERS, verify-only),
-#                  then stop t3 and wipe ALL of `~/.t3/userdata` so the golden snapshot is spotless.
-#   (default)      Write slot's permanent `environment-id` BEFORE t3 starts, start `t3code.service`
+#                  then stop t3 and wipe ALL of `~/.t3/userdata` so the golden snapshot is spotless
+#                  (provider sign-in tokens included; `providers/` runtimes are kept).
+#   (default)      Install provider sign-ins staged by sentinel in `~/.t3-sentinel/provider-sessions/`
+#                  (`t3.persistProviderSessions`, mode 0600) and
+#                  write slot's permanent `environment-id` BEFORE t3 starts, start `t3code.service`
 #                  and `t3-sentinel-watchdog.service`, optionally register `PROJECT_WORKDIR` via
 #                  `t3 project add`, and print one JSON line with `{ environmentId, descriptor, authSession, upstreamToken?, t3Version }`.
 set -euo pipefail
@@ -270,7 +273,10 @@ if [ "$BAKE_CLEAN" = "1" ]; then
       "$userdata_dir/environment-id" "$userdata_dir/settings.json" "$userdata_dir/keybindings.json" \
       "$userdata_dir/logs" "$userdata_dir/worktrees" "$userdata_dir/attachments" "$userdata_dir/auth" \
       "$sentinel_dir/watchdog.json" "$sentinel_dir/boot-secrets.json" "$sentinel_dir/t3-settings.json" "$sentinel_dir/saw-thread" \
-      "$HOME/.klav-forward" "$units/t3code.service.d/klav-env.conf"
+      "$HOME/.klav-forward" "$units/t3code.service.d/klav-env.conf" \
+      "$sentinel_dir/provider-sessions" \
+      "$userdata_dir"/providers/antigravity/*/antigravity-acp/antigravity-oauth-token \
+      "$userdata_dir"/providers/antigravity/*/antigravity-acp/acp_token.json
   }
   # The sandbox home is FUSE (ascii-lazyfs), which can briefly return EBUSY on files t3 just closed; retry
   for attempt in $(seq 1 30); do
@@ -286,6 +292,13 @@ if [ "$BAKE_CLEAN" = "1" ]; then
   done
   # Keep logs/ so t3code.service can open its stdout log when VMs boot from this snapshot
   mkdir -p "$userdata_dir/logs"
+  # Provider sign-ins must never be frozen into a snapshot
+  leaked="$(find "$userdata_dir/providers/antigravity" "$sentinel_dir" \( -name antigravity-oauth-token -o -name acp_token.json \) -print 2>/dev/null || true)"
+  if [ -n "$leaked" ]; then
+    echo "[bake] provider credential files survived the wipe; refusing to snapshot:" >&2
+    echo "$leaked" >&2
+    exit 1
+  fi
 
   DESC="$descriptor" SESS="$auth_session" VER="$ver" node -e '
     console.log(JSON.stringify({
@@ -333,6 +346,20 @@ node -e '
   if (fs.existsSync(tpl)) fs.unlinkSync(tpl);
 ' "$settings" "$sentinel_dir/t3-settings.json"
 [ "$before_settings" = "$(cat "$settings")" ] || restart_t3=1
+
+# Install provider sign-ins staged by sentinel (fresh VMs only), then drop the staging copies
+staged_sessions="$sentinel_dir/provider-sessions"
+if [ -d "$staged_sessions" ]; then
+  while IFS= read -r -d '' staged; do
+    dest="$userdata_dir/${staged#"$staged_sessions"/}"
+    if ! cmp -s "$staged" "$dest"; then
+      (umask 077 && mkdir -p "$(dirname "$dest")")
+      install -m 600 "$staged" "$dest"
+      restart_t3=1
+    fi
+  done < <(find "$staged_sessions" -type f -print0)
+  rm -rf "$staged_sessions"
+fi
 
 "$t3" service install --allow-downgrade >/dev/null
 if [ -f "$HOME/.klav-forward/env.systemd" ]; then
