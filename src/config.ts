@@ -77,6 +77,11 @@ export interface ProjectConfig {
   envTarget?: string;
   klav?: ProjectKlavConfig;
   bakeHourUtc?: number;
+  /**
+   * Hub chats (default true): a new chat VM moves `workdir` to the remote's default branch before
+   * T3 starts, discarding what the snapshot's bake left. Resumed VMs are never touched.
+   */
+  syncToRemoteOnStart?: boolean;
 }
 
 export interface InjectFileConfig {
@@ -420,6 +425,9 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
     }
     if (!proj?.workdir) {
       throw new Error(`Project "${key}" is missing required field "workdir"`);
+    }
+    if (proj.syncToRemoteOnStart !== undefined && typeof proj.syncToRemoteOnStart !== "boolean") {
+      throw new Error(`Project "${key}": \`syncToRemoteOnStart\` must be true or false`);
     }
     if (proj.klav && !klav) {
       throw new Error(`Project "${key}" configures \`klav\`, but top-level \`klav\` config is missing`);
