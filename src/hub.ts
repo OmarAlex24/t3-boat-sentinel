@@ -146,6 +146,9 @@ interface LocalThreadSub {
   servedSnapshot: boolean;
 }
 
+/** Commands that close a chat; for a chat still booting (or whose VM failed to start) they cancel the launch. */
+const CLOSING_COMMANDS = new Set(["thread.archive", "thread.delete", "thread.settle", "thread.auto-settle"]);
+
 /** Commands that only record what the user did; answered at once and sent once the VM is up. */
 const BOOKKEEPING_COMMANDS = new Set([
   "thread.visit",
@@ -1929,7 +1932,7 @@ export class HubServer {
         return;
       }
       const pending = this.pendingThreads.get(tid);
-      if (pending && (cmdType === "thread.archive" || cmdType === "thread.delete")) {
+      if (pending && CLOSING_COMMANDS.has(cmdType)) {
         sendRpcExitSuccess(ws, reqId, { sequence: this.cancelPendingLaunch(pending, cmdType) });
         return;
       }

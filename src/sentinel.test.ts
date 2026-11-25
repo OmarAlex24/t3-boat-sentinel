@@ -1587,6 +1587,31 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       expect(handle.state.listHubSandboxes()).toHaveLength(0);
     });
 
+    test("settling a chat whose VM failed to start closes it instead of returning the start error", async () => {
+      const vm = startFakeVmT3Server("vm-settle-failed");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat } = await startHubWithVm(vm, "t3-sentinel-hub-settle-failed-");
+      boat.create = async () => {
+        throw new Error("boat new failed: not found (404)");
+      };
+      const client = await connectHubClient(handle, cfg);
+      const hubProjectId = await subscribeHubShell(client);
+
+      client.request("launch", "orchestration.launchThread", clientLaunchPayload("thread-s", hubProjectId));
+      expect(exitOf(await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "launch"))._tag).toBe("Success");
+      await client.waitForFrame(shellThreadUpdate("thread-s", (t) => t.status === "failed"));
+
+      client.request("settle", "orchestration.dispatchCommand", { type: "thread.settle", commandId: "cmd-settle", threadId: "thread-s" });
+      expect(exitOf(await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "settle"))._tag).toBe("Success");
+      const removed = await client.waitForFrame(
+        (f) =>
+          f._tag === "Chunk" &&
+          f.requestId === "shell" &&
+          (f.values as Array<{ kind?: string; threadId?: string }>).some((v) => v.kind === "thread.removed" && v.threadId === "thread-s"),
+      );
+      expect(removed).toBeTruthy();
+    });
+
     test("counts booting chats toward maxSandboxes and refuses the launch over the limit", async () => {
       const vm = startFakeVmT3Server("vm-cap");
       cleanups.push(() => vm.server.stop(true));
