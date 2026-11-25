@@ -62,6 +62,8 @@ interface RegistryEntry {
   /** Sentinel name (e.g. `t3s-hub-abc-xyz`); Celesto ignores `name`, so the reaper matches on this. */
   intendedName: string;
   createdAt: string;
+  /** `size_id` of the original POST, replayed unchanged when recovering with the same key. */
+  sizeId?: string;
   id?: string;
   /** Recovery POSTs made from `list()` for an entry whose create result was never seen. */
   recoveryAttempts?: number;
@@ -228,16 +230,17 @@ export class CelestoProvider implements SandboxProvider {
       throw new Error("Celesto provider does not support snapshots");
     }
     const idempotencyKey = randomUUID();
+    const sizeId = this.resolveSize(opts.size);
     // Recorded BEFORE the POST so a crash mid-create still leaves a key to recover the id with
     await this.mutateRegistry((entries) => {
-      entries.push({ idempotencyKey, intendedName: opts.name, createdAt: new Date().toISOString() });
+      entries.push({ idempotencyKey, intendedName: opts.name, createdAt: new Date().toISOString(), sizeId });
     });
     this.creating.add(idempotencyKey);
     let id: string;
     try {
-      id = await this.postCreate(idempotencyKey, this.resolveSize(opts.size));
+      id = await this.postCreate(idempotencyKey, sizeId);
     } catch (err) {
-      if (err instanceof CelestoHttpError && err.status >= 400 && err.status < 500 && err.status !== 408 && err.status !== 429) {
+      if (isDefinitiveRejection(err)) {
         // Definitive rejection: nothing was created
         await this.mutateRegistry((entries) => {
           const i = entries.findIndex((e) => e.idempotencyKey === idempotencyKey);
@@ -273,7 +276,8 @@ export class CelestoProvider implements SandboxProvider {
       } catch (err) {
         lastErr = err;
         const status = err instanceof CelestoHttpError ? err.status : 0;
-        const transient = status === 0 || status === 408 || status === 429 || status >= 500;
+        // 409 with a reused key can mean the first request is still being processed
+        const transient = status === 0 || status === 408 || status === 409 || status === 429 || status >= 500;
         if (!transient || attempt === attempts) break;
         await this.sleep(Math.min(1_000 * 2 ** (attempt - 1), 8_000));
       }
@@ -349,10 +353,10 @@ export class CelestoProvider implements SandboxProvider {
         if (e) e.recoveryAttempts = (e.recoveryAttempts ?? 0) + 1;
       });
       try {
-        await this.postCreate(entry.idempotencyKey, this.resolveSize("default"), 1);
+        await this.postCreate(entry.idempotencyKey, entry.sizeId ?? this.resolveSize("default"), 1);
         console.warn(`[celesto] recovered computer for interrupted create of ${entry.intendedName}`);
       } catch (err) {
-        if (err instanceof CelestoHttpError && err.status >= 400 && err.status < 500 && err.status !== 429) {
+        if (isDefinitiveRejection(err)) {
           await this.mutateRegistry((all) => {
             const i = all.findIndex((e) => e.idempotencyKey === entry.idempotencyKey);
             if (i >= 0) all.splice(i, 1);
@@ -373,6 +377,11 @@ export class CelestoProvider implements SandboxProvider {
         if (err instanceof CelestoHttpError && err.status === 404) break;
         // 409 while the computer is still `creating` (or mid-transition): retry
         if (err instanceof CelestoHttpError && err.status === 409 && conflicts++ < maxConflicts) {
+          // Already on its way out: nothing to retry
+          const status = await this.request<CelestoComputer>("GET", `/computers/${encodeURIComponent(id)}`)
+            .then((r) => r.data?.status)
+            .catch((e) => (e instanceof CelestoHttpError && e.status === 404 ? "deleted" : undefined));
+          if (status === "deleting" || status === "deleted") break;
           await this.sleep(this.pollMs);
           continue;
         }
@@ -423,13 +432,19 @@ export class CelestoProvider implements SandboxProvider {
       }
       await this.waitForStatus(id, ["running"], 300_000, `start ${id}`);
     }
-    // Resumable only when this VM was provisioned and its T3 supervisor survived the stop
+    // Resumable only when this VM was provisioned and its T3 supervisor survived the stop. Any
+    // other outcome (exec error, no verdict) throws so the wake can be retried, never destroyed.
     const check = await this.exec(
       id,
-      `test -f ${CELESTO_PROVISION_MARKER} && pid="$(cat ${SUPERVISOR_PIDFILE} 2>/dev/null)" && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null`,
+      `if [ ! -f ${CELESTO_PROVISION_MARKER} ]; then echo t3s-resume:missing; ` +
+        `elif pid="$(cat ${SUPERVISOR_PIDFILE} 2>/dev/null)" && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then echo t3s-resume:ok; ` +
+        `else echo t3s-resume:dead; fi`,
       30,
     );
-    return check.exitCode === 0 ? "resumed" : "data_expired";
+    const verdict = check.stdout.match(/t3s-resume:(ok|missing|dead)/)?.[1];
+    if (verdict === "ok") return "resumed";
+    if (verdict === "missing" || verdict === "dead") return "data_expired";
+    throw new Error(`celesto resume check on ${id} gave no verdict (exit ${check.exitCode})`);
   }
 
   /** Poll count covering `ms` (counted, not clock-based, so tests with a fake sleep stay fast). */
@@ -624,6 +639,18 @@ export class CelestoProvider implements SandboxProvider {
       await this.rawExec(id, `rm -rf ${staging}`, 30).catch(() => {});
     }
   }
+}
+
+/** A 4xx that means nothing was (or will be) created for this key. 408/409/429 are not. */
+function isDefinitiveRejection(err: unknown): boolean {
+  return (
+    err instanceof CelestoHttpError &&
+    err.status >= 400 &&
+    err.status < 500 &&
+    err.status !== 408 &&
+    err.status !== 409 &&
+    err.status !== 429
+  );
 }
 
 function toInfo(c: CelestoComputer, intendedName?: string): SandboxInfo {

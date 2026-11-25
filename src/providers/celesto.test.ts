@@ -366,8 +366,11 @@ describe("CelestoProvider", () => {
     expect(fake.computers.get(id)!.status).toBe("stopped");
 
     let markerPresent = false;
+    let checkOutput: { exit_code: number; stdout?: string } | null = null;
     fake.execHandler = (cmd) =>
-      cmd.includes("test -f ~/.t3-sentinel/provisioned") ? { exit_code: markerPresent ? 0 : 1 } : undefined;
+      cmd.includes("test -f ~/.t3-sentinel/provisioned") || cmd.includes("[ ! -f ~/.t3-sentinel/provisioned ]")
+        ? (checkOutput ?? { exit_code: 0, stdout: markerPresent ? "t3s-resume:ok\n" : "t3s-resume:missing\n" })
+        : undefined;
     expect(await provider.resume(id, "default")).toBe("data_expired");
     expect(fake.calls.some((c) => c.method === "POST" && c.path === `/computers/${id}/start`)).toBe(true);
 
@@ -378,8 +381,54 @@ describe("CelestoProvider", () => {
     expect(check).toContain("sudo -n -u ohm -H bash -lc");
     expect(check).toContain("t3-supervisor.pid");
 
+    // No verdict (e.g. the exec failed oddly) never reads as expired: the wake fails and can retry
+    checkOutput = { exit_code: 1, stdout: "" };
+    await expect(provider.resume(id, "default")).rejects.toThrow(/no verdict/);
+    checkOutput = { exit_code: 0, stdout: "t3s-resume:dead\n" };
+    expect(await provider.resume(id, "default")).toBe("data_expired");
+
     fake.computers.delete(id);
     expect(await provider.resume(id, "default")).toBe("data_expired");
+  });
+
+  test("list() recovers an interrupted create with the same key and size, so the reaper can see it", async () => {
+    const { fake, provider, registryPath } = setup();
+    const key = "11111111-2222-3333-4444-555555555555";
+    // A computer the server created, whose 201 this Sentinel never saw (crash after the POST)
+    fake.byKey.set(key, "cmp_lost");
+    fake.computers.set("cmp_lost", { id: "cmp_lost", name: "watt-lost", status: "running" });
+    writeFileSync(
+      registryPath,
+      JSON.stringify({
+        computers: [
+          { idempotencyKey: key, intendedName: "t3s-hub-lost-1", sizeId: "large", createdAt: new Date(Date.now() - 120_000).toISOString() },
+        ],
+      }),
+      { mode: 0o600 },
+    );
+    const listed = await provider.list();
+    const post = fake.calls.find((c) => c.method === "POST" && c.path === "/computers")!;
+    expect(post.headers["Idempotency-Key"]).toBe(key);
+    expect(post.body!.size_id).toBe("large");
+    expect(listed).toEqual([{ id: "cmp_lost", name: "t3s-hub-lost-1", state: "running", stoppedAt: null }]);
+    expect(provider.registryEntries()[0]).toMatchObject({ idempotencyKey: key, id: "cmp_lost", recoveryAttempts: 1 });
+  });
+
+  test("a 409 on create keeps the registry entry (the key may still be in flight)", async () => {
+    const { fake, provider, stateDir } = setup();
+    const busy = new CelestoProvider({
+      apiKey: "k",
+      stateDir,
+      sleep: async () => {},
+      pollIntervalMs: 1,
+      fetch: async (url, init) =>
+        init.method === "POST" && url.endsWith("/computers")
+          ? new Response(JSON.stringify({ error: { code: "idempotency_conflict" } }), { status: 409 })
+          : fake.fetch(url, init),
+    });
+    await expect(busy.create({ name: "t3s-busy", size: "default" })).rejects.toThrow(/HTTP 409/);
+    expect(provider.registryEntries()).toHaveLength(1);
+    expect(provider.registryEntries()[0]).toMatchObject({ intendedName: "t3s-busy", sizeId: "standard" });
   });
 
   test("exposePort publishes once and returns the public URL without headers", async () => {

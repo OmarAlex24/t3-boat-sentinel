@@ -541,11 +541,7 @@ fi
 t3_service_reload
 t3_service_is_active || restart_t3=1
 if [ "$restart_t3" != "0" ]; then
-  if [ "$supervisor_mode" = "1" ] && ! sup_running t3; then
-    sup_start t3
-  else
-    t3_service_restart
-  fi
+  t3_service_restart
 fi
 wait_for_t3
 
