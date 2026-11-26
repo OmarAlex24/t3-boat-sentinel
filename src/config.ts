@@ -3,6 +3,11 @@ import { resolve } from "node:path";
 import YAML from "yaml";
 import { PROVIDER_INSTANCE_ID_RE } from "./provider-sessions.ts";
 
+/** Default hours to keep a parked (settled) VM stopped in Boat before retiring it to read-only (2 days). */
+export const DEFAULT_PARKED_TTL_HOURS = 48;
+/** Default cap on parked (settled) VMs kept stopped in Boat (0 disables the cap). */
+export const DEFAULT_MAX_PARKED_SANDBOXES = 8;
+
 export interface SlotConfig {
   name: string;
   label?: string;
@@ -132,6 +137,8 @@ export interface HubConfig {
   label: string;
   /** Maximum concurrent live Boat VMs managed by the Hub (default 10). */
   maxSandboxes: number;
+  /** Maximum parked (settled) VMs kept stopped in Boat (default 8; 0 disables the count cap). Oldest parked VMs retire to read-only when exceeded. */
+  maxParkedSandboxes?: number;
   /** Optional preview routing and server-browser stream tuning. */
   preview?: HubPreviewConfig;
 }
@@ -227,9 +234,15 @@ export interface SentinelConfig {
      * Hub only, with `deleteWhen: archived-or-settled`: what happens to a chat VM whose chats are all
      * settled but not all archived or deleted. `park` (default) stops it like an idle sleep and keeps
      * the chat in the sidebar; it does not count toward `hub.maxSandboxes` and wakes only when the chat
-     * is continued (Boat keeps a stopped VM 14 days, then the chat stays read only). `delete` deletes it.
+     * is continued (kept up to `parkedTtlHours` and `hub.maxParkedSandboxes`, then deleted in Boat and
+     * kept read only). `delete` deletes it.
      */
     settleAction: "park" | "delete";
+    /**
+     * Hub only: hours to keep a parked (settled) VM stopped before deleting it in Boat and marking its
+     * chat read only (default 48 = 2 days; Boat itself drops stopped VM disks after 14 days / 336h).
+     */
+    parkedTtlHours?: number;
     reaperIntervalSecs: number;
     /** Safety cap in hours for sleeping sandboxes (0 = disabled, default 0 to prevent surprise data loss). */
     maxSleepingHours: number;
@@ -314,6 +327,7 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
       | "archived-or-settled",
     archiveAction: (parsed.boat?.archiveAction === "stop" ? "stop" : "delete") as "delete" | "stop",
     settleAction: (parsed.boat?.settleAction === "delete" ? "delete" : "park") as "park" | "delete",
+    parkedTtlHours: parsePositiveHours(parsed.boat?.parkedTtlHours, "boat.parkedTtlHours", DEFAULT_PARKED_TTL_HOURS),
     reaperIntervalSecs: Number(parsed.boat?.reaperIntervalSecs ?? 300),
     maxSleepingHours: Number(parsed.boat?.maxSleepingHours ?? 0),
     sandboxPrefix: parsed.boat?.sandboxPrefix ?? "t3s-",
@@ -419,6 +433,11 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
       host: requireString(parsed.hub.host, "hub.host").replace(/^https?:\/\//, "").replace(/\/+$/, "").toLowerCase(),
       label: parsed.hub.label ? String(parsed.hub.label).trim() : "Boat",
       maxSandboxes: Math.max(1, Number(parsed.hub.maxSandboxes ?? 10)),
+      maxParkedSandboxes: parseNonNegativeInteger(
+        parsed.hub.maxParkedSandboxes,
+        "hub.maxParkedSandboxes",
+        DEFAULT_MAX_PARKED_SANDBOXES,
+      ),
       ...(preview ? { preview } : {}),
     };
   }
@@ -541,6 +560,24 @@ function optionalPositiveInteger(val: unknown, name: string): number | undefined
     throw new Error(`Config "${name}" must be a positive integer (0 disables the cap)`);
   }
   return n === 0 ? undefined : n;
+}
+
+function parseNonNegativeInteger(val: unknown, name: string, fallback: number): number {
+  if (val === undefined || val === null) return fallback;
+  const n = typeof val === "number" ? val : typeof val === "string" && val.trim() !== "" ? Number(val) : NaN;
+  if (!Number.isInteger(n) || n < 0) {
+    throw new Error(`Config "${name}" must be a non-negative integer (0 disables the cap)`);
+  }
+  return n;
+}
+
+function parsePositiveHours(val: unknown, name: string, fallback: number): number {
+  if (val === undefined || val === null) return fallback;
+  const n = typeof val === "number" ? val : typeof val === "string" && val.trim() !== "" ? Number(val) : NaN;
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error(`Config "${name}" must be a positive number of hours`);
+  }
+  return n;
 }
 
 function optionalStreamQuality(val: unknown): number | undefined {

@@ -1,5 +1,5 @@
 import { extractBearer, safeEqual } from "./auth.ts";
-import type { SentinelConfig } from "./config.ts";
+import { DEFAULT_MAX_PARKED_SANDBOXES, DEFAULT_PARKED_TTL_HOURS, type SentinelConfig } from "./config.ts";
 import type { HubServer } from "./hub.ts";
 import type { JobManager } from "./jobs.ts";
 import type { LifecycleManager, WatchdogEventPayload } from "./lifecycle.ts";
@@ -172,6 +172,8 @@ export class ControlPlane {
                 label: hubState.label,
                 environmentId: hubState.environmentId,
                 maxSandboxes: this.config.hub.maxSandboxes,
+                maxParkedSandboxes: this.config.hub.maxParkedSandboxes ?? DEFAULT_MAX_PARKED_SANDBOXES,
+                parkedTtlHours: this.config.boat.parkedTtlHours ?? DEFAULT_PARKED_TTL_HOURS,
                 pairedClients: hubState.clients.map((c) => ({ id: c.id, label: c.label, pairedAt: c.pairedAt })),
                 sandboxes: this.state.listHubSandboxes().map((sb) => ({
                   sandboxId: sb.sandboxId,
@@ -182,6 +184,7 @@ export class ControlPlane {
                   createdAt: sb.createdAt,
                   lastHeartbeatAt: sb.lastHeartbeatAt,
                   sleepingSince: sb.sleepingSince,
+                  parkedAt: sb.parkedAt ?? null,
                 })),
               }
             : null;

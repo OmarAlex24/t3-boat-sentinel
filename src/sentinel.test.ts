@@ -403,6 +403,30 @@ describe("config & auth primitives", () => {
     }
     expect(() => loadConfig(writePreviewConfig(`${base}    streamMaxWidth: -1\n`))).toThrow("streamMaxWidth");
   });
+
+  test("loadConfig parses and validates boat.parkedTtlHours and hub.maxParkedSandboxes", () => {
+    const defaults = loadConfig(writePreviewConfig("hub:\n  host: hub.example.com\n"));
+    expect(defaults.boat.parkedTtlHours).toBe(48);
+    expect(defaults.hub?.maxParkedSandboxes).toBe(8);
+
+    const custom = loadConfig(
+      writePreviewConfig("boat:\n  parkedTtlHours: 12\nhub:\n  host: hub.example.com\n  maxParkedSandboxes: 4\n"),
+    );
+    expect(custom.boat.parkedTtlHours).toBe(12);
+    expect(custom.hub?.maxParkedSandboxes).toBe(4);
+
+    const uncapped = loadConfig(writePreviewConfig("hub:\n  host: hub.example.com\n  maxParkedSandboxes: 0\n"));
+    expect(uncapped.hub?.maxParkedSandboxes).toBe(0);
+
+    for (const badTtl of [0, -5, "soon"]) {
+      expect(() => loadConfig(writePreviewConfig(`boat:\n  parkedTtlHours: ${badTtl}\n`))).toThrow("boat.parkedTtlHours");
+    }
+    for (const badMax of [-1, 1.5, "many"]) {
+      expect(() => loadConfig(writePreviewConfig(`hub:\n  host: hub.example.com\n  maxParkedSandboxes: ${badMax}\n`))).toThrow(
+        "hub.maxParkedSandboxes",
+      );
+    }
+  });
 });
 
 describe("Celesto provider config", () => {
@@ -3645,14 +3669,36 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
      * One chat on its own VM, settled by the user: the VM's row carries `settledAt` and, after the
      * grace, its watchdog reports `all-archived` (all top-level chats archived, deleted or settled).
      */
-    async function parkedChat(prefix: string, opts: { maxSandboxes?: number; vms?: number; settleAction?: "park" | "delete" } = {}) {
+    async function parkedChat(
+      prefix: string,
+      opts: {
+        maxSandboxes?: number;
+        maxParkedSandboxes?: number;
+        parkedTtlHours?: number;
+        vms?: number;
+        settleAction?: "park" | "delete";
+      } = {},
+    ) {
       const vms = Array.from({ length: opts.vms ?? 1 }, (_, i) => startFakeVmT3Server(`${prefix}-${i + 1}`));
       for (const vm of vms) cleanups.push(() => vm.server.stop(true));
       const hub = await startHubWithVm(vms[0], `t3-sentinel-hub-${prefix}-`, {
         maxSandboxes: opts.maxSandboxes,
         patchConfig: (cfg) => {
           const settled = settledConfig(cfg);
-          return { ...settled, boat: { ...settled.boat, settleAction: opts.settleAction ?? "park" } };
+          return {
+            ...settled,
+            hub: settled.hub
+              ? {
+                  ...settled.hub,
+                  ...(opts.maxParkedSandboxes !== undefined ? { maxParkedSandboxes: opts.maxParkedSandboxes } : {}),
+                }
+              : settled.hub,
+            boat: {
+              ...settled.boat,
+              settleAction: opts.settleAction ?? "park",
+              ...(opts.parkedTtlHours !== undefined ? { parkedTtlHours: opts.parkedTtlHours } : {}),
+            },
+          };
         },
       });
       // One fake VM per sandbox, as in production (each lists only its own threads)
@@ -3866,27 +3912,27 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       expect(boat.resumed).toEqual([]);
     });
 
-    test("after 14 days parked the chat is read only: listed, not counted, and it refuses to continue", async () => {
+    test("after parkedTtlHours (default 48h / 2 days) parked the chat is read only: listed, not counted, and it refuses to continue", async () => {
       const { boat, handle, client, cfg, sandboxId, dir } = await parkedChat("park-expire", { maxSandboxes: 1, vms: 2 });
-      // Not yet: 13 days
+      // Not yet: 47 hours
       handle.state.updateHubSandbox(sandboxId, (s) => {
-        s.sleepingSince = new Date(Date.now() - 13 * DAY_MS).toISOString();
+        s.sleepingSince = new Date(Date.now() - 47 * 3600_000).toISOString();
       });
       expect(await handle.hub!.expireParkedSandboxes()).toBe(0);
       handle.state.updateHubSandbox(sandboxId, (s) => {
-        s.sleepingSince = new Date(Date.now() - 14 * DAY_MS - 60_000).toISOString();
+        s.sleepingSince = new Date(Date.now() - 48 * 3600_000 - 60_000).toISOString();
       });
       client.request("sub", "orchestration.subscribeThread", { threadId: "thread-p", requestCompletionMarker: true });
       await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "sub");
       expect(await handle.hub!.expireParkedSandboxes()).toBe(1);
       // The open chat is told at once
       const told = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "sub" && !!noticeOf(f)?.summary?.includes("expired"));
-      expect(noticeOf(told)?.summary).toContain("expired after 14 days settled");
+      expect(noticeOf(told)?.summary).toContain("expired after 2 days settled");
       // The Boat sandbox is deleted; no named snapshot is made
       expect(boat.deleted).toEqual([sandboxId]);
       expect(boat.savedSnapshots).toEqual([]);
       expect(handle.state.getHubSandbox(sandboxId)).toBeUndefined();
-      expect(handle.state.getHub()?.expiredThreads?.["thread-p"]).toMatchObject({ sandboxId, reason: "parked-14-days" });
+      expect(handle.state.getHub()?.expiredThreads?.["thread-p"]).toMatchObject({ sandboxId, reason: "parked-ttl", ttlHours: 48 });
 
       // Still listed with its history
       expect((await shellThreads(client, "shell2")).map((t) => t.id)).toEqual(["thread-p"]);
@@ -3898,10 +3944,10 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       // Continuing it fails with a clear notice, never a wake
       dispatch(client, "unsettle", "thread-p", "thread.unsettle", { reason: "user" });
       const refused = await exitFrame(client, "unsettle");
-      expect(failureText(refused)).toContain("expired after 14 days settled");
+      expect(failureText(refused)).toContain("expired after 2 days settled");
       if (t3Contracts) expect(t3Contracts.decodeFrame("orchestration.dispatchCommand", refused)).toEqual([{ ok: true }]);
       dispatch(client, "send", "thread-p", "thread.turn.start", { message: { messageId: "m2", text: "Again", attachments: [] } });
-      expect(failureText(await exitFrame(client, "send"))).toContain("expired after 14 days settled");
+      expect(failureText(await exitFrame(client, "send"))).toContain("expired after 2 days settled");
       expect(boat.resumed).toEqual([]);
 
       // Counts toward nothing: the only place takes a new chat
@@ -3918,7 +3964,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       await Bun.sleep(400);
       expect(existsSync(join(dir, "hub-thread-shells", "thread-p.json"))).toBe(true);
       dispatch(client2, "unsettle2", "thread-p", "thread.unsettle", { reason: "user" });
-      expect(failureText(await exitFrame(client2, "unsettle2"))).toContain("expired after 14 days settled");
+      expect(failureText(await exitFrame(client2, "unsettle2"))).toContain("expired after 2 days settled");
 
       // Archiving it is the only way out of the sidebar
       dispatch(client2, "archive", "thread-p", "thread.archive");
@@ -3927,19 +3973,95 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       expect(handle2.state.getHub()?.expiredThreads?.["thread-p"]).toBeUndefined();
     });
 
+    test("custom boat.parkedTtlHours controls when parked VMs expire and formats the notice", async () => {
+      const { boat, handle, client, sandboxId } = await parkedChat("park-custom-ttl", { parkedTtlHours: 12 });
+      handle.state.updateHubSandbox(sandboxId, (s) => {
+        s.sleepingSince = new Date(Date.now() - 11 * 3600_000).toISOString();
+      });
+      expect(await handle.hub!.expireParkedSandboxes()).toBe(0);
+      handle.state.updateHubSandbox(sandboxId, (s) => {
+        s.sleepingSince = new Date(Date.now() - 12 * 3600_000 - 60_000).toISOString();
+      });
+      expect(await handle.hub!.expireParkedSandboxes()).toBe(1);
+      expect(boat.deleted).toEqual([sandboxId]);
+      expect(handle.state.getHub()?.expiredThreads?.["thread-p"]).toMatchObject({ sandboxId, reason: "parked-ttl", ttlHours: 12 });
+      dispatch(client, "unsettle", "thread-p", "thread.unsettle", { reason: "user" });
+      expect(failureText(await exitFrame(client, "unsettle"))).toContain("expired after 12 hours settled");
+    });
+
+    test("hub.maxParkedSandboxes retires oldest parked VMs immediately on park and during sweep", async () => {
+      const { boat, handle, client, vms, sandboxId: sb1 } = await parkedChat("park-cap", {
+        maxSandboxes: 4,
+        maxParkedSandboxes: 2,
+        vms: 3,
+      });
+      const parkAnother = async (threadId: string, vmIdx: number, ageMinsAgo: number) => {
+        const launched = await launchAnother(client, handle, threadId);
+        expect(exitOf(launched)._tag).toBe("Success");
+        await client.waitForFrame(shellThreadUpdate(threadId, (t) => t.status === "running"));
+        const sbId = handle.state.listHubSandboxes().find((s) => s.threadIds.includes(threadId))!.sandboxId;
+        const vm = vms[vmIdx];
+        const settledRow = { ...vm.threads.get(threadId)!, status: "idle", settledAt: new Date().toISOString() };
+        vm.threads.set(threadId, settledRow);
+        (handle.hub as unknown as { handleVmShellItems(id: string, items: unknown[]): void }).handleVmShellItems(sbId, [
+          { kind: "thread.updated", sequence: 5, location: "active", thread: settledRow },
+        ]);
+        await client.waitForFrame(shellThreadUpdate(threadId, (t) => typeof t.settledAt === "string"));
+        await handle.hub!.handleWatchdogEvent({ slot: `hub:${sbId}`, sandboxId: sbId, event: "all-archived" });
+        handle.state.updateHubSandbox(sbId, (s) => {
+          s.sleepingSince = new Date(Date.now() - ageMinsAgo * 60_000).toISOString();
+        });
+        return sbId;
+      };
+
+      // Age sb1 so ordering is deterministic
+      handle.state.updateHubSandbox(sb1, (s) => {
+        s.sleepingSince = new Date(Date.now() - 30 * 60_000).toISOString();
+      });
+      // 2nd parked VM: still within cap (2/2)
+      const sb2 = await parkAnother("thread-q", 1, 20);
+      expect(boat.deleted).toEqual([]);
+      expect(handle.state.listHubSandboxes().filter((s) => s.parkedAt)).toHaveLength(2);
+
+      // 3rd parked VM: exceeds cap -> oldest (sb1 / thread-p) retires to read-only immediately
+      const sb3 = await parkAnother("thread-r", 2, 10);
+      expect(boat.deleted).toEqual([sb1]);
+      expect(handle.state.getHubSandbox(sb1)).toBeUndefined();
+      expect(handle.state.getHub()?.expiredThreads?.["thread-p"]).toMatchObject({ sandboxId: sb1, reason: "parked-limit" });
+      expect(handle.state.getHubSandbox(sb2)?.parkedAt).toBeTruthy();
+      expect(handle.state.getHubSandbox(sb3)?.parkedAt).toBeTruthy();
+
+      // Retired chat stays listed with cached history and refuses to continue with a clear notice
+      expect((await shellThreads(client, "shell-cap")).map((t) => t.id).sort()).toEqual(["thread-p", "thread-q", "thread-r"]);
+      dispatch(client, "unsettle-p", "thread-p", "thread.unsettle", { reason: "user" });
+      expect(failureText(await exitFrame(client, "unsettle-p"))).toContain("retired to stay within the parked VM limit");
+
+      // Lowering the cap and running sweep retires the next oldest (sb2 / thread-q) while keeping sb3
+      handle.hub!.maxParkedSandboxes = 1;
+      expect(await handle.hub!.expireParkedSandboxes()).toBe(1);
+      expect(boat.deleted).toEqual([sb1, sb2]);
+      expect(handle.state.getHub()?.expiredThreads?.["thread-q"]).toMatchObject({ sandboxId: sb2, reason: "parked-limit" });
+      expect(handle.state.getHubSandbox(sb3)?.parkedAt).toBeTruthy();
+
+      // Setting maxParkedSandboxes = 0 disables count-based eviction
+      handle.hub!.maxParkedSandboxes = 0;
+      expect(await handle.hub!.evictExcessParkedSandboxes()).toBe(0);
+      expect(handle.state.getHubSandbox(sb3)?.parkedAt).toBeTruthy();
+    });
+
     test("a parked VM whose disk Boat dropped early turns read only on wake, without retrying", async () => {
       const { boat, handle, client, sandboxId } = await parkedChat("park-dropped");
       boat.sandboxes.delete(sandboxId);
       dispatch(client, "unsettle", "thread-p", "thread.unsettle", { reason: "user" });
       const refused = await exitFrame(client, "unsettle");
       expect(exitOf(refused)._tag).toBe("Failure");
-      expect(failureText(refused)).toContain("expired after 14 days settled");
+      expect(failureText(refused)).toContain("VM disk expired in Boat");
       expect(handle.state.getHubSandbox(sandboxId)).toBeUndefined();
       expect(handle.state.getHub()?.expiredThreads?.["thread-p"]).toMatchObject({ reason: "data-expired" });
       expect((await shellThreads(client, "shell2")).map((t) => t.id)).toEqual(["thread-p"]);
       // A second try is answered by the Hub: no resume, no backoff loop
       dispatch(client, "unsettle2", "thread-p", "thread.unsettle", { reason: "user" });
-      expect(failureText(await exitFrame(client, "unsettle2"))).toContain("expired after 14 days settled");
+      expect(failureText(await exitFrame(client, "unsettle2"))).toContain("VM disk expired in Boat");
     });
 
     test("the reaper turns a parked VM Boat no longer lists into a read-only chat", async () => {

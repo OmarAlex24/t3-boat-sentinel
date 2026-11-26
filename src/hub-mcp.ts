@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { authenticateClient } from "./auth.ts";
-import type { ProjectConfig, SentinelConfig } from "./config.ts";
+import { DEFAULT_MAX_PARKED_SANDBOXES, DEFAULT_PARKED_TTL_HOURS, type ProjectConfig, type SentinelConfig } from "./config.ts";
 import { clientIpFromRequest, rateLimitedResponse, type AuthRateLimiter } from "./security.ts";
 import { isChildThreadRow, vmCloseBlocker } from "./hub-park-guard.ts";
 import { buildAutoProjectConfig, countsTowardHubLimit, type HubSandboxRecord, type StateStore } from "./state.ts";
@@ -1775,6 +1775,8 @@ export class HubMcpHandler {
       label: hub.label,
       provider: this.bridge.providerName(),
       maxSandboxes: this.config.hub?.maxSandboxes ?? 10,
+      maxParkedSandboxes: this.config.hub?.maxParkedSandboxes ?? DEFAULT_MAX_PARKED_SANDBOXES,
+      parkedTtlHours: this.config.boat.parkedTtlHours ?? DEFAULT_PARKED_TTL_HOURS,
       activeSandboxes: sandboxes.filter(countsTowardHubLimit).length,
       parkedSandboxes: sandboxes.filter((s) => s.phase === "sleeping" && s.parkedAt).length,
       bootingLaunches: this.countBootingLaunches(),
