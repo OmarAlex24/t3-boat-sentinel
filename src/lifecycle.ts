@@ -111,6 +111,8 @@ export class LifecycleManager {
 
   /** Set by the Hub: any other Hub VM Boat no longer lists; its chats leave the sidebar and the Hub forgets it. */
   onHubSandboxGone?: (sandboxId: string) => Promise<void>;
+  /** Called when the reaper finds a Hub sandbox stopped outside the Hub (its watchdog's backstop). */
+  onHubSandboxStopped?: (sandboxId: string) => void;
 
   /** Protect a newly created Hub VM from orphan reaping while it is still provisioning. */
   trackInFlightSandbox(sandboxId: string): void {
@@ -903,6 +905,7 @@ export class LifecycleManager {
           if (endKlav) s.klavAgentName = null;
           s.sleepingSince = remote.stoppedAt ?? new Date().toISOString();
         });
+        this.onHubSandboxStopped?.(hubSb.sandboxId);
       }
     }
     const maxSleepMs = this.config.boat.maxSleepingHours > 0 ? this.config.boat.maxSleepingHours * 3600_000 : 0;

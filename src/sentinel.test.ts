@@ -2564,7 +2564,8 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       if (t3Contracts) expect(t3Contracts.decodeFrame("orchestration.subscribeShell", shell)).toEqual([{ ok: true }, { ok: true }]);
       const byId = new Map(listed.map((t) => [String(t.id), t]));
       expect([...byId.keys()].sort()).toEqual([...chats].sort());
-      expect(byId.get("thread-sleep")).toMatchObject({ title: "Chat thread-sleep", projectId: hubProjectId, status: "running" });
+      // Its VM stopped while its row said running: shown ended, as the woken VM will show it
+      expect(byId.get("thread-sleep")).toMatchObject({ title: "Chat thread-sleep", projectId: hubProjectId, status: "interrupted", activeRunId: null });
       expect(byId.get("thread-cached")).toMatchObject({ title: "Cached chat", projectId: hubProjectId });
       expect(byId.get("thread-legacy")).toMatchObject({ title: "Sleeping chat", projectId: hubProjectId, status: "idle" });
       await until(() => !existsSync(join(rows, "thread-ghost.json")));
@@ -3980,6 +3981,156 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       expect(boat.stopped).toEqual([sandboxId]);
       expect(handle.state.getHubSandbox(sandboxId)?.parkedAt).toBeTruthy();
       expect(logged.some((l) => l.includes(`parking settled sandbox ${sandboxId} (my-app) — trigger: watchdog all-archived`))).toBe(true);
+    });
+
+    // ── A chat whose VM stopped mid-run is not shown running ────────────────────────────────────
+
+    /** The VM's projection of a chat in the middle of a turn: its run `running`, a command still running. */
+    function runningProjection(vm: ReturnType<typeof startFakeVmT3Server>, threadId: string) {
+      const input = placeholderInputFrom(
+        "launch",
+        {
+          title: "Busy chat",
+          modelSelection: { instanceId: "claudeAgent", model: "claude-opus-5-5" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          initialMessage: { messageId: `vm-msg-${threadId}`, text: "Do the long thing", attachments: [] },
+        },
+        threadId,
+        vm.vmProjectId,
+      )!;
+      const { projection, shell } = buildPlaceholderThread(input);
+      const runId = String(shell.activeRunId);
+      const userItem = (projection.turnItems as Array<Record<string, unknown>>)[0];
+      const { messageId: _m, inputIntent: _i, text: _t, attachments: _a, createdBy: _c, creationSource: _s, ...base } = userItem;
+      const command = { ...base, id: "item-cmd-1", ordinal: 2, type: "command_execution", status: "running", completedAt: null, input: "bun test" };
+      const visible = (projection.visibleTurnItems as Array<Record<string, unknown>>)[0];
+      const now = String(shell.createdAt);
+      // The provider thread holds two commands the agent waits on ("Waiting on 2 commands"), and a PR watch
+      const providerThread = {
+        id: "pt-1",
+        driver: "claudeAgent",
+        providerInstanceId: "claudeAgent",
+        providerSessionId: null,
+        appThreadId: threadId,
+        ownerNodeId: null,
+        nativeThreadRef: null,
+        nativeConversationHeadRef: null,
+        status: "active",
+        firstRunOrdinal: 1,
+        lastRunOrdinal: 1,
+        handoffIds: [],
+        forkedFrom: null,
+        pendingBackgroundTasks: BACKGROUND_TASKS,
+        createdAt: now,
+        updatedAt: now,
+      };
+      return {
+        runId,
+        projection: {
+          ...projection,
+          providerThreads: [providerThread],
+          runs: (projection.runs as Array<Record<string, unknown>>).map((r) => ({ ...r, status: "running", startedAt: r.requestedAt })),
+          turnItems: [userItem, command],
+          visibleTurnItems: [visible, { ...visible, position: 2, sourceItemId: "item-cmd-1", item: command }],
+        },
+      };
+    }
+    const BACKGROUND_TASKS = [
+      { taskId: "cmd-1", kind: "command", awaited: true, description: "bun test" },
+      { taskId: "cmd-2", kind: "command", awaited: true, description: "bun run build" },
+      { taskId: "pull-request-watch:42", kind: "background_task" },
+    ];
+    const runsOf = (f: Record<string, unknown>) => (snapshotOf(f) as unknown as { runs: Array<{ id: string; status: string }> }).runs;
+    const itemOf = (f: Record<string, unknown>, id: string) =>
+      (snapshotOf(f) as unknown as { turnItems: Array<{ id: string; status: string }> }).turnItems.find((i) => i.id === id);
+
+    test("a chat whose VM was parked mid-run is served as not running; a message to it is held and wakes the VM", async () => {
+      const { vm, boat, handle, client, cfg, sandboxId } = await chatOnParkingHub("park-midrun");
+      const { runId, projection } = runningProjection(vm, "thread-p");
+      vm.readAnswers.set("orchestration.getThreadProjection", projection);
+      vm.pushThreadRow("thread-p", {
+        status: "running",
+        activeRunId: runId,
+        activityRunStatus: "running",
+        settledAt: null,
+        pendingBackgroundTasks: BACKGROUND_TASKS,
+      });
+      await client.waitForFrame(shellThreadUpdate("thread-p", (t) => t.activeRunId === runId));
+      // The chat is open: its view streams from the VM
+      client.request("open", "orchestration.subscribeThread", { threadId: "thread-p" });
+      await until(() => vm.seenMethods.some((m) => m.tag === "orchestration.subscribeThread"));
+
+      // As the Hub did before this fix (a settle elsewhere parked the VM): stopped with the turn running
+      await handle.hub!.sleepHubSandbox(sandboxId);
+      handle.state.updateHubSandbox(sandboxId, (s) => {
+        s.parkedAt = new Date().toISOString();
+      });
+      // An open sidebar is told at once
+      const told = await client.waitForFrame(shellThreadUpdate("thread-p", (t) => t.status === "interrupted"));
+      if (t3Contracts) for (const r of t3Contracts.decodeFrame("orchestration.subscribeShell", told)) expect(r).toEqual({ ok: true });
+      const toldRow = (told.values as Array<{ thread?: Record<string, unknown> }>).find((v) => v.thread?.id === "thread-p")!.thread!;
+      expect(toldRow.pendingBackgroundTasks).toEqual([BACKGROUND_TASKS[2]]);
+      // The open view, as the app opens it again once its VM stream ended (it keeps its own copy): the turn is over
+      client.request("reopen", "orchestration.subscribeThread", { threadId: "thread-p", afterSequence: 12 });
+      const reopened = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "reopen");
+      expect(runsOf(reopened).map((r) => r.status)).toEqual(["interrupted"]);
+      expect(itemOf(reopened, "item-cmd-1")?.status).toBe("interrupted");
+      const providerTasks = (snapshotOf(reopened) as unknown as { providerThreads: Array<{ pendingBackgroundTasks: unknown[] }> }).providerThreads[0]
+        .pendingBackgroundTasks;
+      expect(providerTasks).toEqual([BACKGROUND_TASKS[2]]);
+      if (t3Contracts) for (const r of t3Contracts.decodeFrame("orchestration.subscribeThread", reopened)) expect(r).toEqual({ ok: true });
+
+      // The stored row still says running (what the VM sent); a restarted Hub serves it ended
+      handle.stop();
+      expect(JSON.parse(readFileSync(join(cfg.stateDir, "hub-thread-shells", "thread-p.json"), "utf8")).activeRunId).toBe(runId);
+      const handle2 = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+      cleanups.push(() => handle2.stop());
+      const client2: HubClient = await connectHubClient(handle2, cfg);
+      client2.request("shell", "orchestration.subscribeShell");
+      const shell = await client2.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "shell");
+      const row = (shell.values as Array<{ snapshot: { threads: Array<Record<string, unknown>> } }>)[0].snapshot.threads.find((t) => t.id === "thread-p")!;
+      expect(row).toMatchObject({ status: "interrupted", activeRunId: null, activityRunStatus: null, pendingBackgroundTasks: [BACKGROUND_TASKS[2]] });
+      if (t3Contracts) for (const r of t3Contracts.decodeFrame("orchestration.subscribeShell", shell)) expect(r).toEqual({ ok: true });
+
+      client2.request("sub", "orchestration.subscribeThread", { threadId: "thread-p", afterSequence: 9 });
+      const sub = await client2.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "sub");
+      expect(runsOf(sub).map((r) => r.status)).toEqual(["interrupted"]);
+      expect(itemOf(sub, "item-cmd-1")?.status).toBe("interrupted");
+      if (t3Contracts) for (const r of t3Contracts.decodeFrame("orchestration.subscribeThread", sub)) expect(r).toEqual({ ok: true });
+      client2.request("family", "orchestration.getThreadFamily", { threadId: "thread-p" });
+      const family = await exitFrame(client2, "family");
+      expect((family.exit as { value: { threads: Array<Record<string, unknown>> } }).value.threads[0]).toMatchObject({ status: "interrupted", activeRunId: null });
+      expect(boat.resumed).toEqual([]);
+
+      // The app sends a new message normally: held, it wakes the VM and reaches it
+      const seenBefore = vm.seenMethods.length;
+      const command = appMessage("thread-p", "p2", "Are you still there?");
+      client2.request("send", "orchestration.dispatchCommand", command);
+      expect(exitOf(await exitFrame(client2, "send", 1_000))._tag).toBe("Success");
+      await until(() => vmMessages(vm, seenBefore).length === 1);
+      expect(vmMessages(vm, seenBefore)).toEqual([command]);
+      expect(boat.resumed).toEqual([sandboxId]);
+      // Up again, the VM's own row wins over the ended run the Hub showed, even unchanged from the stored one
+      // (this fake VM still lists it running; a real one lists it interrupted)
+      await client2.waitForFrame(shellThreadUpdate("thread-p", (t) => t.activeRunId === runId));
+    });
+
+    test("a chat whose VM slept while it waits on the person's answer is served as it was", async () => {
+      const { vm, handle, client, sandboxId } = await chatOnParkingHub("sleep-waiting-person");
+      const asking = {
+        status: "waiting",
+        activeRunId: "run-ask",
+        activityRunStatus: "waiting",
+        pendingRuntimeRequest: { id: "req-1", kind: "user_input", blocking: true },
+      };
+      vm.pushThreadRow("thread-p", asking);
+      await client.waitForFrame(shellThreadUpdate("thread-p", (t) => t.activeRunId === "run-ask"));
+      await handle.hub!.sleepHubSandbox(sandboxId);
+      expect(handle.state.getHubSandbox(sandboxId)?.phase).toBe("sleeping");
+      // Its run survives the VM's restart (T3 continues a run that waits): nothing is rewritten
+      const listed = await shellThreads(client, "shell-after");
+      expect(listed.find((t) => t.id === "thread-p")).toMatchObject({ status: "waiting", activeRunId: "run-ask", activityRunStatus: "waiting" });
     });
 
     test("idle sleep is not held back by the park check", async () => {

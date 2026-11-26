@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { waitsOnPerson } from "./hub-park-guard.ts";
 
 /**
  * Thread records the Hub shows while a chat's VM boots: a shell thread (`orchestration.subscribeShell`)
@@ -418,6 +419,68 @@ export function failPlaceholderThread(
       threadId,
       { outcome: "failed", summary: "This chat's VM could not start.", detail: error },
       now,
+    ),
+  };
+}
+
+/** Run states a stop ends (a queued run has not started: T3 starts it after the restart). */
+const RUN_IN_PROGRESS = new Set(["preparing", "starting", "running", "waiting"]);
+const ITEM_IN_PROGRESS = new Set(["pending", "running", "waiting"]);
+
+/** A background task whose process lives on the VM (commands, monitors, subagents), not a pull-request watch. */
+function isVmProcessTask(task: unknown): boolean {
+  return !String((task as { taskId?: unknown } | null)?.taskId ?? "").startsWith("pull-request-watch:");
+}
+
+/** The tasks a stop leaves (pull-request watches only); the list unchanged when it has none to drop. */
+function withoutVmProcessTasks(tasks: unknown): unknown {
+  return Array.isArray(tasks) && tasks.some(isVmProcessTask) ? tasks.filter((t) => !isVmProcessTask(t)) : tasks;
+}
+
+/**
+ * True when a chat's row says a run or background work (a command, a monitor...) was under way and
+ * not just waiting on the person. A VM stopped like that (parked, or stopped by its watchdog)
+ * restarts T3 when it wakes and its processes are gone: the VM then shows the run `interrupted`.
+ * A run blocked on the person's answer survives the restart. Same notion of live as `parkBlocker`.
+ */
+export function wasStoppedMidRun(row: Record<string, unknown> | undefined): boolean {
+  if (!row) return false;
+  const live =
+    row.activeRunId != null ||
+    row.activityRunStatus != null ||
+    RUN_IN_PROGRESS.has(String(row.status)) ||
+    (Array.isArray(row.pendingBackgroundTasks) && row.pendingBackgroundTasks.some(isVmProcessTask));
+  return live && !waitsOnPerson(row);
+}
+
+/** The row as the woken VM will show it: the run ended `interrupted`, nothing active or running in the background. */
+export function withStoppedRunShell(row: Record<string, unknown>): Record<string, unknown> {
+  const ended: Record<string, unknown> = { ...row, status: "interrupted", activeRunId: null, activityRunStatus: null };
+  if ("pendingBackgroundTasks" in row) ended.pendingBackgroundTasks = withoutVmProcessTasks(row.pendingBackgroundTasks);
+  return ended;
+}
+
+/**
+ * The projection with the runs under way ended `interrupted` (their unfinished items too) and no
+ * background work on its provider threads, so the app shows the turn over (and sends a new message
+ * instead of waiting on it). Queued runs are kept.
+ */
+export function withStoppedRunProjection(projection: Record<string, unknown>): Record<string, unknown> {
+  const runs = (projection.runs as Array<Record<string, unknown>> | undefined) ?? [];
+  const ended = new Set(runs.filter((r) => RUN_IN_PROGRESS.has(String(r.status))).map((r) => r.id));
+  const endItem = (item: Record<string, unknown>) =>
+    ended.has(item.runId) && ITEM_IN_PROGRESS.has(String(item.status)) ? { ...item, status: "interrupted" } : item;
+  const visible = (projection.visibleTurnItems as Array<Record<string, unknown>> | undefined) ?? [];
+  const providerThreads = (projection.providerThreads as Array<Record<string, unknown>> | undefined) ?? [];
+  return {
+    ...projection,
+    runs: runs.map((r) => (ended.has(r.id) ? { ...r, status: "interrupted" } : r)),
+    turnItems: ((projection.turnItems as Array<Record<string, unknown>> | undefined) ?? []).map(endItem),
+    visibleTurnItems: visible.map((row) =>
+      row.item && typeof row.item === "object" ? { ...row, item: endItem(row.item as Record<string, unknown>) } : row,
+    ),
+    providerThreads: providerThreads.map((t) =>
+      "pendingBackgroundTasks" in t ? { ...t, pendingBackgroundTasks: withoutVmProcessTasks(t.pendingBackgroundTasks) } : t,
     ),
   };
 }

@@ -89,8 +89,11 @@ import {
   placeholderInputFrom,
   projectionFromShell,
   restoredShellRow,
+  wasStoppedMidRun,
   withHeldTurns,
   withStatusNotice,
+  withStoppedRunProjection,
+  withStoppedRunShell,
   type HeldTurn,
   type PlaceholderInput,
   type StatusNotice,
@@ -1170,11 +1173,14 @@ export class HubServer {
           const bridge = await this.ensureBridgeOpen(sb);
           return bridge.callUnary(tag, payload, timeoutMs);
         },
-        getThreadShell: (threadId) => this.threadShells.get(threadId),
+        getThreadShell: (threadId) => {
+          const row = this.threadShells.get(threadId);
+          return row ? this.servedShellRow(threadId, row) : undefined;
+        },
         listThreadShells: () =>
           Array.from(this.threadShells.entries()).map(([threadId, shell]) => ({
             threadId,
-            shell,
+            shell: this.servedShellRow(threadId, shell),
             sandboxId: this.threadToSandbox.get(threadId) ?? null,
           })),
         getSandboxForThread: (threadId) => {
@@ -1226,6 +1232,7 @@ export class HubServer {
       this.restoreHeldTurns();
       this.lifecycle.onParkedHubSandboxGone = (sandboxId) => this.expireParkedSandbox(sandboxId, "gone-remotely");
       this.lifecycle.onHubSandboxGone = (sandboxId) => this.forgetVanishedSandbox(sandboxId);
+      this.lifecycle.onHubSandboxStopped = (sandboxId) => this.announceStoppedRuns(sandboxId);
     }
   }
 
@@ -1899,7 +1906,7 @@ export class HubServer {
       schemaVersion: 2,
       snapshotSequence: hub.sequence,
       projects: this.buildHubProjects(),
-      threads: Array.from(this.threadShells.values()),
+      threads: Array.from(this.threadShells, ([threadId, row]) => this.servedShellRow(threadId, row)),
       archivedThreads: [],
     };
   }
@@ -2539,7 +2546,7 @@ export class HubServer {
         // Opening the chat asks for its family; answer from the sidebar row instead of waiting for the VM
         const shell = this.threadShells.get(tid);
         if (shell) {
-          sendRpcExitSuccess(ws, reqId, { snapshotSequence: this.state.ensureHub().sequence, threads: [shell] });
+          sendRpcExitSuccess(ws, reqId, { snapshotSequence: this.state.ensureHub().sequence, threads: [this.servedShellRow(tid, shell)] });
           return;
         }
       }
@@ -3654,7 +3661,8 @@ export class HubServer {
     }
     const cached = this.readProjectionCache(threadId);
     const shell = this.threadShells.get(threadId);
-    const base = cached ?? (shell ? projectionFromShell(shell) : null);
+    let base = cached ?? (shell ? projectionFromShell(shell) : null);
+    if (base && wasStoppedMidRun(shell)) base = withStoppedRunProjection(base);
     return base ? withStatusNotice(base, threadId, { outcome: "updated", summary: EXPIRED_NOTICE }) : null;
   }
 
@@ -3686,7 +3694,7 @@ export class HubServer {
     if (tag === "orchestration.getThreadFamily") {
       const shell = this.threadShells.get(threadId);
       if (shell) {
-        sendRpcExitSuccess(ws, reqId, { snapshotSequence: this.state.ensureHub().sequence, threads: [shell] });
+        sendRpcExitSuccess(ws, reqId, { snapshotSequence: this.state.ensureHub().sequence, threads: [this.servedShellRow(threadId, shell)] });
         return;
       }
     }
@@ -4006,11 +4014,47 @@ export class HubServer {
    * The Hub's view of a sleeping chat: its cached projection (or its sidebar row), the messages it
    * holds for the VM as queued (or failed) runs, and a status row.
    */
+  /** True while a chat's VM is stopped (asleep, parked or waking) or gone (a read-only chat). */
+  private vmIsStopped(threadId: string): boolean {
+    if (this.expiredThread(threadId)) return true;
+    const sbId = this.threadToSandbox.get(threadId);
+    return (sbId ? this.state.getHubSandbox(sbId) : undefined)?.phase === "sleeping";
+  }
+
+  /**
+   * A chat's sidebar row as the Hub serves it. A run its stopped VM was in the middle of is shown
+   * ended, as the VM itself shows it once it wakes (T3 restarts and the run is dead), so the app sends
+   * a new message instead of waiting on a turn that will never finish. The stored row is unchanged.
+   */
+  private servedShellRow(threadId: string, row: Record<string, unknown>): Record<string, unknown> {
+    return this.vmIsStopped(threadId) && wasStoppedMidRun(row) ? withStoppedRunShell(row) : row;
+  }
+
+  /** After a VM stopped: chats it stopped mid-run are shown ended, in the sidebar and in open views. */
+  announceStoppedRuns(sandboxId: string): void {
+    const sb = this.state.getHubSandbox(sandboxId);
+    if (!sb || sb.phase !== "sleeping") return;
+    for (const threadId of sb.threadIds) {
+      const row = this.threadShells.get(threadId);
+      if (!row || !wasStoppedMidRun(row)) continue;
+      console.log(`[hub] chat ${threadId} was mid-run when ${sandboxId} stopped; shown interrupted until its VM wakes`);
+      this.broadcastShellItem({
+        kind: "thread.updated",
+        sequence: this.state.nextHubSequence(),
+        location: "active",
+        thread: this.servedShellRow(threadId, row),
+      });
+      this.pushHeldTurnsView(threadId);
+    }
+  }
+
   private sleepingThreadView(threadId: string, sandboxId: string): Record<string, unknown> | null {
     const cached = this.readProjectionCache(threadId);
     const shell = this.threadShells.get(threadId);
     let base = cached ?? (shell ? projectionFromShell(shell) : null);
     if (!base) return null;
+    // Beneath the held messages: their queued runs are the Hub's own
+    if (this.vmIsStopped(threadId) && wasStoppedMidRun(shell)) base = withStoppedRunProjection(base);
     const held = this.heldTurns.get(threadId);
     if (held) base = withHeldTurns(base, threadId, held.turns);
     const notice: StatusNotice =
@@ -5542,6 +5586,7 @@ export class HubServer {
       s.sleepingSince = now;
       s.parkedAt = park ? now : null;
     });
+    this.announceStoppedRuns(sandboxId);
   }
 
   /** `pull: false` skips the teardown read of provider sign-ins (a VM that cannot be reached). */
@@ -5844,8 +5889,9 @@ export class HubServer {
           if (typeof rewritten.worktreePath === "string" && rewritten.worktreePath) {
             this.bindWorktreeToSandbox(rewritten.worktreePath, sandboxId);
           }
-          // New, or a row the Hub restored while the VM was down: the VM's live row wins
-          if (!previous || JSON.stringify(previous) !== JSON.stringify(rewritten)) {
+          // New, or a row the Hub restored while the VM was down: the VM's live row wins (also over
+          // the ended run the Hub showed while it was stopped, even when the stored row is the same)
+          if (!previous || JSON.stringify(previous) !== JSON.stringify(rewritten) || wasStoppedMidRun(previous)) {
             this.broadcastShellItem({
               kind: "thread.updated",
               sequence: this.state.nextHubSequence(),
