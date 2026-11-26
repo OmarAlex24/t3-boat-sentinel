@@ -156,6 +156,31 @@ export interface HubPendingLaunchRecord {
   createdAt: string;
 }
 
+/**
+ * Messages a chat got while its VM was asleep or waking, held by the Hub (shown as queued runs) and
+ * sent to the VM in order once it is up. Kept so a Hub restart resumes the wake and the delivery.
+ */
+export interface HubHeldTurnsRecord {
+  threadId: string;
+  sandboxId: string;
+  /** Oldest first: the client's `message.dispatch` payloads (Hub project ids) and the runs the Hub shows. */
+  turns: Array<{
+    runId: string;
+    payload: Record<string, unknown>;
+    requestedAt: string;
+    status: "queued" | "sent" | "failed";
+  }>;
+  /** The redacted reason of the wake (or the delivery) that failed them, if any. */
+  error: string | null;
+  /**
+   * The VM was up but did not take a held message (it refused it, or it could not be reached after
+   * retries): that message and the ones after it are failed, and the chat keeps the Hub's view (with
+   * them) until the user's next message. Never delivered again, also after a Hub restart.
+   */
+  failedDelivery?: boolean;
+  createdAt: string;
+}
+
 export interface HubStateRecord {
   environmentId: string;
   label: string;
@@ -180,6 +205,8 @@ export interface HubStateRecord {
   pendingLaunches?: Record<string, HubPendingLaunchRecord>;
   /** Read-only settled chats whose parked VM expired, by thread id (see `HubExpiredThreadRecord`). */
   expiredThreads?: Record<string, HubExpiredThreadRecord>;
+  /** Messages held for chats whose VM is waking, by thread id (see `HubHeldTurnsRecord`). */
+  heldTurns?: Record<string, HubHeldTurnsRecord>;
 }
 
 export interface PersistedState {
@@ -290,6 +317,7 @@ export class StateStore {
         ...(prevHub?.expiredThreads && Object.keys(prevHub.expiredThreads).length > 0
           ? { expiredThreads: prevHub.expiredThreads }
           : {}),
+        ...(prevHub?.heldTurns && Object.keys(prevHub.heldTurns).length > 0 ? { heldTurns: prevHub.heldTurns } : {}),
       };
     }
 

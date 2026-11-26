@@ -83,10 +83,13 @@ import { HubPortGateway, PREVIEW_BOOTSTRAP_PATH, parseLoopbackPreviewUrl } from 
 import {
   buildPlaceholderThread,
   failPlaceholderThread,
+  isQueueableMessage,
   placeholderInputFrom,
   projectionFromShell,
   restoredShellRow,
+  withHeldTurns,
   withStatusNotice,
+  type HeldTurn,
   type PlaceholderInput,
   type StatusNotice,
 } from "./hub-placeholder.ts";
@@ -119,6 +122,7 @@ import {
   buildAutoProjectConfig,
   countsTowardHubLimit,
   type HubExpiredThreadRecord,
+  type HubHeldTurnsRecord,
   type HubPendingLaunchRecord,
   type HubSandboxRecord,
   type HubWakeFailure,
@@ -242,6 +246,25 @@ const BOOKKEEPING_COMMANDS = new Set([
   "thread.active.reorder",
   "thread.tag.set",
 ]);
+
+/**
+ * Commands on T3's queued runs (edit, remove, "Send now", reorder, resume, promote to steer). For a
+ * chat whose messages the Hub holds while its VM wakes, the Hub applies them to the held messages.
+ */
+const QUEUED_RUN_COMMANDS = new Set([
+  "queued-run.edit",
+  "queued-run.cancel",
+  "queued-run.start",
+  "queued-run.reorder",
+  "queue.resume",
+  "queued-message.promote-to-steer",
+]);
+
+/** How sending one held message to its up VM ended. */
+type HeldSendOutcome = { ok: true; bridge: HubVmBridge } | { ok: false; closed: boolean; reason: string };
+
+/** Commands that send the user's message (a new turn, or a follow-up queued behind one). */
+const TURN_COMMANDS = new Set(["message.dispatch", "thread.turn.start"]);
 
 const HOP_BY_HOP = new Set([
   "connection",
@@ -899,6 +922,9 @@ const EXPIRED_NOTICE =
 const SLEEPING_RPC_DETAIL =
   "This chat's VM is asleep, so it cannot answer this. Send a message to wake it.";
 const SLEEPING_NOTICE = "This chat's VM is asleep. Sending a message wakes it.";
+const WAKING_NOTICE = "Waking this chat's VM. Queued messages are sent once it is up.";
+const DELIVERY_FAILED_NOTICE =
+  "This chat's VM did not take a queued message, so it and the ones after it were not sent. Send a message to continue.";
 /** Bookkeeping commands kept per sleeping chat for its next wake; the oldest go past this many. */
 const MAX_HELD_BOOKKEEPING = 50;
 const PARKED_RPC_DETAIL =
@@ -942,6 +968,13 @@ export class HubServer {
   closeBridgeTimeoutMs = 8_000;
   /** Delay between a VM bridge's reconnect attempts. */
   bridgeReconnectMs = 2_000;
+  /**
+   * Resends of a held message the VM could not be reached for (bridge down, timeout), with the same
+   * `commandId`: T3 keeps a receipt per `commandId`, so a command it already took is never run twice.
+   */
+  heldTurnSendRetries = 2;
+  /** Wait before the first resend of a held message; the next waits twice as long. */
+  heldTurnRetryMs = 1_000;
   /** Failed connects in a row (since the last open) after which the Hub re-exposes the VM's T3 port. */
   relayRepairAfterFailures = 3;
   /** At most one automatic relay repair per VM in this window. */
@@ -966,6 +999,12 @@ export class HubServer {
   private readonly pendingThreads = new Map<string, PendingThreadLaunch>();
   /** Bookkeeping commands (visit, pin, tag...) for chats whose VM is asleep, sent when it next wakes; by thread id. */
   private readonly heldBookkeeping = new Map<string, Record<string, unknown>[]>();
+  /** Messages sent to a chat whose VM is asleep or waking, shown as queued and sent once it is up; by thread id. */
+  private readonly heldTurns = new Map<string, HubHeldTurnsRecord>();
+  /** Chats whose held messages are being delivered (the VM's wake, then each message in order). */
+  private readonly heldTurnRunners = new Set<string>();
+  /** The held message each chat is sending to its VM right now (its run id), by thread id. */
+  private readonly heldTurnInFlight = new Map<string, string>();
   /** Thread streams the Hub serves while the thread's VM is not up, by thread id. */
   private readonly localThreadSubs = new Map<string, LocalThreadSub[]>();
   /** A sleeping VM being woken, or whose last wake failed (with the reason), by sandbox id. */
@@ -1137,6 +1176,7 @@ export class HubServer {
       this.state.ensureHub(config.hub.label, Object.keys(this.state.getAllProjects(config)));
       this.restoreLiveSandboxes();
       this.restorePendingLaunches();
+      this.restoreHeldTurns();
       this.lifecycle.onParkedHubSandboxGone = (sandboxId) => this.expireParkedSandbox(sandboxId, "gone-remotely");
       this.lifecycle.onHubSandboxGone = (sandboxId) => this.forgetVanishedSandbox(sandboxId);
     }
@@ -2388,6 +2428,10 @@ export class HubServer {
         sendRpcExitFailure(ws, reqId, `Missing threadId for ${tag}`);
         return;
       }
+      const servable = tag === "orchestration.subscribeThread" || tag === "orchestration.getThreadProjection";
+      // Until its held messages reach the VM, the chat shows them queued (the VM may already be up);
+      // after a failed delivery, the Hub's view with them failed, until the user's next message
+      if (servable && this.showsHeldView(tid) && this.serveSleepingThread(ws, reqId, tag, payload, tid)) return;
       if (this.parkedSandboxForThread(tid) || this.expiredThread(tid)) {
         // Reading a parked (or read-only) chat never wakes its VM
         this.serveParkedThreadRpc(ws, reqId, tag, payload, tid);
@@ -2398,7 +2442,6 @@ export class HubServer {
         this.serveParkedThreadRpc(ws, reqId, tag, payload, tid, SLEEPING_RPC_DETAIL);
         return;
       }
-      const servable = tag === "orchestration.subscribeThread" || tag === "orchestration.getThreadProjection";
       const pending = this.pendingThreads.get(tid);
       if (pending && servable) {
         this.serveLocalThread(ws, reqId, tag, payload, pending.record.projection);
@@ -2577,6 +2620,8 @@ export class HubServer {
     payload: Record<string, unknown>,
     headers: unknown,
   ): Promise<void> {
+    /** A chat whose failed held messages this command cleared: its views move to the VM after it. */
+    let handOffAfter: string | null = null;
     try {
       const cmdType = String(payload.type ?? "");
       if (cmdType === "thread.create") {
@@ -2630,8 +2675,26 @@ export class HubServer {
         sendRpcExitSuccess(ws, reqId, { sequence: this.cancelPendingLaunch(pending, cmdType) });
         return;
       }
-      if (!pending && (await this.handleParkedThreadCommand(ws, reqId, cmdType, payload, tid))) return;
       const closes = cmdType === "thread.archive" || cmdType === "thread.delete";
+      // Closing a chat drops the messages it holds while its VM wakes; the close itself goes on as before
+      if (closes && this.heldTurns.has(tid)) {
+        // After a failed delivery its views are the Hub's: they follow the VM again once the close is sent
+        if (this.heldTurns.get(tid)?.failedDelivery) handOffAfter = tid;
+        this.dropHeldTurns(tid, cmdType);
+      }
+      if (!pending && QUEUED_RUN_COMMANDS.has(cmdType) && this.appliesToHeldTurns(cmdType, payload, tid)) {
+        this.applyHeldQueueCommand(ws, reqId, cmdType, payload, tid);
+        return;
+      }
+      if (!pending && this.holdTurnWhileWaking(ws, reqId, payload, tid)) return;
+      if (!pending && TURN_COMMANDS.has(cmdType) && this.heldTurns.get(tid)?.failedDelivery) {
+        // The user's next message after a failed delivery: the failed rows go, the message goes to the
+        // VM as usual, then the chat's open views follow the VM's own projection again
+        this.forgetHeldTurns(tid);
+        handOffAfter = tid;
+        console.log(`[hub] chat ${tid}: new message after a failed delivery; its view moves to the VM once it is sent`);
+      }
+      if (!pending && (await this.handleParkedThreadCommand(ws, reqId, cmdType, payload, tid))) return;
       if (closes && !pending && this.threadSandboxIsGone(tid)) {
         // Its VM record is gone (or it never had one): nothing can apply the close, so the Hub drops the chat
         sendRpcExitSuccess(ws, reqId, { sequence: this.forgetOrphanThread(tid, cmdType) });
@@ -2671,6 +2734,8 @@ export class HubServer {
       }
     } catch (err) {
       this.sendTypedFailure(ws, reqId, "orchestration.dispatchCommand", payload, err instanceof Error ? err.message : String(err));
+    } finally {
+      if (handOffAfter) this.leaveHeldView(handOffAfter);
     }
   }
 
@@ -3066,6 +3131,395 @@ export class HubServer {
     }
   }
 
+  // ── Messages sent while a chat's VM wakes ──────────────────────────────────────────────────────
+
+  private sandboxOfThread(threadId: string): HubSandboxRecord | undefined {
+    const sbId = this.threadToSandbox.get(threadId);
+    return sbId ? this.state.getHubSandbox(sbId) : undefined;
+  }
+
+  /**
+   * A message for a chat whose VM is asleep (idle or parked) or waking: answered at once and held,
+   * shown as a queued run, while the VM wakes in the background; sent to the VM, in order with any
+   * other held message, once it is up. False when the Hub does not hold it (the VM is up, the chat
+   * is booting or read only, the payload is not a plain message, or a wake would be refused now:
+   * then the command takes the path it always took, and fails at once with the reason).
+   */
+  private holdTurnWhileWaking(
+    ws: ServerWebSocket<HubWsData>,
+    reqId: string | number,
+    payload: Record<string, unknown>,
+    threadId: string,
+  ): boolean {
+    if (!isQueueableMessage(payload) || this.pendingThreads.has(threadId) || this.expiredThread(threadId)) return false;
+    const delivering = this.heldTurnRunners.has(threadId);
+    const sb = this.sandboxOfThread(threadId);
+    if (!sb || this.destroyingSandboxes.has(sb.sandboxId)) return false;
+    if (!delivering) {
+      const asleep = sb.phase === "sleeping" || this.inFlightSleeps.has(sb.sandboxId) || this.inFlightWakes.has(sb.sandboxId);
+      if (!asleep) return false;
+      if (!this.inFlightWakes.has(sb.sandboxId) && this.wakeRefusal(sb)) return false;
+    }
+
+    let record = this.heldTurns.get(threadId);
+    if (record?.failedDelivery) {
+      // The user's next message after a failed delivery (its VM slept since): the failed rows go
+      this.forgetHeldTurns(threadId);
+      record = undefined;
+    }
+    // The app sends a command again after a socket loss: the same message is held once
+    const commandId = typeof payload.commandId === "string" ? payload.commandId : null;
+    if (commandId && record?.turns.some((t) => t.status !== "failed" && t.payload.commandId === commandId)) {
+      sendRpcExitSuccess(ws, reqId, { sequence: this.state.ensureHub().sequence });
+      return true;
+    }
+    const now = new Date().toISOString();
+    const turn: HeldTurn = { runId: `run_hub_${randomUUID().replace(/-/g, "")}`, payload, requestedAt: now, status: "queued" };
+    record = record
+      ? { ...record, sandboxId: sb.sandboxId, turns: [...record.turns, turn] }
+      : { threadId, sandboxId: sb.sandboxId, turns: [turn], error: null, createdAt: now };
+    this.heldTurns.set(threadId, record);
+    this.persistHeldTurns(record);
+    for (const id of this.stagedIdsIn(payload)) this.pinnedStagedAttachments.add(id);
+    sendRpcExitSuccess(ws, reqId, { sequence: this.state.nextHubSequence() });
+    const queued = record.turns.filter((t) => t.status === "queued").length;
+    console.log(`[hub] chat ${threadId}: message held as queued (${queued} queued) while ${sb.sandboxId} wakes`);
+    if (!delivering) void this.deliverHeldTurns(threadId);
+    this.pushHeldTurnsView(threadId);
+    return true;
+  }
+
+  /** Sends the chat's view (held messages included) to its open streams. */
+  private pushHeldTurnsView(threadId: string): void {
+    const sbId = this.threadToSandbox.get(threadId);
+    const view = sbId ? this.sleepingThreadView(threadId, sbId) : null;
+    // With no cached history, a stream that kept the client's own copy is left alone
+    if (view) this.pushLocalThreadSnapshot(threadId, view, !this.readProjectionCache(threadId));
+  }
+
+  /**
+   * Wakes the chat's VM, sends it the held messages in order (as the client sent them, with VM
+   * project ids and staged uploads replayed), then hands the chat's streams over to it. A message
+   * held meanwhile joins the queue; a failed wake marks the held messages failed.
+   */
+  private async deliverHeldTurns(threadId: string): Promise<void> {
+    const record = this.heldTurns.get(threadId);
+    if (!record || this.heldTurnRunners.has(threadId)) return;
+    this.heldTurnRunners.add(threadId);
+    let sb: HubSandboxRecord;
+    let bridge: HubVmBridge;
+    try {
+      // The record may still say running while a sleep finishes
+      await this.inFlightSleeps.get(record.sandboxId)?.catch(() => {});
+      sb = await this.wakeHubSandbox(record.sandboxId);
+      bridge = await this.ensureBridgeOpen(sb);
+      await this.settingsReplayDone(sb.sandboxId);
+    } catch (err) {
+      this.heldTurnRunners.delete(threadId);
+      this.failHeldTurns(threadId, err);
+      return;
+    }
+    for (;;) {
+      const current = this.heldTurns.get(threadId);
+      // Closed meanwhile (archive, delete, VM gone): nothing more to send
+      if (!current) break;
+      const next = current.turns.find((t) => t.status === "queued");
+      if (!next) {
+        // No await from here to the hand-off, so a message held now is never left behind
+        this.forgetHeldTurns(threadId);
+        break;
+      }
+      this.heldTurnInFlight.set(threadId, next.runId);
+      let outcome: HeldSendOutcome;
+      try {
+        outcome = await this.sendHeldTurn(threadId, sb, bridge, next);
+      } finally {
+        this.heldTurnInFlight.delete(threadId);
+      }
+      if (outcome.ok) {
+        bridge = outcome.bridge;
+        // Sent: never sent again (also after a Hub restart); shown until the view moves to the VM
+        this.markHeldTurnSent(threadId, next.runId);
+        continue;
+      }
+      if (outcome.closed) break;
+      // The VM did not take it: it and every message after it (held until this ends) fail, visibly;
+      // the view stays the Hub's
+      try {
+        await this.failHeldDelivery(threadId, sb, next.runId, outcome.reason);
+      } finally {
+        this.heldTurnRunners.delete(threadId);
+      }
+      return;
+    }
+    this.heldTurnRunners.delete(threadId);
+    console.log(`[hub] chat ${threadId}: held messages sent to ${sb.sandboxId}; its streams move to the VM`);
+    this.handOffLocalThreadSubs(threadId, sb);
+  }
+
+  /**
+   * Sends one held message to the up VM. A transport failure (bridge down, dropped, timed out) is
+   * retried with the same payload and `commandId` (T3 answers a `commandId` it already took from its
+   * receipt, without running it again); a failure the VM sent is not. `closed`: the chat was closed
+   * (archive, delete, VM gone) while it waited to retry.
+   */
+  private async sendHeldTurn(threadId: string, sb: HubSandboxRecord, bridge: HubVmBridge, turn: HeldTurn): Promise<HeldSendOutcome> {
+    // Replayed once: a staged upload is gone from the Hub after it reached the VM
+    let payload: Record<string, unknown> | null = null;
+    let lastError = "unknown error";
+    for (let attempt = 0; ; attempt++) {
+      try {
+        if (!bridge.isOpen()) bridge = await this.ensureBridgeOpen(sb, this.wakeBridgeTimeoutMs);
+        payload ??= await this.replayStagedAttachmentsInPayload(
+          sb,
+          bridge,
+          rewriteProjectIds(turn.payload, sb.hubProjectId, sb.vmProjectId) as Record<string, unknown>,
+        );
+        const exit = await bridge.callUnary("orchestration.dispatchCommand", payload, 60_000);
+        if (exit._tag === "Success") return { ok: true, bridge };
+        if (!isHubTransportFailure(exit.cause)) {
+          const reason = formatRpcFailure(exit.cause);
+          console.warn(`[hub] held message for ${threadId} was refused by ${sb.sandboxId}: ${reason}`);
+          return { ok: false, closed: false, reason: `The chat's VM refused it: ${reason}` };
+        }
+        lastError = formatRpcFailure(exit.cause);
+      } catch (err) {
+        lastError = redactForLog(err);
+      }
+      if (attempt >= this.heldTurnSendRetries) {
+        console.warn(`[hub] held message for ${threadId} could not be sent to ${sb.sandboxId} after ${attempt + 1} tries: ${lastError}`);
+        return { ok: false, closed: false, reason: `The chat's VM could not be reached: ${lastError}` };
+      }
+      console.warn(`[hub] held message for ${threadId} could not be sent to ${sb.sandboxId} (${lastError}); retrying`);
+      await Bun.sleep(this.heldTurnRetryMs * 2 ** attempt);
+      if (!this.heldTurns.get(threadId)?.turns.some((t) => t.runId === turn.runId)) return { ok: false, closed: true, reason: "" };
+    }
+  }
+
+  /**
+   * The VM did not take a held message: it and the messages after it show as failed runs with the
+   * reason (never sent later). The view stays the Hub's (the VM's latest copy, so what it took shows)
+   * until the user's next message, which hands it over to the VM.
+   */
+  private async failHeldDelivery(threadId: string, sb: HubSandboxRecord, runId: string, reason: string): Promise<void> {
+    await this.refreshProjectionCache(threadId, sb);
+    const record = this.heldTurns.get(threadId);
+    // Closed meanwhile: nothing to show
+    if (!record) return;
+    let after = false;
+    const turns = record.turns.map((t) => {
+      if (t.runId === runId) after = true;
+      if (!after || t.status === "sent") return t;
+      for (const id of this.stagedIdsIn(t.payload)) this.dropStagedAttachment(id);
+      return { ...t, status: "failed" as const };
+    });
+    const failed: HubHeldTurnsRecord = { ...record, turns, error: reason, failedDelivery: true };
+    this.heldTurns.set(threadId, failed);
+    this.persistHeldTurns(failed);
+    const count = turns.filter((t) => t.status === "failed").length;
+    console.warn(`[hub] chat ${threadId}: ${count} held message(s) failed, ${sb.sandboxId} did not take them: ${reason}`);
+    this.pushHeldTurnsView(threadId);
+  }
+
+  /** Replaces a chat's cached projection with its up VM's current one; kept as it was if the VM cannot answer. */
+  private async refreshProjectionCache(threadId: string, sb: HubSandboxRecord): Promise<void> {
+    const bridge = this.bridges.get(sb.sandboxId);
+    if (!bridge?.isOpen()) return;
+    const exit = await bridge.callUnary("orchestration.getThreadProjection", { threadId }, 5_000);
+    if (exit._tag !== "Success" || !exit.value || typeof exit.value !== "object") return;
+    this.storeProjectionCache(threadId, rewriteProjectIds(exit.value, sb.vmProjectId, sb.hubProjectId) as Record<string, unknown>);
+  }
+
+  /** The wake failed: the held messages show as failed runs (never sent later), with the reason. */
+  private failHeldTurns(threadId: string, err: unknown): void {
+    const record = this.heldTurns.get(threadId);
+    if (!record) return;
+    const reason = err instanceof HubWakeFailedError || err instanceof HubWakeCooldownError ? err.message : redactForLog(err);
+    for (const turn of record.turns) {
+      if (turn.status === "queued") for (const id of this.stagedIdsIn(turn.payload)) this.dropStagedAttachment(id);
+    }
+    const failed: HubHeldTurnsRecord = {
+      ...record,
+      error: reason,
+      turns: record.turns.map((t) => (t.status === "queued" ? { ...t, status: "failed" as const } : t)),
+    };
+    this.heldTurns.set(threadId, failed);
+    this.persistHeldTurns(failed);
+    console.warn(`[hub] chat ${threadId}: held messages failed, its VM could not wake: ${reason}`);
+    this.pushHeldTurnsView(threadId);
+  }
+
+  /**
+   * A queued-run command (edit, remove, "Send now", reorder, resume, promote) on a chat whose
+   * messages the Hub holds: applied to the held messages, answered at once.
+   */
+  private applyHeldQueueCommand(
+    ws: ServerWebSocket<HubWsData>,
+    reqId: string | number,
+    cmdType: string,
+    payload: Record<string, unknown>,
+    threadId: string,
+  ): void {
+    const record = this.heldTurns.get(threadId)!;
+    const fail = (message: string) => this.sendTypedFailure(ws, reqId, "orchestration.dispatchCommand", payload, message);
+    if (cmdType === "queue.resume") {
+      // Held messages are sent as soon as the VM is up; nothing holds the queue
+      sendRpcExitSuccess(ws, reqId, { sequence: this.state.ensureHub().sequence });
+      return;
+    }
+    if (cmdType === "queued-message.promote-to-steer") {
+      fail("This chat's VM is still waking, so no turn is running to steer. Queued messages are sent in order once it is up.");
+      return;
+    }
+    const runId = typeof payload.runId === "string" ? payload.runId : "";
+    const turn = record.turns.find((t) => t.runId === runId);
+    if (!turn || turn.status !== "queued") {
+      fail(
+        !turn || turn.status === "sent"
+          ? "This queued message is no longer queued."
+          : record.failedDelivery
+            ? "This message was not sent: its chat's VM did not take it. Send it again."
+            : "This message was not sent: its chat's VM could not wake. Send it again.",
+      );
+      return;
+    }
+    if (this.heldTurnInFlight.get(threadId) === runId) {
+      fail("This queued message is already being sent to the chat's VM.");
+      return;
+    }
+    const others = record.turns.filter((t) => t.runId !== runId);
+    let turns = record.turns;
+    if (cmdType === "queued-run.cancel") {
+      for (const id of this.stagedIdsIn(turn.payload)) this.dropStagedAttachment(id);
+      turns = others;
+    } else if (cmdType === "queued-run.edit") {
+      if (typeof payload.text !== "string") {
+        fail("A queued message edit needs its text.");
+        return;
+      }
+      const edited: Record<string, unknown> = { ...turn.payload, text: payload.text };
+      if (Array.isArray(payload.attachments)) edited.attachments = payload.attachments;
+      if (payload.context !== undefined) edited.context = payload.context;
+      if (payload.modelSelection && typeof payload.modelSelection === "object") edited.modelSelection = payload.modelSelection;
+      const kept = new Set(this.stagedIdsIn(edited));
+      for (const id of this.stagedIdsIn(turn.payload)) if (!kept.has(id)) this.dropStagedAttachment(id);
+      for (const id of kept) this.pinnedStagedAttachments.add(id);
+      turns = record.turns.map((t) => (t.runId === runId ? { ...t, payload: edited } : t));
+    } else if (cmdType === "queued-run.start") {
+      // "Send now": the first queued message is already next; another moves to the front
+      const first = others.findIndex((t) => t.status === "queued" && t.runId !== this.heldTurnInFlight.get(threadId));
+      turns = first < 0 ? [...others, turn] : [...others.slice(0, first), turn, ...others.slice(first)];
+    } else if (cmdType === "queued-run.reorder") {
+      const before = payload.beforeRunId;
+      if (before === null || before === undefined) {
+        turns = [...others, turn];
+      } else {
+        const at = others.findIndex((t) => t.runId === before && t.status === "queued" && t.runId !== this.heldTurnInFlight.get(threadId));
+        if (at < 0) {
+          fail("The queued message to move this one before is no longer queued.");
+          return;
+        }
+        turns = [...others.slice(0, at), turn, ...others.slice(at)];
+      }
+    } else {
+      fail(`${cmdType} cannot be applied while this chat's VM wakes.`);
+      return;
+    }
+    const next = { ...record, turns };
+    this.heldTurns.set(threadId, next);
+    this.persistHeldTurns(next);
+    sendRpcExitSuccess(ws, reqId, { sequence: this.state.nextHubSequence() });
+    this.pushHeldTurnsView(threadId);
+  }
+
+  /**
+   * A held message reached the VM: never sent again, and shown as sent until the chat's view moves to
+   * the VM (its upload, if still staged, stays until the sweep).
+   */
+  private markHeldTurnSent(threadId: string, runId: string): void {
+    const record = this.heldTurns.get(threadId);
+    if (!record) return;
+    const turn = record.turns.find((t) => t.runId === runId);
+    for (const id of turn ? this.stagedIdsIn(turn.payload) : []) this.pinnedStagedAttachments.delete(id);
+    const next = { ...record, turns: record.turns.map((t) => (t.runId === runId ? { ...t, status: "sent" as const } : t)) };
+    this.heldTurns.set(threadId, next);
+    this.persistHeldTurns(next);
+  }
+
+  /** True while the Hub answers the chat's view: its held messages are on their way, or failed to reach its up VM. */
+  private showsHeldView(threadId: string): boolean {
+    return this.heldTurnRunners.has(threadId) || this.heldTurns.get(threadId)?.failedDelivery === true;
+  }
+
+  /**
+   * A queued-run command the Hub applies to the chat's held messages: any while they are being sent;
+   * after a failed delivery (the VM is up), only one about a held message (others are the VM's).
+   */
+  private appliesToHeldTurns(cmdType: string, payload: Record<string, unknown>, threadId: string): boolean {
+    const record = this.heldTurns.get(threadId);
+    if (!record) return false;
+    if (!record.failedDelivery) return true;
+    if (cmdType === "queue.resume") return false;
+    const runIds = [payload.runId, payload.queuedRunId, payload.beforeRunId];
+    return record.turns.some((t) => runIds.includes(t.runId));
+  }
+
+  /** After the user's message cleared a failed delivery: the chat's open views follow its VM again. */
+  private leaveHeldView(threadId: string): void {
+    if (this.showsHeldView(threadId)) return;
+    const sb = this.sandboxOfThread(threadId);
+    if (!sb) return;
+    if (sb.phase === "running" && !this.inFlightSleeps.has(sb.sandboxId)) this.handOffLocalThreadSubs(threadId, sb);
+    else this.pushHeldTurnsView(threadId);
+  }
+
+  /** Archive or delete while the VM wakes: the held messages are dropped, never sent. */
+  private dropHeldTurns(threadId: string, command: string): void {
+    const record = this.heldTurns.get(threadId);
+    if (!record) return;
+    for (const turn of record.turns) for (const id of this.stagedIdsIn(turn.payload)) this.dropStagedAttachment(id);
+    this.forgetHeldTurns(threadId);
+    console.log(`[hub] chat ${threadId} closed (${command}); dropped ${record.turns.length} held message(s)`);
+  }
+
+  private forgetHeldTurns(threadId: string): void {
+    this.heldTurns.delete(threadId);
+    if (!this.state.getHub()?.heldTurns?.[threadId]) return;
+    this.state.updateHub((h) => {
+      const { [threadId]: _gone, ...rest } = h.heldTurns ?? {};
+      if (Object.keys(rest).length > 0) h.heldTurns = rest;
+      else delete h.heldTurns;
+    });
+  }
+
+  private persistHeldTurns(record: HubHeldTurnsRecord): void {
+    this.state.updateHub((h) => {
+      h.heldTurns = { ...(h.heldTurns ?? {}), [record.threadId]: record };
+    });
+  }
+
+  /** After a Hub restart: failed messages stay shown, queued ones resume their VM's wake and delivery (sent ones are not sent again). */
+  private restoreHeldTurns(): void {
+    for (const record of Object.values(this.state.getHub()?.heldTurns ?? {})) {
+      if (this.threadToSandbox.get(record.threadId) !== record.sandboxId || !this.state.getHubSandbox(record.sandboxId)) {
+        this.forgetHeldTurns(record.threadId);
+        continue;
+      }
+      if (record.turns.every((t) => t.status === "sent")) {
+        // Every message reached the VM before the restart: the VM's view has them
+        this.forgetHeldTurns(record.threadId);
+        continue;
+      }
+      this.heldTurns.set(record.threadId, record);
+      // A failed delivery stays shown failed (never sent again) until the user's next message
+      const queued = record.failedDelivery ? 0 : record.turns.filter((t) => t.status === "queued").length;
+      if (queued > 0) {
+        console.log(`[hub] resuming the delivery of ${queued} queued message(s) to chat ${record.threadId}, interrupted by a Hub restart`);
+        void this.deliverHeldTurns(record.threadId);
+      }
+    }
+  }
+
   // ── Settled chats whose VM is parked ───────────────────────────────────────────────────────────
 
   /** True when a VM whose chats are all settled is parked instead of deleted. */
@@ -3204,6 +3658,7 @@ export class HubServer {
   private forgetOrphanThread(threadId: string, command: string): number {
     this.threadToSandbox.delete(threadId);
     this.heldBookkeeping.delete(threadId);
+    this.forgetHeldTurns(threadId);
     this.recordedReads.delete(threadId);
     this.deleteThreadShell(threadId);
     this.localThreadSubs.delete(threadId);
@@ -3366,6 +3821,7 @@ export class HubServer {
       for (const threadId of sb.threadIds) {
         this.threadToSandbox.delete(threadId);
         this.heldBookkeeping.delete(threadId);
+        this.forgetHeldTurns(threadId);
         this.recordedReads.delete(threadId);
         if (kept.has(threadId)) continue;
         this.deleteThreadShell(threadId);
@@ -3398,14 +3854,15 @@ export class HubServer {
     }
   }
 
-  private sleepNotice(sandboxId: string): StatusNotice {
+  /** `delivering`: the chat's held messages are on their way (its VM is waking, or up and taking them). */
+  private sleepNotice(sandboxId: string, delivering = false): StatusNotice {
     // After a Hub restart only the stored failure is left
     const stored = this.state.getHubSandbox(sandboxId)?.wakeFailure;
     const status: WakeStatus | undefined =
       this.wakeStatus.get(sandboxId) ??
       (stored ? { phase: "failed", error: stored.reason, retryAfter: stored.retryAfter } : undefined);
-    if (status?.phase === "waking") {
-      return { outcome: "updated", summary: "Waking this chat's VM. Messages you send are delivered once it is up." };
+    if (status?.phase === "waking" || (delivering && status?.phase !== "failed")) {
+      return { outcome: "updated", summary: WAKING_NOTICE };
     }
     if (status?.phase === "failed") {
       const coolingDown = status.retryAfter !== null && Date.parse(status.retryAfter) > Date.now();
@@ -3424,12 +3881,22 @@ export class HubServer {
     return { outcome: "updated", summary: SLEEPING_NOTICE };
   }
 
-  /** The Hub's view of a sleeping chat: its cached projection (or its sidebar row) with a status row. */
+  /**
+   * The Hub's view of a sleeping chat: its cached projection (or its sidebar row), the messages it
+   * holds for the VM as queued (or failed) runs, and a status row.
+   */
   private sleepingThreadView(threadId: string, sandboxId: string): Record<string, unknown> | null {
     const cached = this.readProjectionCache(threadId);
     const shell = this.threadShells.get(threadId);
-    const base = cached ?? (shell ? projectionFromShell(shell) : null);
-    return base ? withStatusNotice(base, threadId, this.sleepNotice(sandboxId)) : null;
+    let base = cached ?? (shell ? projectionFromShell(shell) : null);
+    if (!base) return null;
+    const held = this.heldTurns.get(threadId);
+    if (held) base = withHeldTurns(base, threadId, held.turns);
+    const notice: StatusNotice =
+      held?.failedDelivery && this.wakeStatus.get(sandboxId)?.phase !== "waking"
+        ? { outcome: "failed", summary: DELIVERY_FAILED_NOTICE, ...(held.error ? { detail: held.error } : {}) }
+        : this.sleepNotice(sandboxId, this.heldTurnRunners.has(threadId));
+    return withStatusNotice(base, threadId, notice);
   }
 
   /**
@@ -3443,7 +3910,7 @@ export class HubServer {
     payload: unknown,
     threadId: string,
   ): boolean {
-    const sb = this.sleepingSandboxForThread(threadId);
+    const sb = this.sleepingSandboxForThread(threadId) ?? (this.showsHeldView(threadId) ? this.sandboxOfThread(threadId) : undefined);
     if (!sb) return false;
     let view: Record<string, unknown> | null = null;
     if (this.readProjectionCache(threadId)) {
@@ -3471,8 +3938,12 @@ export class HubServer {
       if (!status) {
         // The VM answers from now on: its panels' copy goes, and their streams move to it
         this.discardReadCache(threadId);
-        this.handOffLocalThreadSubs(threadId, sb);
         void this.deliverHeldBookkeeping(threadId, sb);
+        // A chat with held messages moves once they reach the VM (`deliverHeldTurns`)
+        if (this.heldTurnRunners.has(threadId)) continue;
+        // Messages a failed wake left failed: the VM's own view replaces them
+        this.forgetHeldTurns(threadId);
+        this.handOffLocalThreadSubs(threadId, sb);
         continue;
       }
       const subs = this.liveLocalThreadSubs(threadId);
@@ -3519,20 +3990,25 @@ export class HubServer {
           return;
         }
         const projection = rewriteProjectIds(exit.value, sb.vmProjectId, sb.hubProjectId) as Record<string, unknown>;
-        this.projectionCache.set(threadId, projection);
-        try {
-          const file = this.projectionCacheFile(threadId);
-          mkdirSync(join(this.config.stateDir, "hub-thread-cache"), { recursive: true, mode: 0o700 });
-          writeFileSync(file, JSON.stringify(projection), { mode: 0o600 });
-        } catch (err) {
-          console.warn(`[hub] could not save thread ${threadId} for its sleeping VM:`, err instanceof Error ? err.message : err);
-        }
+        this.storeProjectionCache(threadId, projection);
         await this.cacheThreadReads(sb, bridge, threadId, projection, deadline).catch((err) => {
           console.warn(`[hub] could not cache the panels of thread ${threadId}:`, err instanceof Error ? err.message : err);
           this.readStore.discard(threadId);
         });
       }),
     );
+  }
+
+  /** Keeps a copy of a chat's projection (Hub project ids) for when the Hub answers its view. */
+  private storeProjectionCache(threadId: string, projection: Record<string, unknown>): void {
+    this.projectionCache.set(threadId, projection);
+    try {
+      const file = this.projectionCacheFile(threadId);
+      mkdirSync(join(this.config.stateDir, "hub-thread-cache"), { recursive: true, mode: 0o700 });
+      writeFileSync(file, JSON.stringify(projection), { mode: 0o600 });
+    } catch (err) {
+      console.warn(`[hub] could not save thread ${threadId} for its sleeping VM:`, err instanceof Error ? err.message : err);
+    }
   }
 
   private dropProjectionCache(threadId: string): void {
@@ -4578,27 +5054,34 @@ export class HubServer {
     const sb = this.state.getHubSandbox(sandboxId);
     if (!sb) throw new Error(`Unknown hub sandbox "${sandboxId}"`);
     if (sb.phase === "running") return sb;
-    // During the cooldown after a failed wake: no resume, no Klav sandbox, no log line
-    const failure = sb.wakeFailure;
-    if (failure && Date.parse(failure.retryAfter) > Date.now()) {
-      throw new HubWakeCooldownError(sandboxId, failure.step, failure.reason, failure.retryAfter);
-    }
-    // A parked VM takes a place under the limit again; with none free, no wake starts (and no backoff)
-    if (sb.parkedAt) {
-      const max = this.config.hub?.maxSandboxes ?? 10;
-      const active = this.activeSandboxCount();
-      if (active >= max) {
-        throw new HubParkedCapacityError(
-          `Hub sandbox limit reached (${active}/${max}): this settled chat's VM can wake once another chat is settled or archived.`,
-        );
-      }
-    }
+    const refusal = this.wakeRefusal(sb);
+    if (refusal) throw refusal;
 
     const promise = this.doWakeHubSandbox(sandboxId).finally(() => {
       this.inFlightWakes.delete(sandboxId);
     });
     this.inFlightWakes.set(sandboxId, promise);
     return promise;
+  }
+
+  /** Why a wake of this sleeping VM would be refused before it starts (no resume, no backoff); null if it can start. */
+  private wakeRefusal(sb: HubSandboxRecord): Error | null {
+    // During the cooldown after a failed wake: no resume, no Klav sandbox, no log line
+    const failure = sb.wakeFailure;
+    if (failure && Date.parse(failure.retryAfter) > Date.now()) {
+      return new HubWakeCooldownError(sb.sandboxId, failure.step, failure.reason, failure.retryAfter);
+    }
+    // A parked VM takes a place under the limit again; with none free, no wake starts (and no backoff)
+    if (sb.parkedAt) {
+      const max = this.config.hub?.maxSandboxes ?? 10;
+      const active = this.activeSandboxCount();
+      if (active >= max) {
+        return new HubParkedCapacityError(
+          `Hub sandbox limit reached (${active}/${max}): this settled chat's VM can wake once another chat is settled or archived.`,
+        );
+      }
+    }
+    return null;
   }
 
   private async doWakeHubSandbox(sandboxId: string): Promise<HubSandboxRecord> {
@@ -4979,6 +5462,7 @@ export class HubServer {
     for (const tid of threadIds) {
       this.threadToSandbox.delete(tid);
       this.heldBookkeeping.delete(tid);
+      this.forgetHeldTurns(tid);
       this.recordedReads.delete(tid);
       this.deleteThreadShell(tid);
       this.localThreadSubs.delete(tid);

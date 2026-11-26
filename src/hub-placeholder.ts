@@ -422,6 +422,141 @@ export function failPlaceholderThread(
   };
 }
 
+/**
+ * A message the Hub holds for a chat whose VM is waking: the client's `message.dispatch` payload,
+ * as sent (Hub project ids), with the queued run the Hub shows for it.
+ */
+export interface HeldTurn {
+  runId: string;
+  payload: Record<string, unknown>;
+  requestedAt: string;
+  /**
+   * `sent` once the VM took it (kept until the chat's view moves to the VM); `failed` once the wake
+   * failed or the VM did not take it: shown as a failed run, never delivered.
+   */
+  status: "queued" | "sent" | "failed";
+}
+
+/** True when a `message.dispatch` payload has what a queued message needs (id, text, attachments). */
+export function isQueueableMessage(payload: Record<string, unknown>): boolean {
+  return (
+    payload.type === "message.dispatch" &&
+    typeof payload.messageId === "string" &&
+    payload.messageId !== "" &&
+    typeof payload.text === "string" &&
+    Array.isArray(payload.attachments) &&
+    payload.notification === undefined &&
+    payload.guestMessageId === undefined
+  );
+}
+
+/**
+ * The projection with the held messages as T3 shows a queued follow-up: each a `queued` run (next
+ * ordinal, `queuePosition` in order), its user message (the client's own id, so its optimistic copy
+ * reconciles) and a `user_message` turn item with `inputIntent: "queued_turn"`. Like T3, a queued
+ * message's item is not in `visibleTurnItems` (the app lists it above the composer, with "Send now");
+ * a failed one is (a failed run with its message in the timeline, so the user can resend it). A sent
+ * one the projection does not have yet shows in the timeline as a completed run (the VM took it).
+ */
+export function withHeldTurns(
+  projection: Record<string, unknown>,
+  threadId: string,
+  turns: HeldTurn[],
+  now = new Date().toISOString(),
+): Record<string, unknown> {
+  const messages = (projection.messages as Array<Record<string, unknown>> | undefined) ?? [];
+  const known = new Set(messages.map((m) => m.id));
+  const shown = turns.filter((t) => !known.has(t.payload.messageId));
+  if (shown.length === 0) return projection;
+
+  const thread = (projection.thread ?? {}) as Record<string, unknown>;
+  const runs = (projection.runs as Array<Record<string, unknown>> | undefined) ?? [];
+  const turnItems = (projection.turnItems as Array<Record<string, unknown>> | undefined) ?? [];
+  const visible = (projection.visibleTurnItems as Array<Record<string, unknown>> | undefined) ?? [];
+  const ordinalOf = (v: unknown) => (typeof v === "number" ? v : 0);
+  let runOrdinal = Math.max(0, ...runs.map((r) => ordinalOf(r.ordinal)));
+  let itemOrdinal = Math.max(0, ...turnItems.map((i) => ordinalOf(i.ordinal)), ...visible.map((r) => ordinalOf(r.position)));
+  let queuePosition = 0;
+
+  const newRuns: Record<string, unknown>[] = [];
+  const newMessages: Record<string, unknown>[] = [];
+  const newItems: Record<string, unknown>[] = [];
+  const newVisible: Record<string, unknown>[] = [];
+  for (const turn of shown) {
+    const p = turn.payload;
+    const queued = turn.status === "queued";
+    const runStatus = queued ? "queued" : turn.status === "sent" ? "completed" : "failed";
+    const messageId = String(p.messageId);
+    const modelSelection =
+      p.modelSelection && typeof p.modelSelection === "object" ? (p.modelSelection as Record<string, unknown>) : thread.modelSelection;
+    const providerInstanceId =
+      nonEmpty((modelSelection as Record<string, unknown> | undefined)?.instanceId) ?? nonEmpty(thread.providerInstanceId) ?? "unknown";
+    const creation = {
+      createdBy: typeof p.createdBy === "string" ? p.createdBy : "user",
+      creationSource: CREATION_SOURCES.has(String(p.creationSource)) ? String(p.creationSource) : "web",
+    };
+    const context = p.context !== undefined ? { context: p.context } : {};
+    const attachments = Array.isArray(p.attachments) ? p.attachments : [];
+    newRuns.push({
+      id: turn.runId,
+      threadId,
+      ordinal: ++runOrdinal,
+      providerInstanceId,
+      modelSelection,
+      providerThreadId: null,
+      userMessageId: messageId,
+      rootNodeId: null,
+      activeAttemptId: null,
+      status: runStatus,
+      ...(queued ? { queuePosition: ++queuePosition } : {}),
+      requestedAt: turn.requestedAt,
+      startedAt: null,
+      completedAt: queued ? null : now,
+      checkpointId: null,
+      contextHandoffId: null,
+      ...(p.freshContext === true ? { freshContext: true } : {}),
+    });
+    newMessages.push({
+      ...creation,
+      id: messageId,
+      threadId,
+      runId: turn.runId,
+      nodeId: null,
+      role: "user",
+      text: p.text,
+      ...context,
+      attachments,
+      streaming: false,
+      createdAt: turn.requestedAt,
+      updatedAt: turn.requestedAt,
+    });
+    const item: Record<string, unknown> = {
+      ...turnItemBase(threadId, `hub_msg_${messageId}`, ++itemOrdinal, turn.requestedAt),
+      ...creation,
+      runId: turn.runId,
+      type: "user_message",
+      status: queued ? "pending" : runStatus,
+      startedAt: null,
+      completedAt: queued ? null : now,
+      messageId,
+      inputIntent: "queued_turn",
+      text: p.text,
+      ...context,
+      attachments,
+    };
+    newItems.push(item);
+    if (!queued) newVisible.push(visibleRow(threadId, item));
+  }
+  return {
+    ...projection,
+    runs: [...runs, ...newRuns],
+    messages: [...messages, ...newMessages],
+    turnItems: [...turnItems, ...newItems],
+    visibleTurnItems: [...visible, ...newVisible],
+    updatedAt: now,
+  };
+}
+
 /** Keys a restored row takes from a cached projection's `thread` (same meaning in both records). */
 const ROW_KEYS_FROM_PROJECTION = [
   "createdBy",
