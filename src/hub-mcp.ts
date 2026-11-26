@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { authenticateClient } from "./auth.ts";
 import type { ProjectConfig, SentinelConfig } from "./config.ts";
 import { clientIpFromRequest, rateLimitedResponse, type AuthRateLimiter } from "./security.ts";
+import { isChildThreadRow, vmCloseBlocker } from "./hub-park-guard.ts";
 import { buildAutoProjectConfig, countsTowardHubLimit, type HubSandboxRecord, type StateStore } from "./state.ts";
 
 export const MCP_PROTOCOL_VERSION = "2025-06-18";
@@ -65,6 +66,8 @@ export interface HubMcpBridge {
    * Refused while a chat on it is live or an open top-level chat is not settled.
    */
   parkSandbox: (sandboxId: string, request: HubParkRequest) => Promise<boolean>;
+  /** The thread rows a running VM lists now (delegated children included), or null when it cannot be read. */
+  readVmThreads: (sandboxId: string) => Promise<Array<Record<string, unknown>> | null>;
   projectKeyFromHubId: (hubProjectId: string) => string | null;
   ensureHubProjectId: (projectKey: string) => string;
   spawnSandboxForThread: (
@@ -1476,6 +1479,11 @@ export class HubMcpHandler {
         throw new HubMcpToolError("invalid_request", `Unsupported organize action "${action}".`);
     }
 
+    // A cleanup may close the whole VM: only for one of its top-level chats, read before the command
+    // (once archived, the VM no longer lists it)
+    let listedBefore: Array<Record<string, unknown>> | null = null;
+    if (isDestructiveCleanup && sb.phase === "running") listedBefore = await this.bridge.readVmThreads(sb.sandboxId);
+
     let refused: string | null = null;
     if (sb.phase === "running") {
       const exit = await this.bridge.callVmUnary(sb.sandboxId, "orchestration.dispatchCommand", command, 10_000);
@@ -1503,10 +1511,27 @@ export class HubMcpHandler {
       return { ok: true, threadId, action, sandboxDestroyed, sandboxParked };
     }
     if (isDestructiveCleanup) {
-      if (this.config.boat.archiveAction === "stop") {
+      const trigger = `MCP t3_thread_organize ${action} of ${threadId} by ${JSON.stringify(caller.label)}`;
+      const keep =
+        sb.phase !== "running"
+          ? "its VM is not running, so the command was not applied"
+          : await this.vmCloseRefusal(sb.sandboxId, threadId, listedBefore, refused);
+      if (keep !== null) {
+        console.log(`[hub] not ${this.config.boat.archiveAction === "stop" ? "stopping" : "destroying"} ${sb.sandboxId}: ${keep} — trigger: ${trigger}`);
+        log.outcome = refused !== null ? `the VM refused the ${action} (${refused}); VM kept` : `VM kept: ${keep}`;
+        if (sb.phase !== "running") {
+          // Nothing was applied: say so instead of a success (its chats cannot be read to close it safely)
+          throw new HubMcpToolError(
+            "sandbox_not_running",
+            `This chat's VM is ${sb.phase}, so the ${action} was not applied and the VM was kept. Close the chat from the T3 app, or wake it (send it a message) and try again.`,
+          );
+        }
+      } else if (this.config.boat.archiveAction === "stop") {
+        console.log(`[hub] stopping ${sb.sandboxId} (${sb.project}): no open or running chat left — trigger: ${trigger}`);
         await this.bridge.sleepSandbox(sb.sandboxId);
         log.outcome = "VM stopped";
       } else {
+        console.log(`[hub] destroying ${sb.sandboxId} (${sb.project}): no open or running chat left — trigger: ${trigger}`);
         await this.bridge.destroySandbox(sb.sandboxId, `mcp-${action}`);
         sandboxDestroyed = true;
         log.outcome = "VM destroyed";
@@ -1514,6 +1539,30 @@ export class HubMcpHandler {
     }
 
     return { ok: true, threadId, action, sandboxDestroyed };
+  }
+
+  /**
+   * Why a settle or archive over MCP must leave the chat's VM as it is, or null when the VM may be
+   * stopped or deleted: the chat must be one of its top-level chats (closing a delegated chat never
+   * closes its parent's VM), the VM must have taken the command, and what it lists afterwards must
+   * hold no open top-level chat and nothing live. A VM whose chats cannot be read is kept: a deleted
+   * VM cannot come back, and its watchdog (`all-archived`) still closes it once its chats are done.
+   */
+  private async vmCloseRefusal(
+    sandboxId: string,
+    threadId: string,
+    listedBefore: Array<Record<string, unknown>> | null,
+    refused: string | null,
+  ): Promise<string | null> {
+    if (refused !== null) return "the VM refused the command";
+    if (!listedBefore) return "could not read its chats";
+    const closedThreadRow = listedBefore.find((row) => row.id === threadId);
+    if (!closedThreadRow) return `chat ${threadId} is not one of the chats it lists`;
+    if (isChildThreadRow(closedThreadRow)) return `chat ${threadId} is a delegated chat`;
+    const rows = await this.bridge.readVmThreads(sandboxId);
+    if (!rows) return "could not read its chats";
+    const blocker = vmCloseBlocker(rows, { settledIsClosed: this.config.boat.deleteWhen === "archived-or-settled" });
+    return blocker ? `chat ${blocker.threadId} is ${blocker.reason}` : null;
   }
 
   private async toolListThreadPullRequests(args: Record<string, unknown>): Promise<Record<string, unknown>> {

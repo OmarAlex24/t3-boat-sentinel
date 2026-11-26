@@ -1118,6 +1118,10 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       failProjection?: boolean;
       /** `orchestration.dispatchCommand` of these command types fails, like a VM that refuses it. */
       failCommands?: string[];
+      /** Apply `thread.archive` like T3: the thread leaves the active list (its shell snapshot). */
+      applyArchive?: boolean;
+      /** A one-off `orchestration.subscribeShell` (not the Hub's persistent stream) fails, like a VM that cannot list its chats. */
+      failShellRead?: boolean;
       /** A `message.dispatch` of these message ids fails, like a VM that refuses it (the list may change). */
       refuseMessages?: string[];
       /**
@@ -1352,6 +1356,10 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
             return;
           }
 
+          if (frame.tag === "orchestration.subscribeShell" && opts.failShellRead && frame.id !== "hub-shell") {
+            ws.sendText(JSON.stringify({ _tag: "Exit", requestId: frame.id, exit: { _tag: "Failure", cause: [{ _tag: "Die", defect: "busy" }] } }));
+            return;
+          }
           if (frame.tag === "orchestration.subscribeShell") {
             // The Hub's persistent stream; a one-off read (a park's check) answers the same snapshot
             if (frame.id === "hub-shell" || !shellStream) shellStream = { ws, requestId: frame.id };
@@ -1465,6 +1473,14 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
               ws.close();
               return;
             }
+          }
+          if (
+            frame.tag === "orchestration.dispatchCommand" &&
+            opts.applyArchive &&
+            frame.payload?.type === "thread.archive" &&
+            !opts.failCommands?.includes("thread.archive")
+          ) {
+            threads.delete(String(frame.payload.threadId));
           }
           if (frame.tag === "orchestration.dispatchCommand" && opts.failCommands?.includes(String(frame.payload?.type))) {
             ws.sendText(
@@ -3938,13 +3954,16 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     // ── A park never stops a VM with a running or open chat (whoever asks) ──────────────────────
 
     /** One running chat on a VM that parks settled chats; nothing settled yet. */
-    async function chatOnParkingHub(prefix: string, opts: { failCommands?: string[] } = {}) {
-      const vm = startFakeVmT3Server(prefix, { failCommands: opts.failCommands });
+    async function chatOnParkingHub(
+      prefix: string,
+      opts: { failCommands?: string[]; applyArchive?: boolean; failShellRead?: boolean; archiveAction?: "delete" | "stop" } = {},
+    ) {
+      const vm = startFakeVmT3Server(prefix, { failCommands: opts.failCommands, applyArchive: opts.applyArchive, failShellRead: opts.failShellRead });
       cleanups.push(() => vm.server.stop(true));
       const hub = await startHubWithVm(vm, `t3-sentinel-hub-${prefix}-`, {
         patchConfig: (cfg) => {
           const settled = settledConfig(cfg);
-          return { ...settled, boat: { ...settled.boat, settleAction: "park" } };
+          return { ...settled, boat: { ...settled.boat, settleAction: "park", archiveAction: opts.archiveAction ?? settled.boat.archiveAction } };
         },
       });
       const client: HubClient = await connectHubClient(hub.handle, hub.cfg);
@@ -4098,6 +4117,118 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       expect(boat.stopped).toEqual([sandboxId]);
       expect(handle.state.getHubSandbox(sandboxId)?.parkedAt).toBeTruthy();
       expect(logged.some((l) => l.includes(`parking settled sandbox ${sandboxId} (my-app) — trigger: watchdog all-archived`))).toBe(true);
+    });
+
+    // ── Archiving one chat over MCP never deletes a VM with an open or running chat ─────────────
+
+    const archivedOnVm = (vm: ReturnType<typeof startFakeVmT3Server>, threadId: string) =>
+      vm.seenMethods.some(
+        (m) =>
+          m.tag === "orchestration.dispatchCommand" &&
+          (m.payload as { type?: string }).type === "thread.archive" &&
+          (m.payload as { threadId?: string }).threadId === threadId,
+      );
+
+    test("an MCP archive of a delegated chat while its parent runs archives only that chat; the VM is not deleted", async () => {
+      const { vm, boat, handle, cfg, sandboxId } = await chatOnParkingHub("archive-mcp-child", { applyArchive: true });
+      vm.pushThreadRow("thread-p", { status: "running", activeRunId: "run-22", activityRunStatus: "running", settledAt: null });
+      const childId = "thread:delegated-task:command%3Amcp%3Aabc%3Adelegate-task%3Apaquete-dominio-ola1-p4";
+      vm.threads.set(childId, delegatedChildRow(vm, childId, "thread-p"));
+      (handle.hub as unknown as { bindThreadToSandbox(t: string, s: string): void }).bindThreadToSandbox(childId, sandboxId);
+      const logged = captureLogs();
+      const { result } = await mcpTool(handle, cfg, "zumith", "t3_thread_organize", { threadId: childId, action: "archive" });
+      expect(result.structuredContent).toMatchObject({ ok: true, action: "archive", sandboxDestroyed: false });
+      expect(archivedOnVm(vm, childId)).toBe(true);
+      expect(vm.threads.has(childId)).toBe(false);
+      expect(boat.deleted).toEqual([]);
+      expect(boat.stopped).toEqual([]);
+      expect(handle.state.getHubSandbox(sandboxId)?.phase).toBe("running");
+      expect(logged.some((l) => l.includes(`not destroying ${sandboxId}: chat ${childId} is a delegated chat — trigger: MCP t3_thread_organize archive of ${childId} by "zumith"`))).toBe(true);
+      expect(logged.find((l) => l.includes("t3_thread_organize by"))).toContain("-> VM kept");
+    });
+
+    test("an MCP archive of a chat while another chat on its VM is open does not delete the VM", async () => {
+      const { vm, boat, handle, cfg, sandboxId } = await chatOnParkingHub("archive-mcp-other-open", { applyArchive: true });
+      vm.pushThreadRow("thread-p", { status: "idle", activeRunId: null, settledAt: null });
+      vm.threads.set("thread-q", { ...vm.threads.get("thread-p")!, id: "thread-q", status: "idle", settledAt: null });
+      const logged = captureLogs();
+      const { result } = await mcpTool(handle, cfg, "T3 Code Desktop", "t3_thread_organize", { threadId: "thread-p", action: "archive" });
+      expect(result.structuredContent).toMatchObject({ ok: true, sandboxDestroyed: false });
+      expect(archivedOnVm(vm, "thread-p")).toBe(true);
+      expect(boat.deleted).toEqual([]);
+      expect(handle.state.getHubSandbox(sandboxId)?.phase).toBe("running");
+      expect(logged.some((l) => l.includes(`not destroying ${sandboxId}: chat thread-q is not settled`))).toBe(true);
+    });
+
+    for (const archiveAction of ["delete", "stop"] as const) {
+      test(`an MCP archive of the VM's last open chat with nothing running ${archiveAction === "delete" ? "deletes" : "stops"} it, and says who asked`, async () => {
+        const { vm, boat, handle, cfg, sandboxId } = await chatOnParkingHub(`archive-mcp-last-${archiveAction}`, { applyArchive: true, archiveAction });
+        vm.pushThreadRow("thread-p", { status: "idle", activeRunId: null, settledAt: null });
+        const logged = captureLogs();
+        const { result } = await mcpTool(handle, cfg, "zumith", "t3_thread_organize", { threadId: "thread-p", action: "archive" });
+        expect(result.structuredContent).toMatchObject({ ok: true, sandboxDestroyed: archiveAction === "delete" });
+        const verb = archiveAction === "delete" ? "destroying" : "stopping";
+        expect(logged.some((l) => l.includes(`[hub] ${verb} ${sandboxId} (my-app): no open or running chat left — trigger: MCP t3_thread_organize archive of thread-p by "zumith"`))).toBe(true);
+        if (archiveAction === "delete") {
+          expect(boat.deleted).toEqual([sandboxId]);
+          expect(handle.state.getHubSandbox(sandboxId)).toBeUndefined();
+        } else {
+          expect(boat.deleted).toEqual([]);
+          expect(boat.stopped).toEqual([sandboxId]);
+          expect(handle.state.getHubSandbox(sandboxId)?.phase).toBe("sleeping");
+        }
+      });
+    }
+
+    test("an MCP archive the VM refuses deletes nothing", async () => {
+      const { vm, boat, handle, cfg, sandboxId } = await chatOnParkingHub("archive-mcp-refused", { applyArchive: true, failCommands: ["thread.archive"] });
+      vm.pushThreadRow("thread-p", { status: "idle", activeRunId: null, settledAt: null });
+      const logged = captureLogs();
+      const { result } = await mcpTool(handle, cfg, "zumith", "t3_thread_organize", { threadId: "thread-p", action: "archive" });
+      expect(result.structuredContent).toMatchObject({ ok: true, sandboxDestroyed: false });
+      expect(boat.deleted).toEqual([]);
+      expect(handle.state.getHubSandbox(sandboxId)?.phase).toBe("running");
+      expect(logged.find((l) => l.includes("t3_thread_organize by"))).toContain("the VM refused the archive");
+    });
+
+    test("an MCP archive deletes nothing when the VM's chats cannot be read", async () => {
+      const { vm, boat, handle, cfg, sandboxId } = await chatOnParkingHub("archive-mcp-unreadable", { applyArchive: true, failShellRead: true });
+      vm.pushThreadRow("thread-p", { status: "idle", activeRunId: null, settledAt: null });
+      const logged = captureLogs();
+      const { result } = await mcpTool(handle, cfg, "zumith", "t3_thread_organize", { threadId: "thread-p", action: "archive" });
+      expect(result.structuredContent).toMatchObject({ ok: true, sandboxDestroyed: false });
+      expect(archivedOnVm(vm, "thread-p")).toBe(true);
+      expect(boat.deleted).toEqual([]);
+      expect(handle.state.getHubSandbox(sandboxId)?.phase).toBe("running");
+      expect(logged.some((l) => l.includes(`not destroying ${sandboxId}: could not read its chats`))).toBe(true);
+    });
+
+    test("archiving the last chat while a delegated chat still runs keeps the VM until the watchdog reports all-archived", async () => {
+      const { vm, boat, handle, cfg, sandboxId } = await chatOnParkingHub("archive-mcp-child-running", { applyArchive: true });
+      vm.pushThreadRow("thread-p", { status: "idle", activeRunId: null, settledAt: null });
+      const childId = "thread:delegated-task:still-running";
+      vm.threads.set(childId, { ...delegatedChildRow(vm, childId, "thread-p"), status: "running", activeRunId: "run-c", settledAt: null });
+      const { result } = await mcpTool(handle, cfg, "zumith", "t3_thread_organize", { threadId: "thread-p", action: "archive" });
+      expect(result.structuredContent).toMatchObject({ ok: true, sandboxDestroyed: false });
+      expect(boat.deleted).toEqual([]);
+      // The VM reports the archive on its shell stream, its child finishes, and its watchdog reports all-archived
+      (handle.hub as unknown as { handleVmShellItems(id: string, items: unknown[]): void }).handleVmShellItems(sandboxId, [
+        { kind: "thread.removed", sequence: 20, location: "active", threadId: "thread-p" },
+      ]);
+      vm.threads.delete(childId);
+      await handle.hub!.handleWatchdogEvent({ slot: `hub:${sandboxId}`, sandboxId, event: "all-archived" });
+      expect(boat.deleted).toEqual([sandboxId]);
+    });
+
+    test("an MCP archive of a chat whose VM is asleep is refused with a reason; the VM is kept", async () => {
+      const { vm, boat, handle, cfg, sandboxId } = await chatOnParkingHub("archive-mcp-asleep", { applyArchive: true });
+      vm.pushThreadRow("thread-p", { status: "idle", activeRunId: null, settledAt: null });
+      await handle.hub!.sleepHubSandbox(sandboxId);
+      const { result } = await mcpTool(handle, cfg, "zumith", "t3_thread_organize", { threadId: "thread-p", action: "archive" });
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({ code: "sandbox_not_running" });
+      expect(boat.deleted).toEqual([]);
+      expect(handle.state.getHubSandbox(sandboxId)?.phase).toBe("sleeping");
     });
 
     // ── A chat whose VM stopped mid-run is not shown running ────────────────────────────────────
@@ -8238,7 +8369,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     expect(handle.state.getHub()?.selfUpdate?.version).toBe(target);
   });
 
-  test("Streamable HTTP /mcp: machine token, 0-VM idle reads, async <2s launch, queued sends, pending requests, and settle -> $0/hr destroy", async () => {
+  test("Streamable HTTP /mcp: machine token, 0-VM idle reads, async <2s launch, queued sends, pending requests, and archive -> $0/hr destroy", async () => {
     const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-hub-mcp-"));
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
 
@@ -8249,6 +8380,8 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     let vmThreadId = "";
     let pendingRequestStatus = "pending";
     const vmProjectId = "vm-proj-mcp";
+    /** The rows this VM lists in a shell snapshot: its chat once launched, until archived. */
+    const listedThreads = new Map<string, Record<string, unknown>>();
 
     const vmServer = Bun.serve({
       port: 0,
@@ -8287,7 +8420,8 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
                       schemaVersion: 2,
                       snapshotSequence: 1,
                       projects: [{ id: vmProjectId, title: "my-app", workspaceRoot: "/home/user/my-app" }],
-                      threads: [],
+                      // Only a one-off read lists them (the Hub's own stream gets them as updates, as before)
+                      threads: frame.id === "hub-shell" ? [] : [...listedThreads.values()],
                       archivedThreads: [],
                     },
                   },
@@ -8322,6 +8456,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
                 },
               ],
             };
+            listedThreads.set(vmThreadId, { ...threadShell, lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: vmThreadId } });
             ws.sendText(
               JSON.stringify({
                 _tag: "Exit",
@@ -8347,6 +8482,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
             if (p.type === "runtime-request.respond") {
               pendingRequestStatus = "resolved";
             }
+            if (p.type === "thread.archive") listedThreads.delete(String(p.threadId));
             ws.sendText(
               JSON.stringify({
                 _tag: "Exit",
@@ -8640,10 +8776,18 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     expect(pendResp.structuredContent.ok).toBe(true);
     expect(dispatchedCommands.some((c) => c.type === "runtime-request.respond" && c.requestId === "req-q1")).toBe(true);
 
-    // 11. Settle via t3_thread_organize -> dispatches thread.settle AND destroys Boat VM ($0/hr)!
+    // 11. Settle via t3_thread_organize dispatches thread.settle; with `deleteWhen: archived` the VM is kept
+    // (its chat is still open, and running)
     const settled = await callTool("t3_thread_organize", { threadId: launchedTid, action: "settle" });
     expect(settled.structuredContent.ok).toBe(true);
-    expect(settled.structuredContent.sandboxDestroyed).toBe(true);
+    expect(settled.structuredContent.sandboxDestroyed).toBe(false);
+    expect(dispatchedCommands.some((c) => c.type === "thread.settle" && c.threadId === launchedTid)).toBe(true);
+    expect(boat.deleted).toEqual([]);
+    // Once its turn is over, archiving its only chat destroys the Boat VM ($0/hr)
+    listedThreads.set(launchedTid, { ...listedThreads.get(launchedTid)!, status: "idle", activeRunId: null });
+    const archived = await callTool("t3_thread_organize", { threadId: launchedTid, action: "archive" });
+    expect(archived.structuredContent.ok).toBe(true);
+    expect(archived.structuredContent.sandboxDestroyed).toBe(true);
     expect(boat.deleted).toContain(liveThread.sandbox.sandboxId);
 
     // 12. Sending to destroyed thread returns structured `sandbox_destroyed` error

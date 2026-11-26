@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { isChildThreadRow, parkBlocker } from "./hub-park-guard.ts";
+import { isChildThreadRow, parkBlocker, vmCloseBlocker } from "./hub-park-guard.ts";
 
 const at = "2026-11-26T00:53:34.448Z";
 const row = (id: string, extra: Record<string, unknown> = {}) => ({
@@ -53,6 +53,16 @@ describe("parkBlocker (when a VM may be parked)", () => {
     expect(parkBlocker([row("p"), row("q", { settledAt: null })])).toEqual({ threadId: "q", reason: "not settled" });
     expect(parkBlocker([row("p", { settledOverride: "unsettled" })])).toEqual({ threadId: "p", reason: "not settled" });
     expect(parkBlocker([row("p", { settledAt: null, settledOverride: "settled" })])).toBeNull();
+  });
+
+  test("vmCloseBlocker: with deleteWhen archived a settled chat is still open; children never count as open", () => {
+    expect(vmCloseBlocker([row("p")], { settledIsClosed: false })).toEqual({ threadId: "p", reason: "open" });
+    expect(vmCloseBlocker([row("p", { archivedAt: at }), child("c", { settledAt: null })], { settledIsClosed: false })).toBeNull();
+    expect(vmCloseBlocker([row("p", { archivedAt: at }), child("c", { status: "running" })], { settledIsClosed: false })).toEqual({
+      threadId: "c",
+      reason: "running",
+    });
+    expect(vmCloseBlocker([row("p")], { settledIsClosed: true })).toBeNull();
   });
 
   test("isChildThreadRow: subagent lineage or delegated", () => {
