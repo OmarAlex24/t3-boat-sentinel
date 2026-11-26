@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { ClientCredentialRecord } from "./auth.ts";
+import type { AuthMcpClientAccess, ClientCredentialRecord } from "./auth.ts";
 import type { ProjectConfig, SentinelConfig } from "./config.ts";
 import { normalizeSettingsOverlay, type HubSettingsOverlay } from "./hub-settings.ts";
 
@@ -184,11 +184,27 @@ export interface HubHeldTurnsRecord {
   createdAt: string;
 }
 
+/** Peer-link provenance for a thread launched through a linked environment. Persisted across Hub restarts. */
+export interface HubThreadLinkOriginRecord {
+  sessionId: string;
+  label: string;
+  access?: AuthMcpClientAccess;
+  delegatedFrom?: {
+    environmentId: string;
+    threadId: string;
+    title: string;
+  };
+}
+
 export interface HubStateRecord {
   environmentId: string;
   label: string;
   sequence: number;
   clients: ClientCredentialRecord[];
+  /** Persistent secret used to HMAC-sign stateless MCP OAuth `client_id`s across Hub restarts. */
+  mcpOAuthSecret?: string;
+  /** Peer-link provenance by thread id, for link fencing (`linkFence`) and `delegatedFrom`. */
+  threadLinkOrigins?: Record<string, HubThreadLinkOriginRecord>;
   /** Permanent UUID per configured project key (e.g. "horizon-stack" -> "<uuid>"). */
   projectIds: Record<string, string>;
   /** Active Boat sandboxes managed by the Hub, keyed by sandboxId. */
@@ -314,6 +330,10 @@ export class StateStore {
         projectTemplates: prevHub?.projectTemplates ?? {},
         selfUpdate: prevHub?.selfUpdate ?? null,
         settingsOverlay: normalizeSettingsOverlay(prevHub?.settingsOverlay),
+        ...(prevHub?.mcpOAuthSecret ? { mcpOAuthSecret: prevHub.mcpOAuthSecret } : {}),
+        ...(prevHub?.threadLinkOrigins && Object.keys(prevHub.threadLinkOrigins).length > 0
+          ? { threadLinkOrigins: prevHub.threadLinkOrigins }
+          : {}),
         ...(prevHub?.pendingLaunches && Object.keys(prevHub.pendingLaunches).length > 0
           ? { pendingLaunches: prevHub.pendingLaunches }
           : {}),

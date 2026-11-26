@@ -8786,11 +8786,16 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       repositoryIdentity: { provider: string; owner: string; name: string; canonicalKey: string };
     }>;
     expect(projects).toHaveLength(1);
-    expect(projects[0].repositoryIdentity).toEqual({
+    expect(projects[0].repositoryIdentity).toMatchObject({
       provider: "github",
       owner: "OmarAlex24",
       name: "my-app",
       canonicalKey: "github.com/omaralex24/my-app",
+      locator: {
+        source: "git-remote",
+        remoteName: "origin",
+        remoteUrl: "https://github.com/OmarAlex24/my-app.git",
+      },
     });
     const hubProjectId = projects[0].id;
 
