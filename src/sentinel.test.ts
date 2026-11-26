@@ -2462,6 +2462,43 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       client.request("gone", "assets.createUrl", { resource: { _tag: "attachment", attachmentId: imageId } });
       expect((await exitOf(client, "gone")).exit._tag).toBe("Failure");
     });
+
+    test("a new chat's first message keeps its image across a Hub restart while its VM boots", async () => {
+      const vm = startFakeVmT3Server("vm1");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle, boat, dir } = await startHubWithVm(vm, "t3-sentinel-hub-att-restart-");
+      const client = await connectHubClient(handle, cfg);
+      const hubProjectId = await subscribeHubShell(client);
+      const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 7, 7, 7]);
+      const imageId = await uploadLikeTheApp(client, cfg, "img", { name: "image.png", mimeType: "image/png" }, png);
+      boat.createGate = new Promise<void>(() => {}); // this VM never finishes: the Hub goes down first
+      const launch = clientLaunchPayload("thread-pin", hubProjectId, "Look");
+      launch.initialMessage.attachments = [{ type: "image", id: imageId, name: "image.png", mimeType: "image/png", sizeBytes: png.byteLength }] as never[];
+      client.request("launch", "orchestration.launchThread", launch);
+      expect((await exitOf(client, "launch")).exit._tag).toBe("Success");
+      handle.stop();
+
+      const boat2 = new MockBoat();
+      boat2.snapshots.add("base-t3");
+      boat2.snapshots.add("env-my-app");
+      boat2.upstreamBaseUrl = vm.url;
+      const handle2 = createSentinelServer(cfg, boat2, { startBackgroundLoops: false });
+      cleanups.push(() => handle2.stop());
+      const until = async (cond: () => boolean) => {
+        const start = Date.now();
+        while (!cond()) {
+          if (Date.now() - start > 5_000) throw new Error("condition not met in time");
+          await Bun.sleep(10);
+        }
+      };
+      await until(() => vm.seenMethods.some((m) => m.tag === "orchestration.launchThread"));
+      expect(vm.uploads).toHaveLength(1);
+      expect(vm.uploads[0].bytes).toEqual(png);
+      const vmLaunch = vm.seenMethods.find((m) => m.tag === "orchestration.launchThread")!.payload as typeof launch;
+      expect((vmLaunch.initialMessage.attachments[0] as { id: string }).id).toBe(vm.uploads[0].attachmentId);
+      await until(() => handle2.state.getHub()!.pendingLaunches === undefined);
+      await until(() => readdirSync(join(dir, "hub-staged-attachments")).length === 0);
+    });
   });
 
   // ── Messages sent while a chat's VM is asleep or waking (held by the Hub, shown queued) ──
@@ -3287,6 +3324,86 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       expect(vmMessages(vm, seenBefore).map((m) => m.text)).toEqual(["Before the restart", "Also before"]);
       expect(boat.resumed).toEqual([sandboxId]);
       await until(() => handle2.state.getHub()?.heldTurns === undefined);
+    });
+
+    /** Stages an image on the Hub like the app (mint an upload URL, `POST` the bytes); returns its Hub id. */
+    async function stageImage(client: HubClient, cfg: SentinelConfig, key: string, bytes: Uint8Array<ArrayBuffer>): Promise<string> {
+      client.request(`mint-${key}`, "attachments.createUploadUrl", { name: "image.png", mimeType: "image/png", sizeBytes: bytes.byteLength });
+      const mint = (await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === `mint-${key}`)).exit as {
+        value: { attachmentId: string; relativeUrl: string };
+      };
+      const posted = await fetch(`${client.base}${mint.value.relativeUrl}`, {
+        method: "POST",
+        headers: { host: cfg.hub!.host, "content-type": "image/png" },
+        body: bytes,
+      });
+      expect(posted.status).toBe(204);
+      return mint.value.attachmentId;
+    }
+    const withImage = (command: Record<string, unknown>, id: string, size: number) => ({
+      ...command,
+      attachments: [{ type: "image", id, name: "image.png", mimeType: "image/png", sizeBytes: size }],
+    });
+    const IMAGE = (n: number) => new Uint8Array(Array.from({ length: n }, (_, i) => (i * 13) % 256));
+    const stagedDirOf = (dir: string) => join(dir, "hub-staged-attachments");
+
+    test("a message held while its VM wakes keeps its image across a Hub restart; the VM gets the bytes under its own id", async () => {
+      const { vm, client, boat, cfg, handle, sandboxId, dir } = await sleepingChat("vm-queue-restart-image");
+      const seenBefore = vm.seenMethods.length;
+      const bytes = IMAGE(300);
+      const stagedId = await stageImage(client, cfg, "img", bytes);
+      // This Hub's wake never ends (it is stopped below, like a Hub restart in the middle of it)
+      boat.resumeGate = new Promise<void>(() => {});
+      client.request("s1", "orchestration.dispatchCommand", withImage(appMessage("thread-zz", "i1", "Look at this"), stagedId, bytes.byteLength));
+      expect(await exitTag(client, "s1")).toBe("Success");
+      // The upload is kept on disk with the held message (private files)
+      const stagedDir = stagedDirOf(dir);
+      expect(statSync(stagedDir).mode & 0o777).toBe(0o700);
+      const binFile = join(stagedDir, `${encodeURIComponent(stagedId)}.bin`);
+      expect(statSync(binFile).mode & 0o777).toBe(0o600);
+      expect(new Uint8Array(readFileSync(binFile))).toEqual(bytes);
+      handle.stop();
+
+      boat.resumeGate = null;
+      const handle2 = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+      cleanups.push(() => handle2.stop());
+      await until(() => vmMessages(vm, seenBefore).length === 1);
+      const [sent] = vmMessages(vm, seenBefore);
+      const sentAtt = (sent.attachments as Array<{ id: string; name: string }>)[0];
+      // The VM got the bytes it issued an id for, and the message names that id, never the Hub's
+      expect(vm.uploads).toHaveLength(1);
+      expect(vm.uploads[0].bytes).toEqual(bytes);
+      expect(vm.uploads[0].contentType).toBe("image/png");
+      expect(sentAtt.id).toBe(vm.uploads[0].attachmentId);
+      expect(sentAtt.id).not.toBe(stagedId);
+      expect(JSON.stringify(sent)).not.toContain(stagedId);
+      expect(boat.resumed).toEqual([sandboxId]);
+      // Delivered: the disk copy goes with the held message
+      await until(() => handle2.state.getHub()?.heldTurns === undefined);
+      await until(() => readdirSync(stagedDir).length === 0);
+    });
+
+    test("a held message whose image is gone after a Hub restart fails with the Hub's reason; the VM never sees the Hub's id", async () => {
+      const { vm, client, boat, cfg, handle, dir } = await sleepingChat("vm-queue-restart-image-lost");
+      const seenBefore = vm.seenMethods.length;
+      const bytes = IMAGE(120);
+      const stagedId = await stageImage(client, cfg, "img", bytes);
+      boat.resumeGate = new Promise<void>(() => {});
+      client.request("s1", "orchestration.dispatchCommand", withImage(appMessage("thread-zz", "l1", "And this"), stagedId, bytes.byteLength));
+      expect(await exitTag(client, "s1")).toBe("Success");
+      handle.stop();
+      // The copy did not survive (disk wiped, or kept by a Hub from before this fix)
+      rmSync(stagedDirOf(dir), { recursive: true, force: true });
+
+      boat.resumeGate = null;
+      const handle2 = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+      cleanups.push(() => handle2.stop());
+      await until(() => handle2.state.getHub()?.heldTurns?.["thread-zz"]?.failedDelivery === true);
+      const record = handle2.state.getHub()!.heldTurns!["thread-zz"];
+      expect(record.error).toContain("Attachment 'image.png' was lost on the Hub before it reached the chat's VM. Attach it again");
+      expect(record.turns.map((t) => t.status)).toEqual(["failed"]);
+      expect(vmMessages(vm, seenBefore)).toEqual([]);
+      expect(vm.seenMethods.slice(seenBefore).some((m) => JSON.stringify(m.payload ?? null).includes(stagedId))).toBe(false);
     });
 
     test("archiving the chat during the wake drops its held messages; nothing is delivered", async () => {

@@ -78,6 +78,19 @@ export function stagedAttachmentId(type: AttachmentType, name: string): string {
   return `pending-${randomUUID()}${suffix}`;
 }
 
+/** True for an id `stagedAttachmentId` made: an upload the Hub staged, which no VM knows. */
+export function isHubStagedAttachmentId(id: unknown): id is string {
+  return typeof id === "string" && /^pending-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(-[^/\\]*)?$/.test(id);
+}
+
+/** A staged upload a message refers to is no longer on the Hub: the message cannot be sent with it. */
+export class StagedAttachmentLostError extends Error {
+  constructor(name: string) {
+    super(`Attachment '${name}' was lost on the Hub before it reached the chat's VM. Attach it again and resend.`);
+    this.name = "StagedAttachmentLostError";
+  }
+}
+
 /** The `createUploadUrl` payload that replays a staged upload into a VM. */
 export function replayUploadRequest(staged: StagedAttachment): Record<string, unknown> {
   return {
