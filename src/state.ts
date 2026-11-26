@@ -90,8 +90,9 @@ export function countsTowardHubLimit(sb: HubSandboxRecord): boolean {
 }
 
 /**
- * A settled chat whose parked VM is gone (Boat drops a stopped VM's disk after 14 days). Its sidebar
- * row and cached history stay on the Hub, read only; it has no sandbox and counts toward nothing.
+ * A settled chat whose parked VM is gone (expired after `boat.parkedTtlHours`, retired by
+ * `hub.maxParkedSandboxes`, or dropped by Boat). Its sidebar row and cached history stay on the
+ * Hub, read only; it has no sandbox and counts toward nothing.
  */
 export interface HubExpiredThreadRecord {
   threadId: string;
@@ -101,8 +102,10 @@ export interface HubExpiredThreadRecord {
   sandboxId: string;
   parkedAt: string | null;
   expiredAt: string;
-  /** `parked-14-days`, `data-expired` (Boat dropped it early) or `gone-remotely`. */
+  /** `parked-ttl`, `parked-limit`, `data-expired` (Boat dropped it early), `gone-remotely`, or legacy `parked-14-days`. */
   reason: string;
+  /** Configured parked TTL (in hours) when retired for `parked-ttl`, kept so the notice stays accurate after config changes. */
+  ttlHours?: number;
 }
 
 export interface HubWakeFailure {

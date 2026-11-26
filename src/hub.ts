@@ -25,7 +25,13 @@ import {
   rateLimitedResponse,
   type AuthRateLimiter,
 } from "./security.ts";
-import type { ProjectConfig, ProjectKlavConfig, SentinelConfig } from "./config.ts";
+import {
+  DEFAULT_MAX_PARKED_SANDBOXES,
+  DEFAULT_PARKED_TTL_HOURS,
+  type ProjectConfig,
+  type ProjectKlavConfig,
+  type SentinelConfig,
+} from "./config.ts";
 import { HubMcpHandler, formatRpcFailure, type HubParkRequest, type HubSandboxPhase } from "./hub-mcp.ts";
 import { isChildThreadRow, parkBlocker } from "./hub-park-guard.ts";
 import { HubStagedAttachmentStore } from "./hub-staged-store.ts";
@@ -952,13 +958,48 @@ class HubParkedCapacityError extends Error {
   override name = "HubParkedCapacityError";
 }
 
-/** Boat keeps a stopped VM's disk this long; a parked chat is read only after it. */
-const PARKED_DATA_TTL_MS = 14 * 24 * 3600_000;
+const HOUR_MS = 3600_000;
+const DAY_MS = 24 * HOUR_MS;
+/** Default time a parked VM is kept before retiring its Boat sandbox and marking its chat read only. */
+const DEFAULT_PARKED_TTL_MS = DEFAULT_PARKED_TTL_HOURS * HOUR_MS;
+
+function formatParkedDuration(ms: number): string {
+  if (ms >= DAY_MS && ms % DAY_MS === 0) {
+    const days = ms / DAY_MS;
+    return `${days} ${days === 1 ? "day" : "days"}`;
+  }
+  if (ms >= HOUR_MS) {
+    const hours = ms / HOUR_MS;
+    const rounded = Math.round(hours * 10) / 10;
+    return `${rounded} ${rounded === 1 ? "hour" : "hours"}`;
+  }
+  const mins = Math.max(1, Math.round(ms / 60_000));
+  return `${mins} ${mins === 1 ? "minute" : "minutes"}`;
+}
+
+function expiredNoticeFor(
+  record: Pick<HubExpiredThreadRecord, "reason" | "ttlHours"> | undefined,
+  fallbackTtlMs: number,
+): string {
+  const tail = "so the chat is read only. Its history stays here; start a new chat to continue the work.";
+  switch (record?.reason) {
+    case "parked-limit":
+      return `This chat's parked VM was retired to stay within the parked VM limit, ${tail}`;
+    case "data-expired":
+      return `This chat's VM disk expired in Boat, ${tail}`;
+    case "gone-remotely":
+      return `This chat's parked VM is no longer available, ${tail}`;
+    case "parked-14-days":
+      return `This chat's VM expired after 14 days settled, ${tail}`;
+    default: {
+      const ttlMs = typeof record?.ttlHours === "number" && record.ttlHours > 0 ? record.ttlHours * HOUR_MS : fallbackTtlMs;
+      return `This chat's VM expired after ${formatParkedDuration(ttlMs)} settled, ${tail}`;
+    }
+  }
+}
 
 const PARKED_NOTICE =
   "This chat is settled and its VM is parked. Unsettle it or send a message to wake the VM and continue.";
-const EXPIRED_NOTICE =
-  "This chat's VM expired after 14 days settled, so the chat is read only. Its history stays here; start a new chat to continue the work.";
 const SLEEPING_RPC_DETAIL =
   "This chat's VM is asleep, so it cannot answer this. Send a message to wake it.";
 const SLEEPING_NOTICE = "This chat's VM is asleep. Sending a message wakes it.";
@@ -1025,8 +1066,10 @@ export class HubServer {
   private readonly relayRepairs = new Map<string, Promise<boolean>>();
   /** When each VM's last relay repair started, by sandbox id. */
   private readonly lastRelayRepairAt = new Map<string, number>();
-  /** How long a parked VM is kept before its chat becomes read only (Boat drops the disk after 14 days). */
-  parkedTtlMs = PARKED_DATA_TTL_MS;
+  /** How long a parked VM is kept before its chat becomes read only (configured via `boat.parkedTtlHours`). */
+  parkedTtlMs = DEFAULT_PARKED_TTL_MS;
+  /** Max parked VMs kept stopped in Boat (0 = no count cap; configured via `hub.maxParkedSandboxes`). */
+  maxParkedSandboxes = DEFAULT_MAX_PARKED_SANDBOXES;
   /** After a parked VM wakes, `all-archived` does not park it again for this long (its watchdog's stale grace). */
   unparkHoldMs = 120_000;
   /** Parks that found a chat with no cached history; the park is retried this many times before going ahead. */
@@ -1149,6 +1192,8 @@ export class HubServer {
     private readonly rateLimiter?: AuthRateLimiter,
   ) {
     this.boat = asSandboxProvider(provider);
+    this.parkedTtlMs = (config.boat.parkedTtlHours ?? DEFAULT_PARKED_TTL_HOURS) * HOUR_MS;
+    this.maxParkedSandboxes = config.hub?.maxParkedSandboxes ?? DEFAULT_MAX_PARKED_SANDBOXES;
     const previewCfg = config.hub?.preview;
     if (previewCfg?.mode === "desktop-proxy") {
       this.portGateway = new HubPortGateway({
@@ -2653,8 +2698,9 @@ export class HubServer {
       const threadId = typeof payload.threadId === "string" && payload.threadId ? payload.threadId : randomUUID();
       const reuse = payload.reuseExistingThread === true;
 
-      if (this.expiredThread(threadId)) {
-        this.sendTypedFailure(ws, reqId, "orchestration.launchThread", payload, EXPIRED_NOTICE);
+      const expired = this.expiredThread(threadId);
+      if (expired) {
+        this.sendTypedFailure(ws, reqId, "orchestration.launchThread", payload, expiredNoticeFor(expired, this.parkedTtlMs));
         return;
       }
       const pending = this.pendingThreads.get(threadId);
@@ -3681,7 +3727,8 @@ export class HubServer {
 
   /** The Hub's view of a parked or read-only chat: its cached history (or row) with a status row. */
   private parkedThreadView(threadId: string): Record<string, unknown> | null {
-    if (!this.expiredThread(threadId)) {
+    const expired = this.expiredThread(threadId);
+    if (!expired) {
       const sbId = this.threadToSandbox.get(threadId);
       return sbId ? this.sleepingThreadView(threadId, sbId) : null;
     }
@@ -3689,7 +3736,7 @@ export class HubServer {
     const shell = this.threadShells.get(threadId);
     let base = cached ?? (shell ? projectionFromShell(shell) : null);
     if (base && wasStoppedMidRun(shell)) base = withStoppedRunProjection(base);
-    return base ? withStatusNotice(base, threadId, { outcome: "updated", summary: EXPIRED_NOTICE }) : null;
+    return base ? withStatusNotice(base, threadId, { outcome: "updated", summary: expiredNoticeFor(expired, this.parkedTtlMs) }) : null;
   }
 
   /**
@@ -3705,7 +3752,8 @@ export class HubServer {
     threadId: string,
     vmDetail: string = PARKED_RPC_DETAIL,
   ): void {
-    const detail = this.expiredThread(threadId) ? EXPIRED_NOTICE : vmDetail;
+    const expired = this.expiredThread(threadId);
+    const detail = expired ? expiredNoticeFor(expired, this.parkedTtlMs) : vmDetail;
     if (tag === "orchestration.subscribeThread" || tag === "orchestration.getThreadProjection") {
       // No copy of the history: a client holding its own keeps it (only `synchronized`)
       const afterSequence = (payload as { afterSequence?: unknown } | null)?.afterSequence;
@@ -3741,10 +3789,11 @@ export class HubServer {
     const closes = cmdType === "thread.archive" || cmdType === "thread.delete";
     // Already settled; a visit, pin or tag is not worth waking a parked VM for, so it is dropped
     const noop = cmdType === "thread.settle" || cmdType === "thread.auto-settle" || BOOKKEEPING_COMMANDS.has(cmdType);
-    if (this.expiredThread(threadId)) {
+    const expired = this.expiredThread(threadId);
+    if (expired) {
       if (closes) sendRpcExitSuccess(ws, reqId, { sequence: this.forgetExpiredThread(threadId, cmdType) });
       else if (noop) sendRpcExitSuccess(ws, reqId, { sequence: this.state.ensureHub().sequence });
-      else this.sendTypedFailure(ws, reqId, "orchestration.dispatchCommand", payload, EXPIRED_NOTICE);
+      else this.sendTypedFailure(ws, reqId, "orchestration.dispatchCommand", payload, expiredNoticeFor(expired, this.parkedTtlMs));
       return true;
     }
     const sb = this.parkedSandboxForThread(threadId);
@@ -3878,13 +3927,18 @@ export class HubServer {
           s.parkedAt = new Date().toISOString();
         });
         console.log(`[hub] parked sleeping sandbox ${sandboxId} (${sb.project}): its chats are settled — trigger: ${request.trigger}`);
+        await this.evictExcessParkedSandboxes(sandboxId);
       }
       return true;
     }
     if (sb.phase !== "running") return false;
     await this.sleepHubSandbox(sandboxId, { park: request });
     const after = this.state.getHubSandbox(sandboxId);
-    return after?.phase === "sleeping" && !!after.parkedAt;
+    if (after?.phase === "sleeping" && !!after.parkedAt) {
+      await this.evictExcessParkedSandboxes(sandboxId);
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -3914,26 +3968,73 @@ export class HubServer {
     return bridge.readShellThreads(this.parkCheckTimeoutMs);
   }
 
-  /** Turns every parked VM stopped for `parkedTtlMs` into read-only chats; returns how many. */
+  /** Parked sandboxes that are neither waking nor being destroyed. */
+  private liveParkedSandboxes(): HubSandboxRecord[] {
+    return this.state
+      .listHubSandboxes()
+      .filter(
+        (sb) =>
+          sb.phase === "sleeping" &&
+          !!sb.parkedAt &&
+          !this.inFlightWakes.has(sb.sandboxId) &&
+          !this.destroyingSandboxes.has(sb.sandboxId),
+      );
+  }
+
+  /**
+   * Turns every parked VM stopped for `parkedTtlMs` into read-only chats, then enforces
+   * `maxParkedSandboxes` (retiring oldest parked VMs first). Returns how many were retired.
+   */
   async expireParkedSandboxes(now = Date.now()): Promise<number> {
     let expired = 0;
-    for (const sb of this.state.listHubSandboxes()) {
-      if (sb.phase !== "sleeping" || !sb.parkedAt) continue;
-      if (this.inFlightWakes.has(sb.sandboxId) || this.destroyingSandboxes.has(sb.sandboxId)) continue;
-      // Boat's 14 days run from the stop, which may be an idle sleep before the park
-      const stoppedAt = Date.parse(sb.sleepingSince ?? sb.parkedAt);
+    const ttlHours = this.parkedTtlMs / HOUR_MS;
+    for (const sb of this.liveParkedSandboxes()) {
+      // Measure from the stop, which may be an idle sleep before the park
+      const stoppedAt = Date.parse(sb.sleepingSince ?? sb.parkedAt!);
       if (!Number.isFinite(stoppedAt) || now - stoppedAt < this.parkedTtlMs) continue;
-      await this.expireParkedSandbox(sb.sandboxId, "parked-14-days");
+      await this.expireParkedSandbox(sb.sandboxId, "parked-ttl", { ttlHours });
       expired++;
     }
+    expired += await this.evictExcessParkedSandboxes();
     return expired;
   }
 
   /**
-   * A parked VM whose disk is gone (14 days stopped) or about to go: its open chats stay in the
-   * sidebar with their cached history, read only and without a sandbox; the Boat sandbox is deleted.
+   * Enforces `maxParkedSandboxes` by retiring the oldest parked VMs to read-only (deleting their
+   * Boat sandboxes) until the count is within the cap. Returns how many were retired.
    */
-  async expireParkedSandbox(sandboxId: string, reason: string): Promise<void> {
+  async evictExcessParkedSandboxes(keepSandboxId?: string): Promise<number> {
+    const max = this.maxParkedSandboxes;
+    if (!Number.isFinite(max) || max <= 0) return 0;
+    const parked = this.liveParkedSandboxes();
+    if (parked.length <= max) return 0;
+    const ageKey = (sb: HubSandboxRecord): number => {
+      const t = Date.parse(sb.sleepingSince ?? sb.parkedAt ?? sb.createdAt);
+      return Number.isFinite(t) ? t : 0;
+    };
+    parked.sort((a, b) => {
+      if (keepSandboxId) {
+        if (a.sandboxId === keepSandboxId && b.sandboxId !== keepSandboxId) return 1;
+        if (b.sandboxId === keepSandboxId && a.sandboxId !== keepSandboxId) return -1;
+      }
+      const diff = ageKey(a) - ageKey(b);
+      return diff !== 0 ? diff : a.sandboxId.localeCompare(b.sandboxId);
+    });
+    const excess = parked.slice(0, parked.length - max);
+    let evicted = 0;
+    for (const sb of excess) {
+      if (this.liveParkedSandboxes().length <= max) break;
+      await this.expireParkedSandbox(sb.sandboxId, "parked-limit");
+      evicted++;
+    }
+    return evicted;
+  }
+
+  /**
+   * A parked VM whose retention ended (TTL, parked-VM cap, or Boat disk expiry): its open chats stay
+   * in the sidebar with their cached history, read only and without a sandbox; the Boat sandbox is deleted.
+   */
+  async expireParkedSandbox(sandboxId: string, reason: string, opts: { ttlHours?: number } = {}): Promise<void> {
     const sb = this.state.getHubSandbox(sandboxId);
     if (!sb || this.destroyingSandboxes.has(sandboxId)) return;
     this.destroyingSandboxes.add(sandboxId);
@@ -3967,6 +4068,7 @@ export class HubServer {
             parkedAt: sb.parkedAt ?? null,
             expiredAt,
             reason,
+            ...(opts.ttlHours !== undefined ? { ttlHours: opts.ttlHours } : {}),
           };
         }
         if (Object.keys(records).length > 0) h.expiredThreads = records;
@@ -4585,12 +4687,13 @@ export class HubServer {
         return;
       }
       // A parked chat's VM is stopped, not gone; the answer is the same shape, with its own text
+      const expired = this.expiredThread(threadId);
       const detail = asleep
         ? SLEEPING_RPC_DETAIL
         : !parked
           ? THREAD_VM_GONE_DETAIL
-          : this.expiredThread(threadId)
-            ? EXPIRED_NOTICE
+          : expired
+            ? expiredNoticeFor(expired, this.parkedTtlMs)
             : PARKED_RPC_DETAIL;
       const typed = threadGoneError(tag, payload, detail);
       if (typed) sendRpcExitFail(ws, reqId, typed);
@@ -5383,12 +5486,13 @@ export class HubServer {
     try {
       const res = await this.boat.resume(sandboxId, sb.size);
       if (res === "data_expired" && sb.parkedAt) {
-        // Boat dropped the parked VM before the Hub's own 14 days: the chat stays, read only
+        // Boat dropped the parked VM early: the chat stays, read only
         const threadIds = [...sb.threadIds];
+        const notice = expiredNoticeFor({ reason: "data-expired" }, this.parkedTtlMs);
         await this.expireParkedSandbox(sandboxId, "data-expired");
         console.warn(`[hub] wake of parked sandbox ${sandboxId} failed at step resume: its disk expired; its chat is read only`);
-        this.emitWake({ type: "wake-failure", sandboxId, threadIds, step, reason: EXPIRED_NOTICE, retryAfter: null, attempts: 1 });
-        throw new HubWakeFailedError(EXPIRED_NOTICE);
+        this.emitWake({ type: "wake-failure", sandboxId, threadIds, step, reason: notice, retryAfter: null, attempts: 1 });
+        throw new HubWakeFailedError(notice);
       }
       if (res === "data_expired") {
         const threadIds = [...sb.threadIds];

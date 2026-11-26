@@ -23,6 +23,9 @@ hub:
   host: boat.example.com
   label: Boat
   maxSandboxes: 20
+  # Max parked (settled) VMs kept stopped in Boat (default 8; 0 = unlimited). Oldest parked VMs
+  # retire to read-only (deleting their Boat snapshot) when exceeded so you stay under Boat's snapshot cap.
+  maxParkedSandboxes: 8
   # Fast Native Desktop Preview Gateway (60-120 FPS in T3 Desktop Electron <webview>, 0 disk on Sentinel)
   # preview:
   #   mode: desktop-proxy        # "desktop-proxy" (recommended for Desktop) or "server" (default JPEG stream)
@@ -115,8 +118,12 @@ boat:
   archiveAction: delete
   # Hub, with deleteWhen archived-or-settled: a VM whose chats are all settled (not archived or deleted) is
   # "park"ed (default: stopped, the chat stays in the sidebar, it does not count toward hub.maxSandboxes and
-  # wakes when you continue it; after 14 days Boat drops the disk and the chat stays read only) or "delete"d
+  # wakes when you continue it; once parkedTtlHours or hub.maxParkedSandboxes is reached, the VM is deleted
+  # in Boat to free its snapshot and the chat stays read only) or "delete"d
   settleAction: park
+  # Hub: hours to keep a parked (settled) VM before deleting it in Boat and marking its chat read only
+  # (default 48 = 2 days; Boat itself drops stopped VM disks after 14 days / 336h)
+  parkedTtlHours: 48
   # How often sentinel reconciles `boat list --all` to kill orphan sandboxes
   reaperIntervalSecs: 300
   # Optional safety cap in hours for sleeping sandboxes (0 = disabled)
