@@ -27,6 +27,23 @@ import {
 } from "./security.ts";
 import type { ProjectConfig, ProjectKlavConfig, SentinelConfig } from "./config.ts";
 import { HubMcpHandler, formatRpcFailure, type HubSandboxPhase } from "./hub-mcp.ts";
+import {
+  CACHED_READ_STREAMS,
+  CACHED_READ_TAGS,
+  DEFAULT_MAX_CACHED_ASSET_BYTES,
+  DEFAULT_MAX_CACHED_READ_BYTES,
+  MAX_RECORDED_READS_PER_TAG,
+  ThreadReadStore,
+  attachmentsIn,
+  fetchCapped,
+  isStandaloneStreamValue,
+  readKey,
+  recordedPayload,
+  remainingMs,
+  replayPayload,
+  type CachedAsset,
+  type ThreadReads,
+} from "./hub-read-cache.ts";
 import { HubShellStore } from "./hub-shell-store.ts";
 import {
   ProviderSetupRouter,
@@ -212,6 +229,9 @@ interface LocalThreadSub {
 /** Commands that close a chat; for a chat still booting (or whose VM failed to start) they cancel the launch. */
 const CLOSING_COMMANDS = new Set(["thread.archive", "thread.delete", "thread.settle", "thread.auto-settle"]);
 
+/** A VM that is up: Boat reports it `running`, or `idle` when nothing in it is busy. */
+const isLiveSandboxState = (state: string | undefined): boolean => state === "running" || state === "idle";
+
 /** Commands that only record what the user did; answered at once and sent once the VM is up. */
 const BOOKKEEPING_COMMANDS = new Set([
   "thread.visit",
@@ -373,7 +393,37 @@ class HubVmBridge {
     ) => void,
     private readonly onProviderStatuses: (sandboxId: string, providers: unknown[]) => void = () => {},
     private readonly onOpen: (sandboxId: string) => void = () => {},
+    private readonly opts: {
+      /** Delay before each reconnect. */
+      reconnectMs?: () => number;
+      /** A connection attempt closed before it opened; `failures` counts them since the last open. */
+      onConnectFailure?: (sandboxId: string, failures: number) => void;
+    } = {},
   ) {}
+
+  /** Connection attempts that closed before opening, since the last open. */
+  private connectFailures = 0;
+
+  /**
+   * Points the bridge at a new endpoint for the same VM (its port was exposed again) and, unless it is
+   * open, connects to it now. Callers waiting for it to open keep waiting.
+   */
+  retarget(sandbox: HubSandboxRecord): void {
+    this.sandbox = sandbox;
+    if (this.closed || this.isOpen()) return;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    const stale = this.ws;
+    this.ws = null;
+    try {
+      stale?.close();
+    } catch {
+      // ignore
+    }
+    this.connect();
+  }
 
   start(): void {
     this.closed = false;
@@ -452,8 +502,11 @@ class HubVmBridge {
     } as unknown as string[]);
     this.ws = ws;
 
+    let opened = false;
     ws.addEventListener("open", () => {
       if (this.ws !== ws) return;
+      opened = true;
+      this.connectFailures = 0;
       for (const waiter of this.openWaiters.splice(0)) {
         waiter.resolve();
       }
@@ -520,7 +573,8 @@ class HubVmBridge {
         }
       }
       if (!this.closed && this.sandbox.phase === "running") {
-        this.reconnectTimer = setTimeout(() => this.connect(), 2_000);
+        this.reconnectTimer = setTimeout(() => this.connect(), this.opts.reconnectMs?.() ?? 2_000);
+        if (!opened) this.opts.onConnectFailure?.(this.sandbox.sandboxId, ++this.connectFailures);
       }
     });
 
@@ -842,6 +896,11 @@ const PARKED_NOTICE =
   "This chat is settled and its VM is parked. Unsettle it or send a message to wake the VM and continue.";
 const EXPIRED_NOTICE =
   "This chat's VM expired after 14 days settled, so the chat is read only. Its history stays here; start a new chat to continue the work.";
+const SLEEPING_RPC_DETAIL =
+  "This chat's VM is asleep, so it cannot answer this. Send a message to wake it.";
+const SLEEPING_NOTICE = "This chat's VM is asleep. Sending a message wakes it.";
+/** Bookkeeping commands kept per sleeping chat for its next wake; the oldest go past this many. */
+const MAX_HELD_BOOKKEEPING = 50;
 const PARKED_RPC_DETAIL =
   "This chat is settled and its VM is parked, so it cannot answer this. Unsettle the chat or send a message to wake it.";
 
@@ -879,6 +938,20 @@ export class HubServer {
   forwarderTermTimeoutSecs = 10;
   /** How long a woken VM's bridge may take to open. */
   wakeBridgeTimeoutMs = 20_000;
+  /** How long archive or delete waits for a VM's bridge before treating the VM as unreachable. */
+  closeBridgeTimeoutMs = 8_000;
+  /** Delay between a VM bridge's reconnect attempts. */
+  bridgeReconnectMs = 2_000;
+  /** Failed connects in a row (since the last open) after which the Hub re-exposes the VM's T3 port. */
+  relayRepairAfterFailures = 3;
+  /** At most one automatic relay repair per VM in this window. */
+  relayRepairBackoffMs = 60_000;
+  /** How long one relay repair (Boat state check + re-expose) may take. */
+  relayRepairTimeoutMs = 20_000;
+  /** Relay repairs under way, by sandbox id. */
+  private readonly relayRepairs = new Map<string, Promise<boolean>>();
+  /** When each VM's last relay repair started, by sandbox id. */
+  private readonly lastRelayRepairAt = new Map<string, number>();
   /** How long a parked VM is kept before its chat becomes read only (Boat drops the disk after 14 days). */
   parkedTtlMs = PARKED_DATA_TTL_MS;
   /** After a parked VM wakes, `all-archived` does not park it again for this long (its watchdog's stale grace). */
@@ -891,12 +964,28 @@ export class HubServer {
   private parkedSweepTimer: ReturnType<typeof setInterval> | null = null;
   /** Chats answered before their VM was ready (booting or failed), by thread id. */
   private readonly pendingThreads = new Map<string, PendingThreadLaunch>();
+  /** Bookkeeping commands (visit, pin, tag...) for chats whose VM is asleep, sent when it next wakes; by thread id. */
+  private readonly heldBookkeeping = new Map<string, Record<string, unknown>[]>();
   /** Thread streams the Hub serves while the thread's VM is not up, by thread id. */
   private readonly localThreadSubs = new Map<string, LocalThreadSub[]>();
   /** A sleeping VM being woken, or whose last wake failed (with the reason), by sandbox id. */
   private readonly wakeStatus = new Map<string, WakeStatus>();
   /** Each thread's projection, read from its VM before the VM went to sleep (also on disk). */
   private readonly projectionCache = new Map<string, Record<string, unknown>>();
+  /** What each sleeping chat's panels showed when its VM went to sleep: git status, diff, refs, attachments. */
+  private readonly readStore: ThreadReadStore;
+  /** The read-only requests each chat's app made while its VM was up, re-asked at every sleep; by thread id, then key. */
+  private readonly recordedReads = new Map<string, Map<string, { tag: string; payload: Record<string, unknown> }>>();
+  /** Asset URL tokens the Hub signed for a sleeping chat's cached attachment. */
+  private readonly cachedAssetTokens = new Map<string, { threadId: string; attachmentId: string; expiresAt: number }>();
+  /** Cache entries already logged as skipped (over a cap), so each is logged once. */
+  private readonly loggedCacheSkips = new Set<string>();
+  /** How long caching a VM's chats before it sleeps may take, all chats and reads together. */
+  sleepCacheTimeoutMs = 10_000;
+  /** Largest cached answer of one read (bytes of JSON); a bigger one is not cached. */
+  maxCachedReadBytes = DEFAULT_MAX_CACHED_READ_BYTES;
+  /** Attachment bytes cached per chat; attachments past this are not cached. */
+  maxCachedAssetBytes = DEFAULT_MAX_CACHED_ASSET_BYTES;
   private readonly urlTokenToSandbox = new Map<string, string>();
   /** Preview streams and device-hub sockets, piped to the VM that runs the chat. */
   private readonly media = new HubMediaProxy((data) => this.resolveMediaTarget(data));
@@ -982,6 +1071,7 @@ export class HubServer {
       });
     }
     this.shellStore = new HubShellStore(config.stateDir, (threadId) => this.keepsStoredShell(threadId));
+    this.readStore = new ThreadReadStore(config.stateDir);
     this.mcp = new HubMcpHandler(
       config,
       state,
@@ -1048,6 +1138,7 @@ export class HubServer {
       this.restoreLiveSandboxes();
       this.restorePendingLaunches();
       this.lifecycle.onParkedHubSandboxGone = (sandboxId) => this.expireParkedSandbox(sandboxId, "gone-remotely");
+      this.lifecycle.onHubSandboxGone = (sandboxId) => this.forgetVanishedSandbox(sandboxId);
     }
   }
 
@@ -1848,6 +1939,10 @@ export class HubServer {
         if (!staged?.bytes) return withCors(new Response("Not Found", { status: 404 }));
         return withCors(new Response(req.method === "HEAD" ? null : Buffer.from(staged.bytes), { headers: stagedAssetHeaders(staged) }));
       }
+      const cached = this.cachedAssetForToken(token);
+      if (cached) {
+        return withCors(new Response(req.method === "HEAD" ? null : Bun.file(cached.path), { headers: stagedAssetHeaders(cached.asset) }));
+      }
       const sandboxId = this.urlTokenToSandbox.get(token);
       const sb = sandboxId ? this.state.getHubSandbox(sandboxId) : this.anyRunningSandbox();
       if (sb && sb.phase === "running") {
@@ -2298,6 +2393,11 @@ export class HubServer {
         this.serveParkedThreadRpc(ws, reqId, tag, payload, tid);
         return;
       }
+      if (this.idleSleepingSandboxForThread(tid)) {
+        // Nor does reading a chat whose VM sleeps: only sending it a message wakes it
+        this.serveParkedThreadRpc(ws, reqId, tag, payload, tid, SLEEPING_RPC_DETAIL);
+        return;
+      }
       const servable = tag === "orchestration.subscribeThread" || tag === "orchestration.getThreadProjection";
       const pending = this.pendingThreads.get(tid);
       if (pending && servable) {
@@ -2531,16 +2631,33 @@ export class HubServer {
         return;
       }
       if (!pending && (await this.handleParkedThreadCommand(ws, reqId, cmdType, payload, tid))) return;
+      const closes = cmdType === "thread.archive" || cmdType === "thread.delete";
+      if (closes && !pending && this.threadSandboxIsGone(tid)) {
+        // Its VM record is gone (or it never had one): nothing can apply the close, so the Hub drops the chat
+        sendRpcExitSuccess(ws, reqId, { sequence: this.forgetOrphanThread(tid, cmdType) });
+        return;
+      }
+      if (BOOKKEEPING_COMMANDS.has(cmdType) && !pending && this.idleSleepingSandboxForThread(tid)) {
+        // Opening a sleeping chat records a visit: answered now, kept for the VM's next wake (never starts one)
+        sendRpcExitSuccess(ws, reqId, { sequence: this.state.ensureHub().sequence });
+        this.holdBookkeeping(tid, payload);
+        return;
+      }
       if (BOOKKEEPING_COMMANDS.has(cmdType) && !this.threadVmIsUp(tid)) {
-        // Answered now so opening a booting or sleeping chat raises no slow-request warning; the VM
-        // gets it once up (for a sleeping chat this starts the wake, as opening it always did)
+        // Answered now so opening a booting or waking chat raises no slow-request warning; the VM gets it once up
         sendRpcExitSuccess(ws, reqId, { sequence: this.state.ensureHub().sequence });
         void this.forwardWhenUp(tid, payload);
         return;
       }
       // Other commands for a booting chat wait for its VM (resolveSandboxForThread)
       const sb = await this.resolveSandboxForThread(tid);
-      const bridge = await this.ensureBridgeOpen(sb);
+      let bridge = closes ? await this.bridgeForClose(sb) : await this.ensureBridgeOpen(sb);
+      // An agent may still work behind a lost relay: once repaired, the VM applies the close itself
+      if (!bridge && (await this.repairLocalhostRelay(sb.sandboxId, "close"))) bridge = await this.bridgeForClose(sb);
+      if (!bridge) {
+        await this.closeUnreachableThread(ws, reqId, cmdType, payload, tid, sb);
+        return;
+      }
       const nextPayload = await this.replayStagedAttachmentsInPayload(
         sb,
         bridge,
@@ -2909,6 +3026,46 @@ export class HubServer {
     return sb.phase === "sleeping" || this.inFlightWakes.has(sb.sandboxId) ? sb : undefined;
   }
 
+  /**
+   * The VM of a chat that sleeps (or is going to sleep) and is not parked or waking. Reading such a
+   * chat is answered by the Hub; only an action that needs the VM (a message, an answer) wakes it.
+   */
+  private idleSleepingSandboxForThread(threadId: string): HubSandboxRecord | undefined {
+    const sbId = this.threadToSandbox.get(threadId);
+    const sb = sbId ? this.state.getHubSandbox(sbId) : undefined;
+    if (!sb || sb.parkedAt || this.inFlightWakes.has(sb.sandboxId) || this.destroyingSandboxes.has(sb.sandboxId)) return undefined;
+    return sb.phase === "sleeping" || this.inFlightSleeps.has(sb.sandboxId) ? sb : undefined;
+  }
+
+  /** Keeps a bookkeeping command for a sleeping chat; a newer visit replaces an older one. */
+  private holdBookkeeping(threadId: string, payload: Record<string, unknown>): void {
+    let held = this.heldBookkeeping.get(threadId) ?? [];
+    if (payload.type === "thread.visit") held = held.filter((p) => p.type !== "thread.visit");
+    held.push(payload);
+    if (held.length > MAX_HELD_BOOKKEEPING) held = held.slice(held.length - MAX_HELD_BOOKKEEPING);
+    this.heldBookkeeping.set(threadId, held);
+  }
+
+  /** Sends a woken chat's held bookkeeping commands to its VM, in order. */
+  private async deliverHeldBookkeeping(threadId: string, sb: HubSandboxRecord): Promise<void> {
+    const held = this.heldBookkeeping.get(threadId);
+    this.heldBookkeeping.delete(threadId);
+    if (!held?.length) return;
+    const bridge = this.bridges.get(sb.sandboxId);
+    for (const payload of held) {
+      if (!bridge?.isOpen()) {
+        void this.forwardWhenUp(threadId, payload);
+        continue;
+      }
+      const exit = await bridge.callUnary(
+        "orchestration.dispatchCommand",
+        rewriteProjectIds(payload, sb.hubProjectId, sb.vmProjectId),
+        60_000,
+      );
+      if (exit._tag !== "Success") console.warn(`[hub] held ${String(payload.type)} for ${threadId} failed: ${formatRpcFailure(exit.cause)}`);
+    }
+  }
+
   // ── Settled chats whose VM is parked ───────────────────────────────────────────────────────────
 
   /** True when a VM whose chats are all settled is parked instead of deleted. */
@@ -2934,12 +3091,13 @@ export class HubServer {
     return sb.threadIds.filter((tid) => tid !== except && isOpenTopLevelRow(this.threadShells.get(tid)));
   }
 
-  /** True when `cwd` is the worktree of a parked or read-only chat. */
-  private isParkedWorkspace(cwd: string): boolean {
+  /** True when `cwd` is the worktree of a chat whose VM is parked or asleep (not waking), or a read-only chat. */
+  private isAsleepWorkspace(cwd: string): boolean {
     const inside = (wt: unknown) => typeof wt === "string" && wt !== "" && (cwd === wt || cwd.startsWith(`${wt}/`));
     for (const [wt, sbId] of this.worktreeToSandbox) {
       const sb = this.state.getHubSandbox(sbId);
-      if (inside(wt) && sb?.phase === "sleeping" && sb.parkedAt) return true;
+      if (!inside(wt) || !sb || this.inFlightWakes.has(sbId)) continue;
+      if (sb.phase === "sleeping" || this.inFlightSleeps.has(sbId)) return true;
     }
     for (const threadId of Object.keys(this.state.getHub()?.expiredThreads ?? {})) {
       if (inside(this.threadShells.get(threadId)?.worktreePath)) return true;
@@ -2970,8 +3128,9 @@ export class HubServer {
     tag: string,
     payload: unknown,
     threadId: string,
+    vmDetail: string = PARKED_RPC_DETAIL,
   ): void {
-    const detail = this.expiredThread(threadId) ? EXPIRED_NOTICE : PARKED_RPC_DETAIL;
+    const detail = this.expiredThread(threadId) ? EXPIRED_NOTICE : vmDetail;
     if (tag === "orchestration.subscribeThread" || tag === "orchestration.getThreadProjection") {
       // No copy of the history: a client holding its own keeps it (only `synchronized`)
       const afterSequence = (payload as { afterSequence?: unknown } | null)?.afterSequence;
@@ -3030,6 +3189,76 @@ export class HubServer {
     return false;
   }
 
+  /**
+   * True when a chat (not booting) has no VM record to apply a command: bound to a record that no
+   * longer exists, or not bound at all. A VM being destroyed still counts as there (it removes the chat).
+   */
+  private threadSandboxIsGone(threadId: string): boolean {
+    if (this.inFlightSpawns.has(threadId) || this.pendingThreads.has(threadId) || this.expiredThread(threadId)) return false;
+    const sandboxId = this.threadToSandbox.get(threadId);
+    if (!sandboxId) return true;
+    return !this.destroyingSandboxes.has(sandboxId) && !this.state.getHubSandbox(sandboxId);
+  }
+
+  /** Archive or delete of a chat whose VM record is gone: its row, streams and cached copy go. */
+  private forgetOrphanThread(threadId: string, command: string): number {
+    this.threadToSandbox.delete(threadId);
+    this.heldBookkeeping.delete(threadId);
+    this.recordedReads.delete(threadId);
+    this.deleteThreadShell(threadId);
+    this.localThreadSubs.delete(threadId);
+    this.dropProjectionCache(threadId);
+    const sequence = this.state.nextHubSequence();
+    this.broadcastShellItem({ kind: "thread.removed", sequence, location: "active", threadId });
+    console.log(`[hub] chat ${threadId} closed (${command}) with no VM left to apply it`);
+    return sequence;
+  }
+
+  /**
+   * The bridge a close goes through, waited on for `closeBridgeTimeoutMs` only; null when the VM
+   * cannot be reached (its bridge does not open), never for a VM that answers, even with a failure.
+   */
+  private async bridgeForClose(sb: HubSandboxRecord): Promise<HubVmBridge | null> {
+    try {
+      return await this.ensureBridgeOpen(sb, this.closeBridgeTimeoutMs);
+    } catch (err) {
+      console.warn(`[hub] could not reach ${sb.sandboxId} to close a chat: ${redactForLog(err)}`);
+      return null;
+    }
+  }
+
+  /**
+   * Archive or delete of a chat whose VM cannot be reached. With no other open chat on it, the Hub
+   * deletes the VM (like a parked chat's close) and the chat goes with it; otherwise the close fails.
+   */
+  private async closeUnreachableThread(
+    ws: ServerWebSocket<HubWsData>,
+    reqId: string | number,
+    cmdType: string,
+    payload: Record<string, unknown>,
+    threadId: string,
+    sb: HubSandboxRecord,
+  ): Promise<void> {
+    const others = this.openTopLevelThreads(this.state.getHubSandbox(sb.sandboxId) ?? sb, threadId);
+    if (others.length > 0) {
+      this.sendTypedFailure(
+        ws,
+        reqId,
+        "orchestration.dispatchCommand",
+        payload,
+        `This chat's VM cannot be reached, and other chats still run on it. Try again in a moment.`,
+      );
+      return;
+    }
+    console.log(`[hub] chat ${threadId} closed (${cmdType}) while ${sb.sandboxId} cannot be reached; deleting the VM`);
+    await this.destroyHubSandbox(
+      sb.sandboxId,
+      cmdType === "thread.archive" ? "chat-archived-while-unreachable" : "chat-deleted-while-unreachable",
+      { pull: false },
+    );
+    sendRpcExitSuccess(ws, reqId, { sequence: this.state.ensureHub().sequence });
+  }
+
   /** Archive or delete of a read-only chat: it leaves the sidebar and the Hub forgets its copy. */
   private forgetExpiredThread(threadId: string, command: string): number {
     this.state.updateHub((h) => {
@@ -3039,6 +3268,7 @@ export class HubServer {
     });
     this.deleteThreadShell(threadId);
     this.localThreadSubs.delete(threadId);
+    this.recordedReads.delete(threadId);
     this.dropProjectionCache(threadId);
     const sequence = this.state.nextHubSequence();
     this.broadcastShellItem({ kind: "thread.removed", sequence, location: "active", threadId });
@@ -3135,6 +3365,8 @@ export class HubServer {
       this.mcp.recordThreadsDestroyed([...sb.threadIds], `parked-expired-${reason}`);
       for (const threadId of sb.threadIds) {
         this.threadToSandbox.delete(threadId);
+        this.heldBookkeeping.delete(threadId);
+        this.recordedReads.delete(threadId);
         if (kept.has(threadId)) continue;
         this.deleteThreadShell(threadId);
         this.localThreadSubs.delete(threadId);
@@ -3181,15 +3413,15 @@ export class HubServer {
       return {
         outcome: "failed",
         summary: coolingDown
-          ? `This chat's VM could not wake. The next try is allowed after ${status.retryAfter}; ${parked ? "send a message" : "open the chat or send a message"} then.`
+          ? `This chat's VM could not wake. The next try is allowed after ${status.retryAfter}; send a message then.`
           : parked
             ? "This chat's VM could not wake. Send a message or unsettle it to retry."
-            : "This chat's VM could not wake. Open the chat again or send a message to retry.",
+            : "This chat's VM could not wake. Send a message to retry.",
         detail: status.error,
       };
     }
     if (this.state.getHubSandbox(sandboxId)?.parkedAt) return { outcome: "updated", summary: PARKED_NOTICE };
-    return { outcome: "updated", summary: "This chat's VM is asleep. Opening the chat or sending a message wakes it." };
+    return { outcome: "updated", summary: SLEEPING_NOTICE };
   }
 
   /** The Hub's view of a sleeping chat: its cached projection (or its sidebar row) with a status row. */
@@ -3201,8 +3433,8 @@ export class HubServer {
   }
 
   /**
-   * Serves a sleeping chat's thread view at once and starts waking its VM; the stream moves to the VM
-   * once it is up. False when the Hub knows nothing of the thread (then the request waits for the wake).
+   * Serves a waking chat's thread view at once; the stream moves to the VM once it is up. Never starts
+   * a wake. False when the Hub knows nothing of the thread (then the request waits for the wake).
    */
   private serveSleepingThread(
     ws: ServerWebSocket<HubWsData>,
@@ -3225,9 +3457,6 @@ export class HubServer {
       if (!view && !clientHasCopy) return false;
     }
     this.serveLocalThread(ws, reqId, tag, payload, view);
-    if (!this.inFlightWakes.has(sb.sandboxId)) {
-      void this.wakeHubSandbox(sb.sandboxId).catch(() => {});
-    }
     return true;
   }
 
@@ -3237,9 +3466,13 @@ export class HubServer {
     if (status && sb) this.wakeStatus.set(sandboxId, status);
     else this.wakeStatus.delete(sandboxId);
     if (!sb) return;
+    if (!status) this.handOffLocalVcsStreams(sandboxId);
     for (const threadId of sb.threadIds) {
       if (!status) {
+        // The VM answers from now on: its panels' copy goes, and their streams move to it
+        this.discardReadCache(threadId);
         this.handOffLocalThreadSubs(threadId, sb);
+        void this.deliverHeldBookkeeping(threadId, sb);
         continue;
       }
       const subs = this.liveLocalThreadSubs(threadId);
@@ -3267,13 +3500,19 @@ export class HubServer {
     }
   }
 
-  /** Before a VM sleeps: keep a copy of each of its threads, so the Hub can show them while it sleeps. */
+  /**
+   * Before a VM sleeps: keep a copy of each of its threads, so the Hub can show them while it sleeps,
+   * with what their panels showed (git status, diff, refs, attachments). Bounded by `sleepCacheTimeoutMs`.
+   */
   private async cacheThreadProjections(sb: HubSandboxRecord): Promise<void> {
     const bridge = this.bridges.get(sb.sandboxId);
     if (!bridge?.isOpen()) return;
+    const deadline = Date.now() + this.sleepCacheTimeoutMs;
     await Promise.all(
       sb.threadIds.map(async (threadId) => {
-        const exit = await bridge.callUnary("orchestration.getThreadProjection", { threadId }, 10_000);
+        // Replaced at every sleep: whatever the last one kept is older than what the VM answers now
+        this.readStore.discard(threadId);
+        const exit = await bridge.callUnary("orchestration.getThreadProjection", { threadId }, remainingMs(deadline));
         if (exit._tag !== "Success" || !exit.value || typeof exit.value !== "object") {
           // An older copy must never replace the newer one the client holds
           this.dropProjectionCache(threadId);
@@ -3288,6 +3527,10 @@ export class HubServer {
         } catch (err) {
           console.warn(`[hub] could not save thread ${threadId} for its sleeping VM:`, err instanceof Error ? err.message : err);
         }
+        await this.cacheThreadReads(sb, bridge, threadId, projection, deadline).catch((err) => {
+          console.warn(`[hub] could not cache the panels of thread ${threadId}:`, err instanceof Error ? err.message : err);
+          this.readStore.discard(threadId);
+        });
       }),
     );
   }
@@ -3295,6 +3538,255 @@ export class HubServer {
   private dropProjectionCache(threadId: string): void {
     this.projectionCache.delete(threadId);
     rmSync(this.projectionCacheFile(threadId), { force: true });
+    this.discardReadCache(threadId);
+  }
+
+  // ── What a sleeping chat's panels showed ───────────────────────────────────────────────────────
+
+  /** A chat's cached reads and attachments go (its VM answers again, or the chat is gone). */
+  private discardReadCache(threadId: string): void {
+    this.readStore.discard(threadId);
+    for (const [token, entry] of this.cachedAssetTokens) if (entry.threadId === threadId) this.cachedAssetTokens.delete(token);
+  }
+
+  /** The chat whose worktree holds `cwd` (the deepest one), among chats the Hub knows. */
+  private threadForWorktree(cwd: string): string | null {
+    let best: { threadId: string; length: number } | null = null;
+    for (const [threadId, row] of this.threadShells) {
+      const wt = row.worktreePath;
+      if (typeof wt !== "string" || wt === "" || (cwd !== wt && !cwd.startsWith(`${wt}/`))) continue;
+      if (!this.threadToSandbox.has(threadId) && !this.expiredThread(threadId)) continue;
+      if (!best || wt.length > best.length) best = { threadId, length: wt.length };
+    }
+    return best?.threadId ?? null;
+  }
+
+  /** The chat a workspace request is for: the one it names, else the one whose worktree it reads. */
+  private threadForWorkspaceRpc(tid: string | null, cwd: string | null): string | null {
+    if (tid && (this.threadToSandbox.has(tid) || this.expiredThread(tid))) return tid;
+    return cwd ? this.threadForWorktree(cwd) : null;
+  }
+
+  /** Remembers a read the app made of a chat on its running VM, to ask again when the VM sleeps. */
+  private recordRead(threadId: string, tag: string, payload: unknown): void {
+    if (!CACHED_READ_TAGS.has(tag)) return;
+    let reads = this.recordedReads.get(threadId);
+    if (!reads) {
+      reads = new Map();
+      this.recordedReads.set(threadId, reads);
+    }
+    const key = readKey(tag, payload);
+    reads.delete(key);
+    reads.set(key, { tag, payload: recordedPayload(tag, payload) });
+    const sameTag = [...reads].filter(([, r]) => r.tag === tag).map(([k]) => k);
+    for (const old of sameTag.slice(0, Math.max(0, sameTag.length - MAX_RECORDED_READS_PER_TAG))) reads.delete(old);
+  }
+
+  /** True while a chat is answered from its cache: its VM sleeps or is parked (not waking), or the chat is read only. */
+  private servesCachedReads(threadId: string): boolean {
+    if (this.expiredThread(threadId)) return true;
+    const sbId = this.threadToSandbox.get(threadId);
+    const sb = sbId ? this.state.getHubSandbox(sbId) : undefined;
+    return !!sb && sb.phase === "sleeping" && !this.inFlightWakes.has(sb.sandboxId) && !this.destroyingSandboxes.has(sb.sandboxId);
+  }
+
+  private logCacheSkipOnce(threadId: string, what: string, detail: string): void {
+    const key = `${threadId} ${what}`;
+    if (this.loggedCacheSkips.has(key)) return;
+    this.loggedCacheSkips.add(key);
+    console.warn(`[hub] not caching ${what} of thread ${threadId} for its sleeping VM: ${detail}`);
+  }
+
+  /** Asks the VM again for each read the chat's app made, and copies the attachments its history shows. */
+  private async cacheThreadReads(
+    sb: HubSandboxRecord,
+    bridge: HubVmBridge,
+    threadId: string,
+    projection: Record<string, unknown>,
+    deadline: number,
+  ): Promise<void> {
+    const recorded = [...(this.recordedReads.get(threadId)?.entries() ?? [])];
+    const reads: ThreadReads = { savedAt: Date.now(), entries: {}, attachments: {} };
+    await Promise.all([
+      ...recorded.map(async ([key, read]) => {
+        const value = await this.askVmForRead(sb, bridge, read.tag, read.payload, deadline);
+        if (value === undefined) return;
+        const bytes = Buffer.byteLength(JSON.stringify(value));
+        if (bytes > this.maxCachedReadBytes) {
+          this.logCacheSkipOnce(threadId, key, `${bytes} bytes is over the ${this.maxCachedReadBytes}-byte cap`);
+          return;
+        }
+        reads.entries[key] = { tag: read.tag, value };
+      }),
+      this.cacheThreadAttachments(sb, bridge, threadId, projection, deadline, reads),
+    ]);
+    // A chat closed or woken meanwhile keeps nothing
+    if (!this.threadToSandbox.has(threadId) || this.inFlightWakes.has(sb.sandboxId)) {
+      this.readStore.discard(threadId);
+      return;
+    }
+    if (Object.keys(reads.entries).length === 0 && Object.keys(reads.attachments).length === 0) {
+      this.readStore.discard(threadId);
+      return;
+    }
+    this.readStore.save(threadId, reads);
+  }
+
+  /** One read, answered by the VM now (a stream's first standalone value); undefined if it fails or times out. */
+  private askVmForRead(
+    sb: HubSandboxRecord,
+    bridge: HubVmBridge,
+    tag: string,
+    payload: Record<string, unknown>,
+    deadline: number,
+  ): Promise<unknown> {
+    const vmPayload = rewriteProjectIds(replayPayload(tag, payload), sb.hubProjectId, sb.vmProjectId);
+    const toHub = (value: unknown) => rewriteProjectIds(value, sb.vmProjectId, sb.hubProjectId);
+    if (!CACHED_READ_STREAMS.has(tag)) {
+      return bridge
+        .callUnary(tag, vmPayload, remainingMs(deadline))
+        .then((exit) => (exit._tag === "Success" && exit.value !== undefined ? toHub(exit.value) : undefined));
+    }
+    return new Promise((resolve) => {
+      let done = false;
+      let upReqId = "";
+      const finish = (value: unknown) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const timer = setTimeout(() => {
+        bridge.sendInterrupt(upReqId);
+        finish(undefined);
+      }, remainingMs(deadline));
+      upReqId = bridge.openStream(
+        tag,
+        vmPayload,
+        (values) => {
+          if (done) return;
+          const value = [...values].reverse().find((v) => isStandaloneStreamValue(tag, v));
+          if (value === undefined) return;
+          bridge.sendInterrupt(upReqId);
+          finish(toHub(value));
+        },
+        () => finish(undefined),
+      );
+    });
+  }
+
+  /** Copies the attachments a chat's history shows, up to `maxCachedAssetBytes` for the chat. */
+  private async cacheThreadAttachments(
+    sb: HubSandboxRecord,
+    bridge: HubVmBridge,
+    threadId: string,
+    projection: Record<string, unknown>,
+    deadline: number,
+    reads: ThreadReads,
+  ): Promise<void> {
+    let budget = this.maxCachedAssetBytes;
+    for (const att of attachmentsIn(projection)) {
+      if (remainingMs(deadline) <= 1) return;
+      if (att.sizeBytes > budget) {
+        this.logCacheSkipOnce(threadId, `attachment ${att.id}`, `${att.sizeBytes} bytes is over what is left of the ${this.maxCachedAssetBytes}-byte cap`);
+        continue;
+      }
+      const resource = { _tag: "attachment", attachmentId: att.id };
+      const exit = await bridge.callUnary("assets.createUrl", { resource }, remainingMs(deadline));
+      const relativeUrl = exit._tag === "Success" ? (exit.value as { relativeUrl?: unknown } | null)?.relativeUrl : undefined;
+      if (typeof relativeUrl !== "string" || !relativeUrl.startsWith("/")) continue;
+      const live = this.state.getHubSandbox(sb.sandboxId) ?? sb;
+      const bytes = await fetchCapped(`${live.upstreamUrl}${relativeUrl}`, live.upstreamHeaders ?? {}, budget, remainingMs(deadline)).catch(
+        () => null,
+      );
+      if (bytes === "over") {
+        this.logCacheSkipOnce(threadId, `attachment ${att.id}`, `it is over what is left of the ${this.maxCachedAssetBytes}-byte cap`);
+        continue;
+      }
+      if (!bytes) continue;
+      budget -= bytes.byteLength;
+      const file = this.readStore.writeAsset(threadId, att.id, bytes);
+      reads.attachments[att.id] = { name: att.name, mimeType: att.mimeType, file };
+    }
+  }
+
+  /**
+   * Answers a workspace read for a sleeping chat from its cache: a stream gets the cached value and
+   * stays open. False when nothing is cached for this request.
+   */
+  private serveCachedRead(
+    ws: ServerWebSocket<HubWsData>,
+    reqId: string | number,
+    tag: string,
+    payload: unknown,
+    threadId: string,
+  ): boolean {
+    if (!CACHED_READ_TAGS.has(tag) || !this.servesCachedReads(threadId)) return false;
+    const hit = this.readStore.get(threadId)?.entries[readKey(tag, payload)];
+    if (!hit || hit.tag !== tag) return false;
+    if (CACHED_READ_STREAMS.has(tag)) {
+      ws.data.localStreams.set(String(reqId), { rawId: reqId, tag, payload });
+      sendRpcFrame(ws, { _tag: "Chunk", requestId: reqId, values: [hit.value] });
+      return true;
+    }
+    sendRpcExitSuccess(ws, reqId, hit.value);
+    return true;
+  }
+
+  /** A signed URL for an attachment a sleeping chat's cache holds, served like a staged upload; false if none. */
+  private serveCachedAttachmentUrl(ws: ServerWebSocket<HubWsData>, reqId: string | number, attachmentId: string): boolean {
+    const threadId = this.readStore.attachmentOwner(attachmentId);
+    if (!threadId || !this.servesCachedReads(threadId)) return false;
+    const asset = this.readStore.get(threadId)?.attachments[attachmentId];
+    if (!asset || !existsSync(this.readStore.assetPath(threadId, asset))) return false;
+    const now = Date.now();
+    for (const [token, entry] of this.cachedAssetTokens) if (entry.expiresAt <= now) this.cachedAssetTokens.delete(token);
+    const token = randomToken(24);
+    const expiresAt = now + ATTACHMENT_UPLOAD_URL_TTL_MS;
+    this.cachedAssetTokens.set(token, { threadId, attachmentId, expiresAt });
+    sendRpcExitSuccess(ws, reqId, { relativeUrl: `/api/assets/${token}/${encodeURIComponent(asset.name)}`, expiresAt });
+    return true;
+  }
+
+  /** The cached attachment an asset URL token names, while its chat still sleeps. */
+  private cachedAssetForToken(token: string): { asset: CachedAsset; path: string } | null {
+    const entry = this.cachedAssetTokens.get(token);
+    if (!entry) return null;
+    if (entry.expiresAt <= Date.now()) {
+      this.cachedAssetTokens.delete(token);
+      return null;
+    }
+    const asset = this.readStore.get(entry.threadId)?.attachments[entry.attachmentId];
+    if (!asset) return null;
+    const path = this.readStore.assetPath(entry.threadId, asset);
+    return existsSync(path) ? { asset, path } : null;
+  }
+
+  /**
+   * Moves the VCS streams the Hub kept open for a VM's worktrees (it slept, or was not up) to that VM,
+   * so a panel fed from the cache follows the live VM again.
+   */
+  private handOffLocalVcsStreams(sandboxId: string): void {
+    const sb = this.state.getHubSandbox(sandboxId);
+    const bridge = this.bridges.get(sandboxId);
+    if (!sb || sb.phase !== "running" || !bridge?.isOpen()) return;
+    const ownsCwd = (cwd: string) => {
+      for (const [wt, sbId] of this.worktreeToSandbox) {
+        if (sbId === sandboxId && wt !== "" && (cwd === wt || cwd.startsWith(`${wt}/`))) return true;
+      }
+      return false;
+    };
+    for (const client of this.clients) {
+      for (const [key, sub] of client.data.localStreams) {
+        if (sub.tag !== "subscribeVcsStatus" && sub.tag !== "subscribeVcsBranch") continue;
+        const cwd = (sub.payload as { cwd?: unknown } | undefined)?.cwd;
+        if (typeof cwd !== "string" || !ownsCwd(cwd)) continue;
+        client.data.localStreams.delete(key);
+        bridge.forwardToClient(client, sub.rawId, sub.tag, sub.payload, []);
+        const chat = this.threadForWorktree(cwd);
+        if (chat && this.threadToSandbox.get(chat) === sandboxId) this.recordRead(chat, sub.tag, sub.payload);
+      }
+    }
   }
 
   private async handleWorkspaceRpc(
@@ -3310,10 +3802,13 @@ export class HubServer {
     const hubProjId = typeof obj.projectId === "string" ? obj.projectId : null;
 
     let sb: HubSandboxRecord | undefined;
-    // A parked or read-only chat gets the Hub's own answer: no wake, and never another chat's VM
+    // A parked, sleeping or read-only chat gets the Hub's own answer: no wake, and never another chat's VM
     const parked =
-      (tid !== null && (this.parkedSandboxForThread(tid) !== undefined || this.expiredThread(tid) !== undefined)) ||
-      (cwd !== null && this.isParkedWorkspace(cwd));
+      (tid !== null &&
+        (this.parkedSandboxForThread(tid) !== undefined ||
+          this.idleSleepingSandboxForThread(tid) !== undefined ||
+          this.expiredThread(tid) !== undefined)) ||
+      (cwd !== null && this.isAsleepWorkspace(cwd));
     if (!parked && tid && this.threadToSandbox.has(tid) && !this.pendingThreads.has(tid)) {
       try {
         sb = await this.resolveSandboxForThread(tid);
@@ -3333,10 +3828,19 @@ export class HubServer {
       try {
         const bridge = await this.ensureBridgeOpen(sb);
         bridge.forwardToClient(ws, reqId, tag, payload, headers);
+        // Asked again when this chat's VM next sleeps, so its panels can be shown while it sleeps
+        const chat = this.threadForWorkspaceRpc(tid, cwd);
+        if (chat && this.threadToSandbox.get(chat) === sb.sandboxId) this.recordRead(chat, tag, payload);
         return;
       } catch {
         // fall through to cached fallback
       }
+    }
+
+    // A sleeping or read-only chat: what its panel showed when the VM went to sleep
+    if (parked) {
+      const chat = this.threadForWorkspaceRpc(tid, cwd);
+      if (chat && this.serveCachedRead(ws, reqId, tag, payload, chat)) return;
     }
 
     // Zero running VMs for this project -> return clean cached fallback for composer calls
@@ -3365,8 +3869,9 @@ export class HubServer {
       return;
     }
     if (tag === "subscribeVcsStatus" || tag === "subscribeVcsBranch") {
-      // Keep VCS status/branch subscriptions open quietly when zero VMs are running for this project
-      ws.data.localStreams.set(String(reqId), { rawId: reqId, tag });
+      // Keep VCS status/branch subscriptions open quietly when zero VMs are running for this project;
+      // the payload lets the chat's VM take the stream over once it is up (`handOffLocalVcsStreams`)
+      ws.data.localStreams.set(String(reqId), { rawId: reqId, tag, payload });
       return;
     }
 
@@ -3399,7 +3904,9 @@ export class HubServer {
     threadId: string,
   ): Promise<void> {
     const parked = this.parkedSandboxForThread(threadId) !== undefined || this.expiredThread(threadId) !== undefined;
-    if (parked || !this.threadHasVm(threadId)) {
+    // Answering a request the agent made (a secret, feedback) needs the VM; anything else waits for a message
+    const asleep = !parked && !tag.endsWith(".answerRequest") && this.idleSleepingSandboxForThread(threadId) !== undefined;
+    if (parked || asleep || !this.threadHasVm(threadId)) {
       if (tag === "preview.list") {
         // Asked for every open chat, drafts included: a chat with no VM has no previews
         sendRpcExitSuccess(ws, reqId, { sessions: [], serverEpoch: "boat-hub", revision: 0 });
@@ -3411,7 +3918,13 @@ export class HubServer {
         return;
       }
       // A parked chat's VM is stopped, not gone; the answer is the same shape, with its own text
-      const detail = !parked ? THREAD_VM_GONE_DETAIL : this.expiredThread(threadId) ? EXPIRED_NOTICE : PARKED_RPC_DETAIL;
+      const detail = asleep
+        ? SLEEPING_RPC_DETAIL
+        : !parked
+          ? THREAD_VM_GONE_DETAIL
+          : this.expiredThread(threadId)
+            ? EXPIRED_NOTICE
+            : PARKED_RPC_DETAIL;
       const typed = threadGoneError(tag, payload, detail);
       if (typed) sendRpcExitFail(ws, reqId, typed);
       else sendRpcExitFailure(ws, reqId, detail);
@@ -3497,17 +4010,19 @@ export class HubServer {
       });
       return;
     }
+    // An image in a sleeping chat's history: the copy the Hub kept when its VM went to sleep
+    if (this.serveCachedAttachmentUrl(ws, reqId, attachmentId)) return;
     const ownerId = this.attachmentToSandbox.get(attachmentId);
     const owner = ownerId ? this.state.getHubSandbox(ownerId) : undefined;
-    if (owner?.phase === "sleeping" && owner.parkedAt) {
-      // A parked VM is never woken to read
-      sendRpcExitFail(ws, reqId, notFound);
-      return;
-    }
     if (owner?.phase === "sleeping") {
-      // Like a chat's own images: an idle VM is woken, not skipped
+      // A sleeping or parked VM is never woken to read; one already waking is waited for
+      const waking = this.inFlightWakes.get(owner.sandboxId);
+      if (!waking) {
+        sendRpcExitFail(ws, reqId, notFound);
+        return;
+      }
       try {
-        const bridge = await this.ensureBridgeOpen(await this.wakeHubSandbox(owner.sandboxId));
+        const bridge = await this.ensureBridgeOpen(await waking);
         bridge.forwardToClient(ws, reqId, "assets.createUrl", payload, headers);
       } catch (err) {
         sendRpcExitFailure(ws, reqId, err instanceof Error ? err.message : String(err));
@@ -4231,7 +4746,7 @@ export class HubServer {
     let needsPause = ctx.resumed || previous?.vmPaused === false;
     if (!needsPause) {
       const info = await this.boat.info(sandboxId).catch(() => null);
-      needsPause = info?.state === "running";
+      needsPause = isLiveSandboxState(info?.state);
     }
     let vmPaused = !needsPause;
     if (needsPause && this.boat.pause) {
@@ -4328,6 +4843,12 @@ export class HubServer {
     if (existing) return existing;
     const promise = this.doSleepHubSandbox(sandboxId, opts.park === true).finally(() => {
       this.inFlightSleeps.delete(sandboxId);
+      const after = this.state.getHubSandbox(sandboxId);
+      if (after?.phase === "running") {
+        // It did not go to sleep (a park put off, a pause that failed): the VM still answers
+        for (const threadId of after.threadIds) this.discardReadCache(threadId);
+        this.handOffLocalVcsStreams(sandboxId);
+      }
     });
     this.inFlightSleeps.set(sandboxId, promise);
     return promise;
@@ -4390,25 +4911,47 @@ export class HubServer {
     });
   }
 
-  async destroyHubSandbox(sandboxId: string, reason: string): Promise<void> {
+  /** `pull: false` skips the teardown read of provider sign-ins (a VM that cannot be reached). */
+  async destroyHubSandbox(sandboxId: string, reason: string, opts: { pull?: boolean } = {}): Promise<void> {
     const sb = this.state.getHubSandbox(sandboxId);
     if (!sb || this.destroyingSandboxes.has(sandboxId)) return;
     this.destroyingSandboxes.add(sandboxId);
     try {
-      await this.doDestroyHubSandbox(sb, reason);
+      await this.doDestroyHubSandbox(sb, reason, opts.pull !== false);
     } finally {
       this.destroyingSandboxes.delete(sandboxId);
     }
   }
 
-  private async doDestroyHubSandbox(sb: HubSandboxRecord, reason: string): Promise<void> {
+  private async doDestroyHubSandbox(sb: HubSandboxRecord, reason: string, pull: boolean): Promise<void> {
     const sandboxId = sb.sandboxId;
     console.log(`[hub] destroying sandbox ${sandboxId} (project=${sb.project}, reason=${reason})`);
 
     // Best effort, bounded (~10s): the CLI may have refreshed the token since it was captured
-    if (sb.phase === "running") {
+    if (pull && sb.phase === "running") {
       await this.lifecycle.providerSessions.pullBeforeDestroy(sandboxId).catch(() => {});
     }
+    const { klavAgent } = this.forgetHubSandboxLocally(sb, reason);
+
+    if (klavAgent && this.klav) {
+      await this.klav.revokeForSandbox(klavAgent).catch((err) => {
+        console.warn(`[hub] Klav revoke failed for ${klavAgent}:`, err);
+      });
+    }
+
+    this.state.queueDelete(sandboxId, `hub:${reason}`, klavAgent);
+    await this.boat.delete(sandboxId).catch((err) => {
+      console.warn(`[hub] delete failed for ${sandboxId} (queued for reaper):`, err);
+    });
+    void this.lifecycle.reaperTick();
+  }
+
+  /**
+   * The Hub's half of a destroy: forgets the sandbox (bridge, media sockets, routes, wake and settings
+   * state) and removes its chats from the sidebar (`thread.removed`). Klav and Boat are left to the caller.
+   */
+  private forgetHubSandboxLocally(sb: HubSandboxRecord, reason: string): { klavAgent: string | null } {
+    const sandboxId = sb.sandboxId;
     this.lifecycle.providerSessions.forgetSandbox(sandboxId);
     this.providerBook.forgetSandbox(sandboxId);
     this.providerSetupRouter.forgetSandbox(sandboxId);
@@ -4420,17 +4963,23 @@ export class HubServer {
     this.settingsReplays.delete(sandboxId);
     this.replayedSettings.delete(sandboxId);
     this.wakeStatus.delete(sandboxId);
+    this.clearPauseRetry(sandboxId);
+    this.parkCacheMisses.delete(sandboxId);
+    this.unparkedAt.delete(sandboxId);
+    this.lastRelayRepairAt.delete(sandboxId);
 
-    // Threads may have been bound while the pull ran
+    // Threads may have been bound while a teardown pull ran
     const current = this.state.getHubSandbox(sandboxId) ?? sb;
     const threadIds = [...current.threadIds];
     const worktreePaths = [...current.worktreePaths];
-    const klavAgent = current.klavAgentName;
+    const klavAgent = current.klavAgentName ?? null;
 
     this.state.removeHubSandbox(sandboxId);
     this.mcp.recordThreadsDestroyed(threadIds, reason);
     for (const tid of threadIds) {
       this.threadToSandbox.delete(tid);
+      this.heldBookkeeping.delete(tid);
+      this.recordedReads.delete(tid);
       this.deleteThreadShell(tid);
       this.localThreadSubs.delete(tid);
       this.dropProjectionCache(tid);
@@ -4447,18 +4996,30 @@ export class HubServer {
     for (const [attachmentId, owner] of this.attachmentToSandbox) {
       if (owner === sandboxId) this.attachmentToSandbox.delete(attachmentId);
     }
+    return { klavAgent };
+  }
 
-    if (klavAgent && this.klav) {
-      await this.klav.revokeForSandbox(klavAgent).catch((err) => {
-        console.warn(`[hub] Klav revoke failed for ${klavAgent}:`, err);
-      });
+  /**
+   * The reaper found a (not parked) VM Boat no longer lists, e.g. deleted in Boat's UI: its chats
+   * leave the sidebar and the Hub forgets it, as after a destroy. Nothing is left to delete in Boat.
+   */
+  async forgetVanishedSandbox(sandboxId: string): Promise<void> {
+    const sb = this.state.getHubSandbox(sandboxId);
+    if (!sb || this.destroyingSandboxes.has(sandboxId)) return;
+    // A wake or sleep in flight settles it itself (a resume of a missing VM reports its disk gone)
+    if (this.inFlightWakes.has(sandboxId) || this.inFlightSleeps.has(sandboxId)) return;
+    this.destroyingSandboxes.add(sandboxId);
+    try {
+      console.warn(`[hub] sandbox ${sandboxId} (${sb.project}) no longer exists in ${this.boat.name}; removing its chat(s)`);
+      const { klavAgent } = this.forgetHubSandboxLocally(sb, "vanished-remotely");
+      if (klavAgent && this.klav) {
+        await this.klav.revokeForSandbox(klavAgent).catch((err) => {
+          console.warn(`[hub] Klav revoke failed for ${klavAgent}: ${redactForLog(err)}`);
+        });
+      }
+    } finally {
+      this.destroyingSandboxes.delete(sandboxId);
     }
-
-    this.state.queueDelete(sandboxId, `hub:${reason}`, klavAgent);
-    await this.boat.delete(sandboxId).catch((err) => {
-      console.warn(`[hub] delete failed for ${sandboxId} (queued for reaper):`, err);
-    });
-    void this.lifecycle.reaperTick();
   }
 
   async handleWatchdogEvent(payload: WatchdogEventPayload): Promise<void> {
@@ -4492,6 +5053,85 @@ export class HubServer {
     }
   }
 
+  /**
+   * Re-exposes a running VM's T3 port when its bridge cannot connect. Inside the VM T3 listens on
+   * 127.0.0.1 only and Boat's localhost relay carries it; an in-VM `host <port>` without `--localhost`
+   * drops that relay, and Boat's edge then answers 502 forever. The same `exposePort` the spawn uses
+   * brings it back; the record adopts whatever endpoint it returns and the bridge reconnects to it.
+   * Skipped for a VM that is sleeping, waking or being destroyed, or that Boat does not report running.
+   * `bridge` repairs run at most once per `relayRepairBackoffMs`; a `close` asks once regardless.
+   */
+  private repairLocalhostRelay(sandboxId: string, trigger: "bridge" | "close"): Promise<boolean> {
+    const existing = this.relayRepairs.get(sandboxId);
+    if (existing) return existing;
+    if (!this.relayRepairAllowed(sandboxId)) return Promise.resolve(false);
+    const last = this.lastRelayRepairAt.get(sandboxId);
+    if (trigger === "bridge" && last !== undefined && Date.now() - last < this.relayRepairBackoffMs) {
+      return Promise.resolve(false);
+    }
+    this.lastRelayRepairAt.set(sandboxId, Date.now());
+    const promise = this.doRepairLocalhostRelay(sandboxId, trigger)
+      .catch((err) => {
+        console.warn(`[hub] relay repair of ${sandboxId} failed: ${redactForLog(err)}`);
+        return false;
+      })
+      .finally(() => this.relayRepairs.delete(sandboxId));
+    this.relayRepairs.set(sandboxId, promise);
+    return promise;
+  }
+
+  private relayRepairAllowed(sandboxId: string): boolean {
+    const sb = this.state.getHubSandbox(sandboxId);
+    return (
+      !!sb &&
+      sb.phase === "running" &&
+      typeof this.boat.exposePort === "function" &&
+      !this.inFlightSleeps.has(sandboxId) &&
+      !this.inFlightWakes.has(sandboxId) &&
+      !this.destroyingSandboxes.has(sandboxId)
+    );
+  }
+
+  private async doRepairLocalhostRelay(sandboxId: string, trigger: "bridge" | "close"): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`timed out after ${this.relayRepairTimeoutMs}ms`)), this.relayRepairTimeoutMs);
+    });
+    try {
+      // The VM's watchdog may have stopped it while the record still says running (until the reaper's next tick)
+      const info = await Promise.race([this.boat.info(sandboxId), timeout]).catch(() => null);
+      if (!isLiveSandboxState(info?.state)) {
+        console.warn(`[hub] not repairing the relay of ${sandboxId}: ${this.boat.name} reports it ${info?.state ?? "missing"}`);
+        return false;
+      }
+      if (!this.relayRepairAllowed(sandboxId)) return false;
+      const endpoint = await Promise.race([
+        this.boat.exposePort(sandboxId, 3773, { visibility: this.config.boat.hostVisibility }),
+        timeout,
+      ]);
+      // A sleep or destroy may have started meanwhile; it owns the bridge now
+      if (!this.relayRepairAllowed(sandboxId)) return false;
+      const updated = this.state.updateHubSandbox(sandboxId, (s) => {
+        s.upstreamUrl = endpoint.url;
+        s.upstreamHeaders = endpoint.headers ?? null;
+      });
+      if (!updated) return false;
+      const bridge = this.bridges.get(sandboxId);
+      if (bridge) bridge.retarget(updated);
+      else this.attachBridge(updated);
+      let host = endpoint.url;
+      try {
+        host = new URL(endpoint.url).host;
+      } catch {
+        // keep the raw value
+      }
+      console.log(`[hub] repaired the localhost relay of ${sandboxId} (${trigger}): port 3773 exposed again at ${host}; reconnecting`);
+      return true;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   private attachBridge(sb: HubSandboxRecord): void {
     this.bridges.get(sb.sandboxId)?.stop();
     const bridge = new HubVmBridge(
@@ -4505,23 +5145,30 @@ export class HubServer {
         this.adoptKeepOpenStreams(sandboxId);
         this.adoptFanoutStreams(sandboxId);
         this.adoptDiscoveredServersStreams(sandboxId);
+        this.handOffLocalVcsStreams(sandboxId);
         if (this.lastPreviewProfiles !== undefined) {
           void this.bridges.get(sandboxId)?.callUnary("preview.reportProfiles", this.lastPreviewProfiles, 10_000);
         }
         this.replaySettingsOverlay(sandboxId);
+      },
+      {
+        reconnectMs: () => this.bridgeReconnectMs,
+        onConnectFailure: (sandboxId, failures) => {
+          if (failures >= this.relayRepairAfterFailures) void this.repairLocalhostRelay(sandboxId, "bridge");
+        },
       },
     );
     this.bridges.set(sb.sandboxId, bridge);
     bridge.start();
   }
 
-  private async ensureBridgeOpen(sb: HubSandboxRecord): Promise<HubVmBridge> {
+  private async ensureBridgeOpen(sb: HubSandboxRecord, timeoutMs = 20_000): Promise<HubVmBridge> {
     let bridge = this.bridges.get(sb.sandboxId);
     if (!bridge) {
       this.attachBridge(sb);
       bridge = this.bridges.get(sb.sandboxId)!;
     }
-    await bridge.waitUntilOpen(20_000);
+    await bridge.waitUntilOpen(timeoutMs);
     return bridge;
   }
 
