@@ -9,7 +9,10 @@ import {
   SlotAuth,
   authenticateClient,
   hashToken,
+  isAuthMcpClientAccess,
+  mcpClientScopes,
   randomToken,
+  type AuthMcpClientAccess,
   type TicketUse,
 } from "./auth.ts";
 import {
@@ -33,6 +36,7 @@ import {
   type SentinelConfig,
 } from "./config.ts";
 import { HubMcpHandler, formatRpcFailure, type HubParkRequest, type HubSandboxPhase } from "./hub-mcp.ts";
+import { HubMcpOAuthHandler } from "./hub-mcp-oauth.ts";
 import { isChildThreadRow, parkBlocker } from "./hub-park-guard.ts";
 import { HubStagedAttachmentStore } from "./hub-staged-store.ts";
 import {
@@ -1182,6 +1186,8 @@ export class HubServer {
 
   private readonly boat: SandboxProvider;
   private readonly mcp: HubMcpHandler;
+  private readonly mcpOAuth: HubMcpOAuthHandler;
+  private authAccessRevision = 0;
 
   constructor(
     private readonly config: SentinelConfig,
@@ -1273,8 +1279,15 @@ export class HubServer {
         },
         providerName: () => this.boat.name,
         anyRunningSandbox: () => this.anyRunningSandbox(),
+        getCachedProjection: (threadId) => this.readProjectionCache(threadId) ?? undefined,
+        getServerConfig: () => this.buildHubServerConfig(),
+        buildProjectShell: (key, proj) => this.buildProjectShell(key, proj),
+        nextSequence: () => this.state.nextHubSequence(),
       },
       rateLimiter,
+    );
+    this.mcpOAuth = new HubMcpOAuthHandler(config, state, this.auth, rateLimiter, () =>
+      this.broadcastAuthAccessSnapshot(),
     );
     // What sleeping chats show follows the wake transitions: waking, then handed to the VM or why it failed
     this.onWakeTransition((e) => {
@@ -1388,11 +1401,13 @@ export class HubServer {
   private setThreadShell(threadId: string, row: Record<string, unknown>): void {
     this.threadShells.set(threadId, row);
     this.shellStore.save(threadId, row);
+    this.mcp.notifyThreadChanged(threadId);
   }
 
   private deleteThreadShell(threadId: string): void {
     this.threadShells.delete(threadId);
     this.shellStore.remove(threadId);
+    this.mcp.notifyThreadChanged(threadId);
   }
 
   stop(): void {
@@ -1747,8 +1762,17 @@ export class HubServer {
     const caps: Record<string, unknown> = {
       ...((base.capabilities as Record<string, unknown> | undefined) ?? {}),
       projectCloneTracking: true,
+      mcpModeLimitHeader: true,
+      linkFence: true,
+      peerLinkPairingCodes: true,
     };
     delete caps.accessTokenRenewal;
+    // Strip capabilities harvested from VM templates that the Hub HTTP layer does not serve directly
+    delete caps.linkThreadStream;
+    delete caps.linkClientPairing;
+    delete caps.linkPairingForLink;
+    delete caps.mcpHostedApproval;
+    delete caps.mcpApprovalCodes;
     if (this.config.hub?.preview?.mode === "desktop-proxy") delete caps.serverBrowser;
     return {
       ...base,
@@ -1758,32 +1782,65 @@ export class HubServer {
     };
   }
 
-  /** `subscribeAuthAccess` snapshot: the Hub's paired clients as bearer-token sessions; no pairing links. */
+  /** `subscribeAuthAccess` snapshot: paired clients (including peer links) and active pairing codes. */
   private buildAuthAccessSnapshot(currentClientId: string): Record<string, unknown> {
     const hub = this.state.getHub();
     const connectedIds = new Set(Array.from(this.clients, (c) => c.data.clientId));
     const session = this.buildAuthSession();
+    const legacySet = new Set<string>(DEFAULT_T3_SCOPES);
+    const filterLegacy = (perms: readonly string[]): string[] => perms.filter((s) => legacySet.has(s));
+    const pairingLinks = this.auth.listPairingLinks().map((entry) => {
+      const perms = entry.scopes ?? [...DEFAULT_T3_PERMISSIONS];
+      return {
+        id: entry.id,
+        scopes: filterLegacy(perms),
+        permissions: perms,
+        subject: entry.purpose === "peer-link" ? "peer-link" : "pairing",
+        ...(entry.label ? { label: entry.label } : {}),
+        createdAt: entry.createdAt,
+        expiresAt: entry.expiresAt,
+      };
+    });
     return {
       version: 1,
-      revision: hub?.clients.length ?? 0,
+      revision: Math.max(this.authAccessRevision, (hub?.clients.length ?? 0) + pairingLinks.length),
       type: "snapshot",
       payload: {
-        pairingLinks: [],
-        clientSessions: (hub?.clients ?? []).map((c) => ({
-          sessionId: c.id,
-          subject: c.label,
-          scopes: session.scopes,
-          permissions: session.permissions,
-          method: "bearer-access-token",
-          client: { label: c.label, deviceType: "unknown" },
-          issuedAt: c.pairedAt,
-          expiresAt: session.expiresAt, // rolling, as `/api/auth/session` reports it
-          lastConnectedAt: null,
-          connected: connectedIds.has(c.id),
-          current: c.id === currentClientId,
-        })),
+        pairingLinks,
+        clientSessions: (hub?.clients ?? []).map((c) => {
+          const perms = c.access ? mcpClientScopes(c.access) : (session.permissions as string[]);
+          const scopes = c.access ? filterLegacy(perms) : (session.scopes as string[]);
+          return {
+            sessionId: c.id,
+            subject: c.label,
+            scopes,
+            permissions: perms,
+            method: "bearer-access-token",
+            client: { label: c.label, deviceType: c.peerLink ? "bot" : "unknown" },
+            issuedAt: c.pairedAt,
+            expiresAt: c.expiresAt ?? session.expiresAt,
+            lastConnectedAt: null,
+            connected: connectedIds.has(c.id),
+            current: c.id === currentClientId,
+          };
+        }),
       },
     };
+  }
+
+  private broadcastAuthAccessSnapshot(): void {
+    this.authAccessRevision += 1;
+    for (const client of this.clients) {
+      for (const [, sub] of client.data.localStreams) {
+        if (sub.tag === "subscribeAuthAccess") {
+          sendRpcFrame(client, {
+            _tag: "Chunk",
+            requestId: sub.rawId,
+            values: [this.buildAuthAccessSnapshot(client.data.clientId)],
+          });
+        }
+      }
+    }
   }
 
   private buildAuthSession(): Record<string, unknown> {
@@ -1994,6 +2051,10 @@ export class HubServer {
     if (path === "/mcp" || path === "/mcp/") {
       return this.mcp.handleHttp(req);
     }
+    const mcpOAuthResponse = await this.mcpOAuth.handleHttp(req, url);
+    if (mcpOAuthResponse) {
+      return withCors(mcpOAuthResponse);
+    }
     const ip = clientIpFromRequest(req);
     const hub = this.state.ensureHub(this.config.hub?.label ?? "Boat", Object.keys(this.state.getAllProjects(this.config)));
 
@@ -2026,6 +2087,7 @@ export class HubServer {
           lastSyncedSandboxId: null,
         });
       });
+      this.broadcastAuthAccessSnapshot();
       const session = this.buildAuthSession();
       const scopes = (session.scopes as string[]).join(" ");
       console.log(`[hub] paired new T3 client (${label})`);
@@ -2042,10 +2104,155 @@ export class HubServer {
 
     // 3. Session probe
     if (req.method === "GET" && path === "/api/auth/session") {
-      if (!authenticateClient(hub.clients, req.headers)) {
+      const client = authenticateClient(hub.clients, req.headers);
+      if (!client) {
         return withCors(Response.json({ error: "unauthorized" }, { status: 401 }));
       }
-      return withCors(Response.json(this.buildAuthSession()));
+      return withCors(Response.json({ ...this.buildAuthSession(), sessionId: client.id }));
+    }
+
+    // 3b. Mint a pairing code (interactive or peer-link) for T3 Desktop Settings / LinkRequestCard
+    if (req.method === "POST" && path === "/api/auth/pairing-token") {
+      const client = authenticateClient(hub.clients, req.headers);
+      if (!client) return withCors(Response.json({ error: "unauthorized" }, { status: 401 }));
+      let body: Record<string, unknown> = {};
+      try {
+        const text = await req.text();
+        if (text.trim()) {
+          const parsed = JSON.parse(text);
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            return withCors(Response.json({ error: "invalid_request", message: "Expected a JSON object" }, { status: 400 }));
+          }
+          body = parsed as Record<string, unknown>;
+        }
+      } catch {
+        return withCors(Response.json({ error: "invalid_request", message: "Invalid JSON body" }, { status: 400 }));
+      }
+      const rawLabel = body.label;
+      let label: string | undefined;
+      if (rawLabel !== undefined) {
+        if (typeof rawLabel !== "string" || !rawLabel.trim()) {
+          return withCors(Response.json({ error: "invalid_request", message: "label must be a non-empty string" }, { status: 400 }));
+        }
+        label = rawLabel.trim();
+      }
+      const rawPurpose = body.purpose;
+      if (rawPurpose !== undefined && rawPurpose !== "peer-link") {
+        return withCors(Response.json({ error: "invalid_request", message: "Unsupported pairing purpose" }, { status: 400 }));
+      }
+      const rawAccess = body.access;
+      if (rawAccess !== undefined && !isAuthMcpClientAccess(rawAccess)) {
+        return withCors(Response.json({ error: "invalid_request", message: "Invalid access level" }, { status: 400 }));
+      }
+      if (rawPurpose === "peer-link" && !rawAccess) {
+        return withCors(Response.json({ error: "invalid_request", message: "peer-link pairing codes require an access level" }, { status: 400 }));
+      }
+      const rawScopes = body.scopes;
+      let scopes: string[] | undefined;
+      if (rawScopes !== undefined) {
+        if (!Array.isArray(rawScopes) || !rawScopes.every((s) => typeof s === "string")) {
+          return withCors(Response.json({ error: "invalid_request", message: "scopes must be an array of strings" }, { status: 400 }));
+        }
+        scopes = rawScopes as string[];
+      }
+      const issued = this.auth.newPairingCode({
+        label,
+        access: rawAccess as AuthMcpClientAccess | undefined,
+        purpose: rawPurpose === "peer-link" ? "peer-link" : undefined,
+        scopes,
+      });
+      this.broadcastAuthAccessSnapshot();
+      const result: Record<string, unknown> = {
+        id: issued.id,
+        credential: issued.code,
+        ...(issued.label ? { label: issued.label } : {}),
+        expiresAt: issued.expiresAt,
+        ...(issued.purpose ? { purpose: issued.purpose } : {}),
+        ...(issued.access ? { access: issued.access } : {}),
+      };
+      return withCors(
+        Response.json(result, {
+          headers: { "cache-control": "no-store", pragma: "no-cache" },
+        }),
+      );
+    }
+
+    // 3c. Revoke an active pairing link
+    if (req.method === "POST" && path === "/api/auth/pairing-links/revoke") {
+      const client = authenticateClient(hub.clients, req.headers);
+      if (!client) return withCors(Response.json({ error: "unauthorized" }, { status: 401 }));
+      let body: { id?: unknown };
+      try {
+        body = (await req.json()) as { id?: unknown };
+      } catch {
+        return withCors(Response.json({ error: "invalid_request" }, { status: 400 }));
+      }
+      if (typeof body?.id !== "string" || !body.id.trim()) {
+        return withCors(Response.json({ error: "invalid_request", message: "id is required" }, { status: 400 }));
+      }
+      const revoked = this.auth.revokePairingLink(body.id.trim());
+      if (revoked) this.broadcastAuthAccessSnapshot();
+      return withCors(Response.json({ revoked }));
+    }
+
+    // 3d. Revoke a paired client or peer-link session
+    if (req.method === "POST" && path === "/api/auth/clients/revoke") {
+      const client = authenticateClient(hub.clients, req.headers);
+      if (!client) return withCors(Response.json({ error: "unauthorized" }, { status: 401 }));
+      let body: { sessionId?: unknown };
+      try {
+        body = (await req.json()) as { sessionId?: unknown };
+      } catch {
+        return withCors(Response.json({ error: "invalid_request" }, { status: 400 }));
+      }
+      if (typeof body?.sessionId !== "string" || !body.sessionId.trim()) {
+        return withCors(Response.json({ error: "invalid_request", message: "sessionId is required" }, { status: 400 }));
+      }
+      const targetId = body.sessionId.trim();
+      if (targetId === client.id) {
+        return withCors(
+          Response.json(
+            {
+              _tag: "EnvironmentOperationForbiddenError",
+              reason: "current_session_revoke_not_allowed",
+              message: "Cannot revoke the current session.",
+            },
+            { status: 403 },
+          ),
+        );
+      }
+      let revoked = false;
+      this.state.updateHub((h) => {
+        const before = h.clients.length;
+        h.clients = h.clients.filter((c) => c.id !== targetId);
+        revoked = h.clients.length < before;
+      });
+      if (revoked) {
+        for (const ws of this.clients) {
+          if (ws.data.clientId === targetId) ws.close(4001, "Session revoked");
+        }
+        this.broadcastAuthAccessSnapshot();
+      }
+      return withCors(Response.json({ revoked }));
+    }
+
+    // 3e. Revoke all other client sessions
+    if (req.method === "POST" && path === "/api/auth/clients/revoke-others") {
+      const client = authenticateClient(hub.clients, req.headers);
+      if (!client) return withCors(Response.json({ error: "unauthorized" }, { status: 401 }));
+      let revokedCount = 0;
+      this.state.updateHub((h) => {
+        const before = h.clients.length;
+        h.clients = h.clients.filter((c) => c.id === client.id);
+        revokedCount = before - h.clients.length;
+      });
+      if (revokedCount > 0) {
+        for (const ws of this.clients) {
+          if (ws.data.clientId !== client.id) ws.close(4001, "Session revoked");
+        }
+        this.broadcastAuthAccessSnapshot();
+      }
+      return withCors(Response.json({ revokedCount }));
     }
 
     // 4. WebSocket tickets
@@ -4173,6 +4380,7 @@ export class HubServer {
         thread: this.servedShellRow(threadId, row),
       });
       this.pushHeldTurnsView(threadId);
+      this.mcp.notifyThreadChanged(threadId);
     }
   }
 
@@ -5791,6 +5999,7 @@ export class HubServer {
       s.parkedAt = park ? now : null;
     });
     this.announceStoppedRuns(sandboxId);
+    for (const tid of sb.threadIds) this.mcp.notifyThreadChanged(tid);
   }
 
   /** `pull: false` skips the teardown read of provider sign-ins (a VM that cannot be reached). */
@@ -7599,8 +7808,11 @@ function withCors(res: Response): Response {
   headers.set("access-control-allow-methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
   headers.set(
     "access-control-allow-headers",
-    "authorization, b3, traceparent, content-type, dpop, x-t3-orchestration-protocol",
+    "authorization, b3, traceparent, content-type, dpop, x-t3-orchestration-protocol, t3-mode-limit, t3-sender-thread",
   );
+  if (!headers.has("access-control-expose-headers")) {
+    headers.set("access-control-expose-headers", "t3-link-expires-at");
+  }
   headers.set("access-control-max-age", "600");
   return applySecurityHeaders(new Response(res.body, { status: res.status, statusText: res.statusText, headers }));
 }
