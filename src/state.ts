@@ -168,10 +168,16 @@ export interface HubHeldTurnsRecord {
     runId: string;
     payload: Record<string, unknown>;
     requestedAt: string;
-    status: "queued" | "failed";
+    status: "queued" | "sent" | "failed";
   }>;
-  /** The redacted reason of the wake that failed them, if any. */
+  /** The redacted reason of the wake (or the delivery) that failed them, if any. */
   error: string | null;
+  /**
+   * The VM was up but did not take a held message (it refused it, or it could not be reached after
+   * retries): that message and the ones after it are failed, and the chat keeps the Hub's view (with
+   * them) until the user's next message. Never delivered again, also after a Hub restart.
+   */
+  failedDelivery?: boolean;
   createdAt: string;
 }
 

@@ -1110,6 +1110,13 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       failProjection?: boolean;
       /** `orchestration.dispatchCommand` of these command types fails, like a VM that refuses it. */
       failCommands?: string[];
+      /** A `message.dispatch` of these message ids fails, like a VM that refuses it (the list may change). */
+      refuseMessages?: string[];
+      /**
+       * A `message.dispatch` of these message ids is taken, then the socket drops before the answer
+       * (once per id). Like T3, a `commandId` already taken is answered from its receipt, not run again.
+       */
+      dropAfterAccept?: string[];
       /** Attachment ids this VM holds: `assets.createUrl` for any other attachment fails as T3 does. */
       attachments?: string[];
       /**
@@ -1128,6 +1135,9 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     const threads = new Map<string, Record<string, unknown>>();
     let vmSettings = (opts.configSnapshot?.settings ?? null) as Record<string, unknown> | null;
     const seenMethods: Array<{ tag: string; payload: unknown }> = [];
+    /** The `message.dispatch` commands this VM took (each `commandId` once, like T3's receipts). */
+    const acceptedMessages: Array<Record<string, unknown>> = [];
+    const dropped = new Set<string>();
     const acks: string[] = [];
     const vmProjectId = `vm-proj-${vmTag}`;
     /** This VM's project as T3 lists it in a shell snapshot (every key `OrchestrationProjectShell` requires). */
@@ -1400,6 +1410,25 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
             ws.sendText(JSON.stringify({ _tag: "Chunk", requestId: frame.id, values: [{ tasks: [] }] }));
             return;
           }
+          if (frame.tag === "orchestration.dispatchCommand" && frame.payload?.type === "message.dispatch") {
+            const messageId = String(frame.payload.messageId);
+            if (opts.refuseMessages?.includes(messageId)) {
+              ws.sendText(
+                JSON.stringify({
+                  _tag: "Exit",
+                  requestId: frame.id,
+                  exit: { _tag: "Failure", cause: [{ _tag: "Fail", error: { _tag: "OrchestrationV2DispatchCommandError", message: `refused ${messageId}` } }] },
+                }),
+              );
+              return;
+            }
+            if (!acceptedMessages.some((m) => m.commandId === frame.payload!.commandId)) acceptedMessages.push(frame.payload);
+            if (opts.dropAfterAccept?.includes(messageId) && !dropped.has(messageId)) {
+              dropped.add(messageId);
+              ws.close();
+              return;
+            }
+          }
           if (frame.tag === "orchestration.dispatchCommand" && opts.failCommands?.includes(String(frame.payload?.type))) {
             ws.sendText(
               JSON.stringify({
@@ -1559,6 +1588,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       server,
       url: `http://127.0.0.1:${server.port}`,
       seenMethods,
+      acceptedMessages,
       acks,
       vmProjectId,
       pushConfigItems,
@@ -3233,6 +3263,155 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       );
       await Bun.sleep(150);
       expect(vmMessages(vm, seenBefore)).toEqual([]);
+    });
+
+    // ── A held message the up VM does not take: shown failed, never lost ──
+    const DELIVERY_FAILED =
+      "This chat's VM did not take a queued message, so it and the ones after it were not sent. Send a message to continue.";
+    const runOf = (f: Record<string, unknown>, messageId: string) => heldProjectionOf(f)!.runs.find((r) => r.userMessageId === messageId);
+    const handedToVm = (vm: { seenMethods: Array<{ tag: string; payload: unknown }> }, from: number) =>
+      vm.seenMethods.slice(from).some((m) => m.tag === "orchestration.subscribeThread");
+    /** A sleeping chat whose two held messages the VM refuses (the first one), with the chat's view open. */
+    async function refusedDelivery(prefix: string) {
+      const chat = await sleepingChat(prefix, { refuseMessages: ["msg-f1"] });
+      const { vm, client, boat } = chat;
+      const seenBefore = vm.seenMethods.length;
+      const release = holdWake(boat);
+      client.request("sub", "orchestration.subscribeThread", { threadId: "thread-zz" });
+      await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "sub");
+      client.request("s1", "orchestration.dispatchCommand", appMessage("thread-zz", "f1", "Refused"));
+      client.request("s2", "orchestration.dispatchCommand", appMessage("thread-zz", "f2", "After it", true));
+      for (const id of ["s1", "s2"]) expect(await exitTag(client, id)).toBe("Success");
+      await client.waitForFrame(threadChunk("sub", (_n, f) => queuedRunsOf(f).length === 2));
+      release();
+      const failed = await client.waitForFrame(threadChunk("sub", (n) => n?.summary === DELIVERY_FAILED), 5_000);
+      return { ...chat, seenBefore, failed };
+    }
+
+    test("the VM refuses a held message: it and the ones after it show failed with the reason; sent ones stay; no hand-off", async () => {
+      const { vm, client, boat, handle, sandboxId } = await sleepingChat("vm-held-refuse", { refuseMessages: ["msg-r2"] });
+      const seenBefore = vm.seenMethods.length;
+      const release = holdWake(boat);
+      client.request("sub", "orchestration.subscribeThread", { threadId: "thread-zz" });
+      await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "sub");
+      client.request("s1", "orchestration.dispatchCommand", appMessage("thread-zz", "r1", "Goes through"));
+      client.request("s2", "orchestration.dispatchCommand", appMessage("thread-zz", "r2", "Refused", true));
+      client.request("s3", "orchestration.dispatchCommand", appMessage("thread-zz", "r3", "After it", true));
+      for (const id of ["s1", "s2", "s3"]) expect(await exitTag(client, id)).toBe("Success");
+      await client.waitForFrame(threadChunk("sub", (_n, f) => queuedRunsOf(f).length === 3));
+      release();
+
+      const failed = await client.waitForFrame(threadChunk("sub", (n) => n?.summary === DELIVERY_FAILED), 5_000);
+      const notice = noticeOf(failed)!;
+      expect(notice.outcome).toBe("failed");
+      expect(notice.detail).toContain("refused msg-r2");
+      // The one sent before stays sent; the refused one and the one after it are failed, in the timeline
+      expect(runOf(failed, "msg-r1")?.status).toBe("completed");
+      expect(runOf(failed, "msg-r2")?.status).toBe("failed");
+      expect(runOf(failed, "msg-r3")?.status).toBe("failed");
+      expect(queuedRunsOf(failed)).toEqual([]);
+      const timeline = heldProjectionOf(failed)!.visibleTurnItems.map((r) => r.item.messageId).filter((id) => id?.startsWith("msg-"));
+      expect(timeline).toEqual(["msg-r1", "msg-r2", "msg-r3"]);
+      if (t3Contracts) for (const r of t3Contracts.decodeFrame("orchestration.subscribeThread", failed)) expect(r).toEqual({ ok: true });
+      // The VM took the first only; the one after the refusal was never sent
+      expect(vm.acceptedMessages.map((m) => m.messageId)).toEqual(["msg-r1"]);
+      expect(vmMessages(vm, seenBefore).map((m) => m.messageId)).toEqual(["msg-r1", "msg-r2"]);
+      // The view stays the Hub's: not handed to the VM, and a re-opened view gets the failed one too
+      await Bun.sleep(150);
+      expect(handedToVm(vm, seenBefore)).toBe(false);
+      client.request("sub2", "orchestration.subscribeThread", { threadId: "thread-zz" });
+      const reopened = await client.waitForFrame(threadChunk("sub2", (n) => n?.summary === DELIVERY_FAILED), 1_000);
+      expect(runOf(reopened, "msg-r2")?.status).toBe("failed");
+      // A queued-run action on a failed message says why; the failed record is kept as is
+      client.request("cancel", "orchestration.dispatchCommand", {
+        type: "queued-run.cancel",
+        commandId: "cmd-cancel-failed",
+        threadId: "thread-zz",
+        runId: runOf(failed, "msg-r3")!.id,
+      });
+      expect(await exitTag(client, "cancel")).toBe("Failure");
+      expect(handle.state.getHub()?.heldTurns?.["thread-zz"]).toMatchObject({ failedDelivery: true });
+
+      // Its VM still sleeps when idle; the chat keeps showing the failure while it sleeps
+      await handle.hub!.sleepHubSandbox(sandboxId);
+      expect(handle.state.getHub()?.heldTurns?.["thread-zz"]?.failedDelivery).toBe(true);
+      client.request("sub3", "orchestration.subscribeThread", { threadId: "thread-zz" });
+      await client.waitForFrame(threadChunk("sub3", (n) => n?.summary === DELIVERY_FAILED), 1_000);
+      // The next message clears it, wakes the VM, is delivered and hands the views over
+      const seenAsleep = vm.seenMethods.length;
+      client.request("next", "orchestration.dispatchCommand", appMessage("thread-zz", "r4", "Next"));
+      expect(await exitTag(client, "next")).toBe("Success");
+      await until(() => vmMessages(vm, seenAsleep).length === 1);
+      expect(vmMessages(vm, seenAsleep).map((m) => m.messageId)).toEqual(["msg-r4"]);
+      await until(() => handedToVm(vm, seenAsleep));
+      await until(() => handle.state.getHub()?.heldTurns === undefined);
+    });
+
+    test("a VM bridge drop while a held message is sent is retried with the same command; the VM takes it once", async () => {
+      const { vm, client, boat, handle } = await sleepingChat("vm-held-drop", { dropAfterAccept: ["msg-d1"] });
+      handle.hub!.bridgeReconnectMs = 20;
+      handle.hub!.heldTurnRetryMs = 20;
+      const seenBefore = vm.seenMethods.length;
+      const release = holdWake(boat);
+      client.request("sub", "orchestration.subscribeThread", { threadId: "thread-zz" });
+      await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "sub");
+      client.request("s1", "orchestration.dispatchCommand", appMessage("thread-zz", "d1", "Dropped once"));
+      client.request("s2", "orchestration.dispatchCommand", appMessage("thread-zz", "d2", "Then this", true));
+      for (const id of ["s1", "s2"]) expect(await exitTag(client, id)).toBe("Success");
+      release();
+
+      await until(() => vm.acceptedMessages.length === 2);
+      await until(() => handedToVm(vm, seenBefore));
+      // The first was sent twice with the same command (the VM took it before the drop), and taken once
+      const sends = vmMessages(vm, seenBefore);
+      expect(sends.map((m) => m.commandId)).toEqual(["cmd-d1", "cmd-d1", "cmd-d2"]);
+      expect(sends[0]).toEqual(sends[1]);
+      expect(vm.acceptedMessages.map((m) => m.messageId)).toEqual(["msg-d1", "msg-d2"]);
+      expect(client.inbox.some((f) => f._tag === "Chunk" && f.requestId === "sub" && noticeOf(f)?.outcome === "failed")).toBe(false);
+      await until(() => handle.state.getHub()?.heldTurns === undefined);
+    });
+
+    test("after a failed delivery, the user's next message reaches the up VM and the open view hands over to it", async () => {
+      const { vm, client, handle, failed } = await refusedDelivery("vm-held-next");
+      expect(runOf(failed, "msg-f1")?.status).toBe("failed");
+      expect(runOf(failed, "msg-f2")?.status).toBe("failed");
+      expect(vm.acceptedMessages).toEqual([]);
+      const seenFailed = vm.seenMethods.length;
+
+      client.request("next", "orchestration.dispatchCommand", appMessage("thread-zz", "n1", "Trying again"));
+      expect(await exitTag(client, "next", 5_000)).toBe("Success");
+      expect(vm.acceptedMessages.map((m) => m.messageId)).toEqual(["msg-n1"]);
+      // Sent first, then the open view moves to the VM (a full snapshot: it had the Hub's copy)
+      await until(() => handedToVm(vm, seenFailed));
+      const after = vm.seenMethods.slice(seenFailed);
+      const sentAt = after.findIndex((m) => m.tag === "orchestration.dispatchCommand");
+      const handedAt = after.findIndex((m) => m.tag === "orchestration.subscribeThread");
+      expect(handedAt).toBeGreaterThan(sentAt);
+      expect("afterSequence" in (after[handedAt].payload as Record<string, unknown>)).toBe(false);
+      expect(handle.state.getHub()?.heldTurns).toBeUndefined();
+      // A view opened now is the VM's
+      client.request("sub2", "orchestration.subscribeThread", { threadId: "thread-zz" });
+      await until(() => vm.seenMethods.slice(seenFailed).filter((m) => m.tag === "orchestration.subscribeThread").length === 2);
+    });
+
+    test("a Hub restart with a failed delivery shows it failed and sends nothing", async () => {
+      const { vm, cfg, boat, handle } = await refusedDelivery("vm-held-restart");
+      handle.stop();
+      const seenStopped = vm.seenMethods.length;
+
+      const handle2 = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+      cleanups.push(() => handle2.stop());
+      const client2: HubClient = await connectHubClient(handle2, cfg);
+      client2.request("sub", "orchestration.subscribeThread", { threadId: "thread-zz" });
+      const view = await client2.waitForFrame(threadChunk("sub", (n) => n?.summary === DELIVERY_FAILED), 5_000);
+      expect(noticeOf(view)!.detail).toContain("refused msg-f1");
+      expect(runOf(view, "msg-f1")?.status).toBe("failed");
+      expect(runOf(view, "msg-f2")?.status).toBe("failed");
+      if (t3Contracts) for (const r of t3Contracts.decodeFrame("orchestration.subscribeThread", view)) expect(r).toEqual({ ok: true });
+      await Bun.sleep(200);
+      expect(vmMessages(vm, seenStopped)).toEqual([]);
+      expect(handedToVm(vm, seenStopped)).toBe(false);
+      expect(handle2.state.getHub()?.heldTurns?.["thread-zz"]?.failedDelivery).toBe(true);
     });
 
     test("automations follow the VMs: no failure when the VM sleeps, back on the next VM that opens", async () => {

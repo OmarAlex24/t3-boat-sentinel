@@ -430,8 +430,11 @@ export interface HeldTurn {
   runId: string;
   payload: Record<string, unknown>;
   requestedAt: string;
-  /** `failed` once the wake failed: shown as a failed run, never delivered. */
-  status: "queued" | "failed";
+  /**
+   * `sent` once the VM took it (kept until the chat's view moves to the VM); `failed` once the wake
+   * failed or the VM did not take it: shown as a failed run, never delivered.
+   */
+  status: "queued" | "sent" | "failed";
 }
 
 /** True when a `message.dispatch` payload has what a queued message needs (id, text, attachments). */
@@ -452,7 +455,8 @@ export function isQueueableMessage(payload: Record<string, unknown>): boolean {
  * ordinal, `queuePosition` in order), its user message (the client's own id, so its optimistic copy
  * reconciles) and a `user_message` turn item with `inputIntent: "queued_turn"`. Like T3, a queued
  * message's item is not in `visibleTurnItems` (the app lists it above the composer, with "Send now");
- * a failed one is (a failed run with its message in the timeline, so the user can resend it).
+ * a failed one is (a failed run with its message in the timeline, so the user can resend it). A sent
+ * one the projection does not have yet shows in the timeline as a completed run (the VM took it).
  */
 export function withHeldTurns(
   projection: Record<string, unknown>,
@@ -481,6 +485,7 @@ export function withHeldTurns(
   for (const turn of shown) {
     const p = turn.payload;
     const queued = turn.status === "queued";
+    const runStatus = queued ? "queued" : turn.status === "sent" ? "completed" : "failed";
     const messageId = String(p.messageId);
     const modelSelection =
       p.modelSelection && typeof p.modelSelection === "object" ? (p.modelSelection as Record<string, unknown>) : thread.modelSelection;
@@ -502,7 +507,7 @@ export function withHeldTurns(
       userMessageId: messageId,
       rootNodeId: null,
       activeAttemptId: null,
-      status: queued ? "queued" : "failed",
+      status: runStatus,
       ...(queued ? { queuePosition: ++queuePosition } : {}),
       requestedAt: turn.requestedAt,
       startedAt: null,
@@ -530,7 +535,7 @@ export function withHeldTurns(
       ...creation,
       runId: turn.runId,
       type: "user_message",
-      status: queued ? "pending" : "failed",
+      status: queued ? "pending" : runStatus,
       startedAt: null,
       completedAt: queued ? null : now,
       messageId,
