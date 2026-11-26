@@ -28,6 +28,7 @@ T3_VERSION="${T3_VERSION:-latest}"
 T3_CHANNEL="${T3_CHANNEL:-stable}"
 BAKE_CLEAN="${BAKE_CLEAN:-0}"
 MINT_UPSTREAM_TOKEN="${MINT_UPSTREAM_TOKEN:-0}"
+T3_PREINSTALL_BROWSER="${T3_PREINSTALL_BROWSER:-0}"
 
 t3="$HOME/.local/bin/t3"
 sentinel_dir="$HOME/.t3-sentinel"
@@ -184,6 +185,7 @@ t3_services_stop() {
   if [ "$supervisor_mode" = "1" ]; then
     sup_stop t3
     sup_stop watchdog
+    pkill -f "chrome-headless-shell" 2>/dev/null || true
   else
     systemctl --user stop t3code.service 2>/dev/null || true
     systemctl --user stop t3-sentinel-watchdog.service 2>/dev/null || true
@@ -410,6 +412,181 @@ run_provider_setup() {
     '
 }
 
+# Pre-install T3's pinned headless browser into ~/.t3/tools by using T3 itself: open a temporary
+# server-runtime preview tab, attach to its stream until the browser install completes, then close it.
+preinstall_browser() {
+  local smoke_token="$1" setup_log js_runner
+  echo "[bake] pre-installing T3 headless browser..." >&2
+  setup_log="$sentinel_dir/browser-setup.log"
+  if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    if ! sudo -n -H "$t3" browser setup >"$setup_log" 2>&1; then
+      echo "[bake] WARNING: t3 browser setup with sudo failed; continuing (details in $setup_log)" >&2
+    fi
+  else
+    echo "[bake] WARNING: passwordless sudo is unavailable; browser host setup may be incomplete" >&2
+    if ! "$t3" browser setup >"$setup_log" 2>&1; then
+      echo "[bake] WARNING: unprivileged t3 browser setup failed; continuing (details in $setup_log)" >&2
+    fi
+  fi
+
+  js_runner="node"
+  if command -v bun >/dev/null 2>&1; then js_runner="bun"; elif [ -x "$HOME/.bun/bin/bun" ]; then js_runner="$HOME/.bun/bin/bun"; fi
+  SMOKE_TOK="$smoke_token" BROWSER_ROOT="$HOME/.t3/tools/chrome-headless-shell" timeout 330 "$js_runner" -e '
+    (async () => {
+      const fs = require("fs");
+      const pathMod = require("path");
+      const base = "http://127.0.0.1:3773";
+      const tok = process.env.SMOKE_TOK;
+      const browserRoot = process.env.BROWSER_ROOT;
+      const threadId = "bake-browser-preinstall";
+      const deadline = Date.now() + 300000;
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      const log = (msg) => console.error("[bake] " + msg);
+      if (typeof WebSocket === "undefined") throw new Error("WebSocket global unavailable in JS runtime");
+
+      const issueTicket = async (use) => {
+        const res = await fetch(base + "/api/auth/websocket-ticket/" + use, {
+          method: "POST",
+          headers: { authorization: "Bearer " + tok },
+        });
+        if (!res.ok) throw new Error(use + " websocket ticket failed: HTTP " + res.status);
+        return (await res.json()).ticket;
+      };
+
+      const control = new WebSocket("ws://127.0.0.1:3773/ws?wsTicket=" + encodeURIComponent(await issueTicket("rpc")) + "&orchestrationProtocol=2");
+      await new Promise((resolve, reject) => {
+        control.addEventListener("open", resolve);
+        control.addEventListener("error", () => reject(new Error("local t3 control websocket failed")));
+      });
+      let seq = 1;
+      const waiters = new Map();
+      control.addEventListener("message", (ev) => {
+        const raw = JSON.parse(String(ev.data));
+        for (const frame of Array.isArray(raw) ? raw : [raw]) {
+          if (frame._tag === "Ping") { control.send(JSON.stringify({ _tag: "Pong" })); continue; }
+          if (frame._tag !== "Exit") continue;
+          const waiter = waiters.get(String(frame.requestId));
+          if (!waiter) continue;
+          waiters.delete(String(frame.requestId));
+          waiter(frame.exit);
+        }
+      });
+      const callUnary = (tag, payload, timeoutMs = 30000) => {
+        const id = seq++;
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            waiters.delete(String(id));
+            reject(new Error(tag + " timed out"));
+          }, timeoutMs);
+          waiters.set(String(id), (exit) => {
+            clearTimeout(timer);
+            if (exit && exit._tag === "Success") resolve(exit.value);
+            else reject(new Error(tag + " failed: " + JSON.stringify(exit)));
+          });
+          control.send(JSON.stringify({ _tag: "Request", id, tag, payload, headers: [] }));
+        });
+      };
+
+      const executableName = process.platform === "win32" ? "chrome-headless-shell.exe" : "chrome-headless-shell";
+      const installedExecutable = () => {
+        try {
+          for (const platform of fs.readdirSync(browserRoot)) {
+            if (platform.startsWith(".")) continue;
+            const platformDir = pathMod.join(browserRoot, platform);
+            if (!fs.statSync(platformDir).isDirectory()) continue;
+            for (const version of fs.readdirSync(platformDir)) {
+              if (version.startsWith(".")) continue;
+              const executable = pathMod.join(platformDir, version, executableName);
+              if (fs.existsSync(executable)) return executable;
+            }
+          }
+        } catch {}
+        return null;
+      };
+
+      let tabId = null;
+      let media = null;
+      try {
+        const opened = await callUnary("preview.open", {
+          threadId,
+          url: base + "/.well-known/t3/environment",
+          runtime: "server",
+          reveal: false,
+        }, 60000);
+        tabId = opened && opened.tabId;
+        if (!tabId) throw new Error("preview.open returned no tabId");
+
+        let mediaState = "closed";
+        let attached = false;
+        let lastClose = "";
+        const mediaSockets = new Set();
+        const connectMedia = async () => {
+          const ticket = await issueTicket("media");
+          const params = new URLSearchParams({
+            threadId,
+            tabId,
+            maxWidth: "320",
+            maxHeight: "200",
+            interactive: "false",
+            wsTicket: ticket,
+          });
+          const socket = new WebSocket("ws://127.0.0.1:3773/api/preview-stream/ws?" + params.toString());
+          mediaSockets.add(socket);
+          media = socket;
+          mediaState = "connecting";
+          socket.addEventListener("open", () => {
+            if (media !== socket) return;
+            mediaState = "open";
+            attached = true;
+          });
+          socket.addEventListener("close", (ev) => {
+            mediaSockets.delete(socket);
+            if (media !== socket) return;
+            mediaState = "closed";
+            lastClose = "close " + ev.code + (ev.reason ? " " + ev.reason : "");
+          });
+          socket.addEventListener("error", () => {
+            if (media !== socket) return;
+            if (mediaState === "connecting") mediaState = "closed";
+          });
+        };
+
+        await connectMedia();
+        let lastReconnectAt = Date.now();
+        // Wait until chrome-headless-shell is actually installed on disk (a media WS can open
+        // briefly before closing with 4503 or while download is still staging).
+        while (!installedExecutable() && Date.now() < deadline) {
+          if (mediaState === "closed" && Date.now() - lastReconnectAt >= 1500) {
+            lastReconnectAt = Date.now();
+            try {
+              await connectMedia();
+            } catch (err) {
+              log("preview stream reconnect failed: " + (err && err.message ? err.message : err));
+            }
+          }
+          await sleep(500);
+        }
+
+        const installed = installedExecutable();
+        for (const socket of mediaSockets) {
+          try { socket.close(); } catch {}
+        }
+        if (installed) log("headless browser installed at " + installed);
+        else throw new Error("chrome-headless-shell executable did not appear on disk before timeout" + (lastClose ? " (" + lastClose + ")" : ""));
+      } finally {
+        if (tabId) {
+          try {
+            await callUnary("preview.close", { threadId, tabId }, 10000);
+          } catch (err) {
+            log("WARNING: temporary preview tab close failed: " + (err && err.message ? err.message : err));
+          }
+        }
+        try { control.close(); } catch {}
+      }
+    })().catch((err) => { console.error("[bake] browser pre-install error:", err); process.exit(1); });
+  '
+}
+
 if [ "$BAKE_CLEAN" = "1" ]; then
   # If a t3-settings.json template was uploaded for base bake, install it temporarily so provider setup sees enabled providers
   if [ -f "$sentinel_dir/t3-settings.json" ]; then
@@ -435,6 +612,12 @@ if [ "$BAKE_CLEAN" = "1" ]; then
   if [ -n "${T3_PREPARE_ACP_AGENTS:-}" ] || [ -n "${T3_INSTALL_PROVIDERS:-}" ] \
     || [ -n "${T3_VERIFY_ACP_AGENTS:-}" ] || [ -n "${T3_VERIFY_PROVIDERS:-}" ]; then
     run_provider_setup "$smoke_token"
+  fi
+
+  # Optional browser pre-bake. The stream attach triggers T3's pinned, checksum-verified
+  # chrome-headless-shell install; the wipe below removes userdata but intentionally keeps ~/.t3/tools.
+  if [ "$T3_PREINSTALL_BROWSER" = "1" ]; then
+    preinstall_browser "$smoke_token"
   fi
 
   # Project bakes: the project as the VM's own T3 reports it (its shell row, with `repositoryIdentity`),
@@ -521,7 +704,8 @@ if [ "$BAKE_CLEAN" = "1" ]; then
       "$userdata_dir/server-owner.sqlite" "$userdata_dir/server-owner.sqlite-journal" \
       "$userdata_dir/environment-id" "$userdata_dir/settings.json" "$userdata_dir/keybindings.json" \
       "$userdata_dir/logs" "$userdata_dir/worktrees" "$userdata_dir/attachments" "$userdata_dir/auth" \
-      "$sentinel_dir/watchdog.json" "$sentinel_dir/boot-secrets.json" "$sentinel_dir/t3-settings.json" "$sentinel_dir/saw-thread" \
+      "$userdata_dir/browser-profiles" "$userdata_dir/preview-downloads" \
+      "$sentinel_dir/watchdog.json" "$sentinel_dir/boot-secrets.json" "$sentinel_dir/t3-settings.json" "$sentinel_dir/saw-thread" "$sentinel_dir/browser-setup.log" \
       "$HOME/.klav-forward" "$units/t3code.service.d/klav-env.conf" \
       "$sentinel_dir/provider-sessions" \
       "$userdata_dir"/providers/antigravity/*/antigravity-acp/antigravity-oauth-token \

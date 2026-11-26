@@ -23,6 +23,18 @@ hub:
   host: boat.example.com
   label: Boat
   maxSandboxes: 20
+  # Fast Native Desktop Preview Gateway (60-120 FPS in T3 Desktop Electron <webview>, 0 disk on Sentinel)
+  # preview:
+  #   mode: desktop-proxy        # "desktop-proxy" (recommended for Desktop) or "server" (default JPEG stream)
+  #   # Optional: offload preview HTTP + HMR WebSocket traffic directly to Cloudflare's edge (1 Worker for all sandboxes).
+  #   # Sentinel NEVER needs a Cloudflare API key — only a locally generated 32-byte shared secret!
+  #   # edgeWorkerHost: example.com
+  #   # edgeWorkerSecret: ${PREVIEW_EDGE_SECRET}
+  #   # Fallback stream tuning for server/agent tabs:
+  #   streamMaxWidth: 1280
+  #   streamMaxHeight: 800
+  #   streamQuality: 55
+  #   coalesceInput: true
 
 # Optional: Modular sandbox backend (defaults to native Boat CLI when omitted).
 # Swap to any `@opencoredev/sandbox-sdk` provider (daytona, e2b, docker, vercel, upstash,
@@ -59,6 +71,9 @@ t3:
   channel: stable
   # Default false: update cleanly during `bake`, never mutate a live chat VM mid-session
   autoUpdateOnWake: false
+  # Optional: pre-install T3's pinned `chrome-headless-shell` and required system libraries during
+  # `bake base`, so fresh VMs do not download 132 MB the first time an agent opens a browser preview.
+  # preinstallBrowser: false
   # Optional JSON file merged into `~/.t3/userdata/settings.json` on every VM boot (providers, defaults, etc.)
   # Start from `t3-settings.example.json`; see "Devin and Antigravity" in README.md. Use an absolute path.
   # settingsFile: /opt/t3-boat-sentinel/t3-settings.json

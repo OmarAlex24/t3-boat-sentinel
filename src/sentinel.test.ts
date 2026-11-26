@@ -44,6 +44,7 @@ import { T3ReleaseResolver } from "./t3-release.ts";
 import { ATTACHMENT_UPLOAD_URL_TTL_MS, parseUploadRequest } from "./hub-attachments.ts";
 import { loadT3Contracts } from "./testing/t3-contracts.ts";
 import { HubMediaProxy, PREVIEW_ACK, newMediaWsData, type HubMediaWsData } from "./hub-media.ts";
+import { PREVIEW_BOOTSTRAP_PARAM, PREVIEW_COOKIE_NAME, sandboxSlug } from "./hub-port-gateway.ts";
 
 /**
  * The installed T3 app's own RPC schemas (`T3_APP_ASAR`, else the macOS Nightly app), or null when
@@ -136,7 +137,7 @@ class MockBoat implements BoatClient {
     return Array.from(this.snapshots);
   }
 
-  async hostPublic(id: string): Promise<string> {
+  async hostPublic(id: string, _port = 3773): Promise<string> {
     return this.upstreamBaseUrl ?? `https://${id}.boat.test`;
   }
 
@@ -346,6 +347,53 @@ describe("config & auth primitives", () => {
     const media = auth.issueTicket("media", "client-a");
     expect(auth.checkTicket(media.ticket, "media")).toBe("client-a");
     expect(auth.checkTicket(media.ticket, "media")).toBe("client-a");
+  });
+
+  function writePreviewConfig(body: string): string {
+    const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-preview-cfg-"));
+    tempDirs.push(dir);
+    const path = join(dir, "sentinel.yaml");
+    writeFileSync(path, `domain: example.com\ncontrolSecret: s\nstateDir: ${dir}\nslots: [{ name: boat-1 }]\n${body}`);
+    return path;
+  }
+
+  test("loadConfig parses hub.preview defaults, desktop-proxy edge settings, stream caps, and t3.preinstallBrowser", () => {
+    const plain = loadConfig(writePreviewConfig("hub:\n  host: hub.example.com\n"));
+    expect(plain.hub?.preview).toBeUndefined();
+    expect(plain.t3.preinstallBrowser).toBe(false);
+
+    const serverMode = loadConfig(writePreviewConfig("hub:\n  host: hub.example.com\n  preview:\n    streamMaxWidth: 0\n    streamMaxHeight: 0\n    streamQuality: 0\n"));
+    expect(serverMode.hub?.preview).toEqual({ mode: "server" });
+
+    const desktop = loadConfig(
+      writePreviewConfig(
+        "t3:\n  preinstallBrowser: true\nhub:\n  host: hub.example.com\n  preview:\n    mode: desktop-proxy\n    edgeWorkerHost: HTTPS://Preview.Example.COM/\n    edgeWorkerSecret: edge-secret\n    streamMaxWidth: 1280\n    streamMaxHeight: 720\n    streamQuality: 55\n    coalesceInput: true\n",
+      ),
+    );
+    expect(desktop.t3.preinstallBrowser).toBe(true);
+    expect(desktop.hub?.preview).toEqual({
+      mode: "desktop-proxy",
+      edgeWorkerHost: "preview.example.com",
+      edgeWorkerSecret: "edge-secret",
+      streamMaxWidth: 1280,
+      streamMaxHeight: 720,
+      streamQuality: 55,
+      coalesceInput: true,
+    });
+  });
+
+  test("loadConfig rejects invalid hub.preview mode, mismatched edge settings, placeholders, and bad streamQuality", () => {
+    const base = "hub:\n  host: hub.example.com\n  preview:\n";
+    expect(() => loadConfig(writePreviewConfig(`${base}    mode: sideways\n`))).toThrow("hub.preview.mode");
+    expect(() => loadConfig(writePreviewConfig(`${base}    edgeWorkerHost: preview.example.com\n`))).toThrow("must be set together");
+    expect(() => loadConfig(writePreviewConfig(`${base}    edgeWorkerSecret: edge-secret\n`))).toThrow("must be set together");
+    expect(() =>
+      loadConfig(writePreviewConfig(`${base}    edgeWorkerHost: preview.example.com\n    edgeWorkerSecret: \${EDGE_SECRET_UNSET_X}\n`)),
+    ).toThrow("references unset environment variable");
+    for (const quality of [-1, 101, 1.5, "high"]) {
+      expect(() => loadConfig(writePreviewConfig(`${base}    streamQuality: ${quality}\n`))).toThrow("streamQuality");
+    }
+    expect(() => loadConfig(writePreviewConfig(`${base}    streamMaxWidth: -1\n`))).toThrow("streamMaxWidth");
   });
 });
 
@@ -586,7 +634,7 @@ describe("LifecycleManager hardening", () => {
     const config = makeTestConfig();
     const settingsFile = join(config.stateDir, "t3-settings.json");
     writeFileSync(settingsFile, JSON.stringify({ providerInstances: {} }));
-    config.t3 = { ...config.t3, settingsFile, prepareAcpAgents: ["devin"], installProviders: ["antigravity"] };
+    config.t3 = { ...config.t3, settingsFile, prepareAcpAgents: ["devin"], installProviders: ["antigravity"], preinstallBrowser: true };
     const state = new StateStore(config.stateDir, config);
     const boat = new MockBoat();
     const uploads: Array<{ local: string; remote: string }> = [];
@@ -600,12 +648,14 @@ describe("LifecycleManager hardening", () => {
     await lifecycle.bake("base");
     expect(bakeScript()).toContain("T3_PREPARE_ACP_AGENTS='devin'");
     expect(bakeScript()).toContain("T3_INSTALL_PROVIDERS='antigravity'");
+    expect(bakeScript()).toContain("T3_PREINSTALL_BROWSER=1");
     expect(bakeScript()).not.toContain("T3_VERIFY_");
     expect(settingsUploads().map((u) => u.local)).toEqual([settingsFile]);
 
     await lifecycle.bake("my-app");
     expect(bakeScript()).toContain("T3_VERIFY_ACP_AGENTS='devin'");
     expect(bakeScript()).toContain("T3_VERIFY_PROVIDERS='antigravity'");
+    expect(bakeScript()).not.toContain("T3_PREINSTALL_BROWSER=1");
     expect(bakeScript()).not.toContain("T3_PREPARE_ACP_AGENTS");
     expect(bakeScript()).not.toContain("T3_INSTALL_PROVIDERS");
     expect(settingsUploads().map((u) => u.local)).toEqual([settingsFile, settingsFile]);
@@ -1101,6 +1151,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     const mediaConnections: Array<{ path: string; query: Record<string, string>; authorization: string | null }> = [];
     const mediaMessages: string[] = [];
     const previewEventStreams: Array<{ ws: { sendText(data: string): unknown }; requestId: string }> = [];
+    const discoveredServerStreams: Array<{ ws: { sendText(data: string): unknown }; requestId: string }> = [];
     /**
      * Answers this VM gives to read RPCs (tag -> value, or `READ_FAILS`); a `subscribeVcs*` stream
      * sends its value as one chunk and stays open, like T3. Tests change them as the "repo" changes.
@@ -1341,6 +1392,10 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
             previewEventStreams.push({ ws, requestId: frame.id });
             return;
           }
+          if (frame.tag === "subscribeDiscoveredLocalServers") {
+            discoveredServerStreams.push({ ws, requestId: frame.id });
+            return;
+          }
           if (frame.tag === "scheduledTasks.subscribe") {
             ws.sendText(JSON.stringify({ _tag: "Chunk", requestId: frame.id, values: [{ tasks: [] }] }));
             return;
@@ -1494,6 +1549,12 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
         stream.ws.sendText(JSON.stringify({ _tag: "Chunk", requestId: stream.requestId, values: [event] }));
       }
     };
+    const pushDiscoveredServers = (servers: Array<Record<string, unknown>>) => {
+      const list = { servers, scannedAt: new Date().toISOString() };
+      for (const stream of discoveredServerStreams) {
+        stream.ws.sendText(JSON.stringify({ _tag: "Chunk", requestId: stream.requestId, values: [list] }));
+      }
+    };
     return {
       server,
       url: `http://127.0.0.1:${server.port}`,
@@ -1512,7 +1573,9 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       mediaConnections,
       mediaMessages,
       previewEventStreams,
+      discoveredServerStreams,
       pushPreviewEvent,
+      pushDiscoveredServers,
       readAnswers,
       vcsStreams,
       pushVcs,
@@ -5789,6 +5852,284 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     });
   });
 
+  describe("desktop-proxy preview integration", () => {
+    const until = async (cond: () => boolean, timeoutMs = 5_000) => {
+      const start = Date.now();
+      while (!cond()) {
+        if (Date.now() - start > timeoutMs) throw new Error("condition not met in time");
+        await Bun.sleep(10);
+      }
+    };
+
+    function startDevServer(tag: string) {
+      const requests: string[] = [];
+      const wsMessages: string[] = [];
+      let upstreamSocket: { sendText(data: string): unknown } | null = null;
+      const server = Bun.serve({
+        port: 0,
+        hostname: "127.0.0.1",
+        fetch(req, srv) {
+          const url = new URL(req.url);
+          if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
+            return srv.upgrade(req) ? undefined : new Response("upgrade failed", { status: 400 });
+          }
+          requests.push(`${url.pathname}${url.search}`);
+          return new Response(`dev-${tag}:${url.pathname}`, { headers: { "content-type": "text/plain" } });
+        },
+        websocket: {
+          open(ws) {
+            upstreamSocket = ws;
+            ws.sendText("hmr-ready");
+          },
+          message(ws, msg) {
+            const text = typeof msg === "string" ? msg : new TextDecoder().decode(msg);
+            wsMessages.push(text);
+            ws.sendText(`echo:${text}`);
+          },
+        },
+      });
+      cleanups.push(() => server.stop(true));
+      return {
+        server,
+        url: `http://127.0.0.1:${server.port}`,
+        requests,
+        wsMessages,
+        socketOpen: () => upstreamSocket !== null,
+      };
+    }
+
+    async function fetchGateway(handle: SentinelServerHandle, previewUrl: string, pathAndQuery: string, init: RequestInit = {}) {
+      const preview = new URL(previewUrl);
+      const headers = new Headers(init.headers);
+      headers.set("host", preview.host);
+      return fetch(`http://127.0.0.1:${handle.server.port}${pathAndQuery}`, { ...init, headers, redirect: "manual" });
+    }
+
+    function cookieFrom(res: Response): string {
+      const setCookie = res.headers.get("set-cookie");
+      if (!setCookie) throw new Error("gateway bootstrap did not set a cookie");
+      return setCookie.split(";")[0];
+    }
+
+    async function startDesktopHub(
+      vm1: ReturnType<typeof startFakeVmT3Server>,
+      vm2: ReturnType<typeof startFakeVmT3Server>,
+      dev: ReturnType<typeof startDevServer>,
+      prefix: string,
+    ) {
+      const hub = await startHubWithVm(vm1, prefix, {
+        patchConfig: (cfg) => ({
+          ...cfg,
+          hub: { ...cfg.hub!, preview: { mode: "desktop-proxy" } },
+        }),
+      });
+      const exposedPorts: Array<{ id: string; port: number }> = [];
+      hub.boat.hostPublic = async (id: string, port = 3773) => {
+        exposedPorts.push({ id, port });
+        if (port !== 3773) return dev.url;
+        return id === "sb-2" ? vm2.url : vm1.url;
+      };
+      const client = await connectHubClient(hub.handle, hub.cfg);
+      await launchThreadOnHub(client, "thread-A");
+      const hubProjectId = hub.handle.state.getHubSandbox("sb-1")!.hubProjectId;
+      client.request("launch-thread-B", "orchestration.launchThread", { threadId: "thread-B", projectId: hubProjectId, title: "B", workspaceStrategy: { type: "root" } });
+      await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "launch-thread-B");
+      expect(hub.handle.state.getHubSandbox("sb-2")?.threadIds).toEqual(["thread-B"]);
+      return { ...hub, client, exposedPorts };
+    }
+
+    test("descriptor and server.getConfig omit capabilities.serverBrowser in desktop-proxy mode", async () => {
+      const vm = startFakeVmT3Server("vm-desc-proxy");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle } = await startHubWithVm(vm, "t3-sentinel-hub-desc-proxy-", {
+        patchConfig: (baseCfg) => ({
+          ...baseCfg,
+          hub: { ...baseCfg.hub!, preview: { mode: "desktop-proxy" } },
+        }),
+      });
+      handle.state.setTemplates(
+        {
+          environmentId: "template-env",
+          label: "template",
+          platform: { os: "linux", arch: "x64" },
+          serverVersion: "0.1.0",
+          orchestrationProtocolVersion: 2,
+          capabilities: { repositoryIdentity: true, serverBrowser: true, accessTokenRenewal: true },
+        },
+        null,
+      );
+
+      const res = await fetch(`http://127.0.0.1:${handle.server.port}/.well-known/t3/environment`, { headers: { host: cfg.hub!.host } });
+      const descriptor = (await res.json()) as { capabilities?: Record<string, unknown> };
+      expect(descriptor.capabilities?.repositoryIdentity).toBe(true);
+      expect(descriptor.capabilities && "serverBrowser" in descriptor.capabilities).toBe(false);
+
+      const client = await connectHubClient(handle, cfg);
+      client.request("cfg", "server.getConfig", {});
+      const exit = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "cfg");
+      const value = (exit.exit as { value?: Record<string, unknown> }).value ?? {};
+      const environment = value.environment as { capabilities?: Record<string, unknown> };
+      expect(environment.capabilities?.repositoryIdentity).toBe(true);
+      expect(environment.capabilities && "serverBrowser" in environment.capabilities).toBe(false);
+    });
+
+    test("merged discovery rewrites loopback URLs lazily, the gateway proxies HTTP and HMR, and teardown invalidates both", async () => {
+      const vm1 = startFakeVmT3Server("vm-dp1");
+      const vm2 = startFakeVmT3Server("vm-dp2");
+      cleanups.push(() => vm1.server.stop(true));
+      cleanups.push(() => vm2.server.stop(true));
+      const dev = startDevServer("vite");
+      const { cfg, handle, client, exposedPorts } = await startDesktopHub(vm1, vm2, dev, "t3-sentinel-hub-dp-");
+      const hub = handle.hub!;
+      expect(hub.portGateway).toBeDefined();
+
+      client.request("discover", "subscribeDiscoveredLocalServers", {});
+      await until(() => vm1.discoveredServerStreams.length === 1 && vm2.discoveredServerStreams.length === 1);
+      vm1.pushDiscoveredServers([{ host: "localhost", port: 5173, url: "http://localhost:5173", title: "Vite" }]);
+      vm2.pushDiscoveredServers([{ host: "127.0.0.1", port: 3000, url: "http://127.0.0.1:3000/app?x=1", title: "App" }]);
+      const merged = await client.waitForFrame((f) => {
+        if (f._tag !== "Chunk" || f.requestId !== "discover") return false;
+        return (f.values as Array<{ servers?: unknown[] }>).some((v) => (v.servers ?? []).length === 2);
+      });
+      const list = (merged.values as Array<{ servers: Array<Record<string, unknown>> }>)[0];
+      const vite = list.servers.find((s) => s.port === 5173)!;
+      const app = list.servers.find((s) => s.port === 3000)!;
+      const viteUrl = new URL(String(vite.url));
+      const appUrl = new URL(String(app.url));
+      expect(viteUrl.host).toBe(`p5173-${sandboxSlug("sb-1")}.boat.example.com`);
+      expect(viteUrl.pathname).toBe("/");
+      expect(viteUrl.searchParams.get(PREVIEW_BOOTSTRAP_PARAM)).toBeTruthy();
+      expect(appUrl.host).toBe(`p3000-${sandboxSlug("sb-2")}.boat.example.com`);
+      expect(appUrl.pathname).toBe("/app");
+      expect(appUrl.searchParams.get("x")).toBe("1");
+      expect(exposedPorts.filter((p) => p.port !== 3773)).toEqual([]);
+
+      const bootstrap = await fetchGateway(handle, String(vite.url), `${viteUrl.pathname}${viteUrl.search}`);
+      expect(bootstrap.status).toBe(302);
+      expect(bootstrap.headers.get("set-cookie")).toContain(PREVIEW_COOKIE_NAME);
+      expect(exposedPorts.filter((p) => p.port === 5173)).toEqual([]);
+      const cookie = cookieFrom(bootstrap);
+
+      const [page, asset] = await Promise.all([
+        fetchGateway(handle, String(vite.url), "/", { headers: { cookie } }),
+        fetchGateway(handle, String(vite.url), "/asset.js?v=1", { headers: { cookie } }),
+      ]);
+      expect(page.status).toBe(200);
+      expect(await page.text()).toBe("dev-vite:/");
+      expect(asset.status).toBe(200);
+      expect(await asset.text()).toBe("dev-vite:/asset.js");
+      expect(exposedPorts.filter((p) => p.port === 5173)).toEqual([{ id: "sb-1", port: 5173 }]);
+      expect(dev.requests).toEqual(["/", "/asset.js?v=1"]);
+
+      const hmr = new WebSocket(`ws://127.0.0.1:${handle.server.port}/hmr`, {
+        headers: { host: viteUrl.host, cookie, origin: `https://${viteUrl.host}` },
+        protocols: ["vite-hmr"],
+      } as unknown as string[]);
+      cleanups.push(() => hmr.close());
+      const hmrClosed = new Promise<{ code: number; reason: string }>((resolve) => {
+        hmr.addEventListener("close", (ev) => resolve({ code: ev.code, reason: ev.reason }));
+      });
+      const nextHmrMessage = () =>
+        new Promise<string>((resolve) => {
+          hmr.addEventListener("message", (ev) => resolve(String(ev.data)), { once: true });
+        });
+      const ready = nextHmrMessage();
+      await new Promise<void>((resolve, reject) => {
+        hmr.addEventListener("open", () => resolve());
+        hmr.addEventListener("error", () => reject(new Error("gateway hmr websocket failed")));
+      });
+      expect(await ready).toBe("hmr-ready");
+      await until(() => dev.socketOpen());
+      expect(exposedPorts.filter((p) => p.port === 5173)).toHaveLength(1);
+      const echo = nextHmrMessage();
+      hmr.send("hmr-update");
+      expect(await echo).toBe("echo:hmr-update");
+
+      client.request("open-app", "preview.open", { threadId: "thread-B", url: "http://localhost:3000/app" });
+      const openExit = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "open-app");
+      expect((openExit.exit as Record<string, unknown>)._tag).toBe("Success");
+      const openPayload = vm2.seenMethods.find((m) => m.tag === "preview.open")!.payload as { url: string };
+      const rewrittenOpen = new URL(openPayload.url);
+      expect(rewrittenOpen.host).toBe(`p3000-${sandboxSlug("sb-2")}.boat.example.com`);
+      expect(rewrittenOpen.pathname).toBe("/app");
+      expect(rewrittenOpen.searchParams.get(PREVIEW_BOOTSTRAP_PARAM)).toBeTruthy();
+      expect(exposedPorts.filter((p) => p.port === 3000)).toEqual([]);
+
+      await hub.sleepHubSandbox("sb-1");
+      const closed = await hmrClosed;
+      expect([1000, 1001]).toContain(closed.code);
+      const afterSleep = await fetchGateway(handle, String(vite.url), "/", { headers: { cookie } });
+      expect([404, 503]).toContain(afterSleep.status);
+      const withoutVite = await client.waitForFrame((f) => {
+        if (f._tag !== "Chunk" || f.requestId !== "discover") return false;
+        return (f.values as Array<{ servers?: Array<Record<string, unknown>> }>).some(
+          (v) => (v.servers ?? []).length === 1 && v.servers?.[0]?.port === 3000,
+        );
+      });
+      expect(withoutVite).toBeTruthy();
+
+      await hub.destroyHubSandbox("sb-2", "test");
+      const empty = await client.waitForFrame((f) => {
+        if (f._tag !== "Chunk" || f.requestId !== "discover") return false;
+        return (f.values as Array<{ servers?: unknown[] }>).some((v) => (v.servers ?? []).length === 0);
+      });
+      expect(empty).toBeTruthy();
+      const destroyed = await fetchGateway(handle, openPayload.url, `${rewrittenOpen.pathname}${rewrittenOpen.search}`);
+      expect(destroyed.status).toBe(404);
+    }, 15_000);
+
+    test("hub.preview stream caps reach the VM preview URL and coalesce hover input", async () => {
+      const vm = startFakeVmT3Server("vm-tuned");
+      cleanups.push(() => vm.server.stop(true));
+      const { cfg, handle } = await startHubWithVm(vm, "t3-sentinel-hub-tuned-", {
+        patchConfig: (baseCfg) => ({
+          ...baseCfg,
+          hub: {
+            ...baseCfg.hub!,
+            preview: { mode: "server", streamMaxWidth: 1280, streamMaxHeight: 720, streamQuality: 50, coalesceInput: true },
+          },
+        }),
+      });
+      const client = await connectHubClient(handle, cfg);
+      await launchThreadOnHub(client, "thread-A");
+
+      const ticketRes = await fetch(`http://127.0.0.1:${handle.server.port}/api/auth/websocket-ticket/media`, {
+        method: "POST",
+        headers: { host: cfg.hub!.host, authorization: `Bearer ${client.bearer}` },
+      });
+      const { ticket } = (await ticketRes.json()) as { ticket: string };
+      const media = new WebSocket(
+        `ws://127.0.0.1:${handle.server.port}/api/preview-stream/ws?wsTicket=${encodeURIComponent(ticket)}&threadId=thread-A&url=${encodeURIComponent("http://localhost:5173")}&maxWidth=2000&maxHeight=1000&quality=95`,
+        { headers: { host: cfg.hub!.host } } as unknown as string[],
+      );
+      cleanups.push(() => media.close());
+      await new Promise<void>((resolve, reject) => {
+        media.addEventListener("open", () => resolve());
+        media.addEventListener("error", () => reject(new Error("tuned media websocket failed")));
+      });
+      await until(() => vm.mediaConnections.length === 1);
+      expect(vm.mediaConnections[0].query).toMatchObject({ maxWidth: "1280", maxHeight: "640", quality: "50" });
+
+      const move = (x: number) => JSON.stringify({ type: "mouse", action: "move", button: "none", buttons: 0, x, y: 10, modifiers: 0 });
+      media.send(move(1));
+      media.send(move(2));
+      await Bun.sleep(20);
+      const hoverInputs = () =>
+        vm.mediaMessages
+          .map((m) => {
+            try {
+              return JSON.parse(m) as Record<string, unknown>;
+            } catch {
+              return null;
+            }
+          })
+          .filter((m): m is Record<string, unknown> => m?.type === "mouse" && m.action === "move");
+      expect(hoverInputs().map((m) => m.x)).toEqual([1]);
+      await until(() => hoverInputs().length === 2, 2_000);
+      expect(hoverInputs().map((m) => m.x)).toEqual([1, 2]);
+    }, 10_000);
+  });
+
   test("spawns 1 fresh Boat VM per chat behind 1 single Environment, routes RPCs strictly to owning VM, and destroys only the settled VM", async () => {
     const dir = mkdtempSync(join(tmpdir(), "t3-sentinel-hub-"));
     cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
@@ -5802,7 +6143,7 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       port: 0,
       hostname: "127.0.0.1",
       fetch() {
-        return Response.json({ ok: true });
+        return Response.json({ ok: true }, { headers: { connection: "close" } });
       },
     });
     cleanups.push(() => fakeLlmUpstream.stop(true));
