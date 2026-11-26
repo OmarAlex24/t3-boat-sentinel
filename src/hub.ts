@@ -28,6 +28,7 @@ import {
 import type { ProjectConfig, ProjectKlavConfig, SentinelConfig } from "./config.ts";
 import { HubMcpHandler, formatRpcFailure, type HubParkRequest, type HubSandboxPhase } from "./hub-mcp.ts";
 import { isChildThreadRow, parkBlocker } from "./hub-park-guard.ts";
+import { HubStagedAttachmentStore } from "./hub-staged-store.ts";
 import {
   CACHED_READ_STREAMS,
   CACHED_READ_TAGS,
@@ -60,6 +61,8 @@ import {
   ATTACHMENT_UPLOAD_ROUTE_PREFIX,
   ATTACHMENT_UPLOAD_URL_TTL_MS,
   STAGED_ATTACHMENT_MAX_AGE_MS,
+  StagedAttachmentLostError,
+  isHubStagedAttachmentId,
   parseUploadRequest,
   replayUploadRequest,
   stagedAssetHeaders,
@@ -1104,6 +1107,8 @@ export class HubServer {
    * right after a send succeeds, which for such a chat is before the Hub replays them into the VM.
    */
   private readonly pinnedStagedAttachments = new Set<string>();
+  /** The bytes of pinned staged uploads, kept on disk while a waiting message refers to them (see `pruneStagedCopies`). */
+  private readonly stagedStore: HubStagedAttachmentStore;
   /** Attachment ids a VM issued when the Hub replayed a staged upload into it -> that VM. */
   private readonly attachmentToSandbox = new Map<string, string>();
   private readonly worktreeSetupSnapshots = new Map<string, WorktreeSetupSnapshotState>();
@@ -1161,6 +1166,7 @@ export class HubServer {
     }
     this.shellStore = new HubShellStore(config.stateDir, (threadId) => this.keepsStoredShell(threadId));
     this.readStore = new ThreadReadStore(config.stateDir);
+    this.stagedStore = new HubStagedAttachmentStore(config.stateDir);
     this.mcp = new HubMcpHandler(
       config,
       state,
@@ -1228,6 +1234,8 @@ export class HubServer {
     if (config.hub) {
       this.state.ensureHub(config.hub.label, Object.keys(this.state.getAllProjects(config)));
       this.restoreLiveSandboxes();
+      // Before the launches and deliveries they resume: their messages' uploads come back first
+      this.restoreStagedAttachments();
       this.restorePendingLaunches();
       this.restoreHeldTurns();
       this.lifecycle.onParkedHubSandboxGone = (sandboxId) => this.expireParkedSandbox(sandboxId, "gone-remotely");
@@ -2859,7 +2867,7 @@ export class HubServer {
       createdAt: input.now,
     });
     this.persistPendingLaunch(pending.record);
-    for (const id of this.stagedIdsIn(payload)) this.pinnedStagedAttachments.add(id);
+    this.pinStagedAttachments(payload);
     const sequence = this.state.nextHubSequence();
     this.broadcastShellItem({ kind: "thread.updated", sequence, location: "active", thread: placeholder.shell });
     console.log(`[hub] chat ${input.threadId} answered at once; booting its VM in the background (project=${projectKey})`);
@@ -2886,6 +2894,7 @@ export class HubServer {
     this.state.updateHub((h) => {
       h.pendingLaunches = { ...(h.pendingLaunches ?? {}), [record.threadId]: record };
     });
+    this.pruneStagedCopies();
   }
 
   private forgetPendingLaunch(threadId: string): void {
@@ -2896,6 +2905,7 @@ export class HubServer {
       if (Object.keys(rest).length > 0) h.pendingLaunches = rest;
       else delete h.pendingLaunches;
     });
+    this.pruneStagedCopies();
   }
 
   /** After a Hub restart: failed chats stay in the sidebar, booting ones start their launch again. */
@@ -2944,17 +2954,19 @@ export class HubServer {
       if (pending.seenOnVm) {
         exit = { _tag: "Success", value: null };
       } else if (kind === "launch") {
-        const payload = await this.replayStagedAttachmentsInPayload(sb, bridge, {
-          ...pending.record.payload,
-          threadId,
-          projectId: sb.vmProjectId,
-        });
+        const payload = await this.replayStagedAttachmentsInPayload(
+          sb,
+          bridge,
+          { ...pending.record.payload, threadId, projectId: sb.vmProjectId },
+          { failLost: true },
+        );
         exit = await bridge.callUnary("orchestration.launchThread", payload, 120_000);
       } else {
         const payload = await this.replayStagedAttachmentsInPayload(
           sb,
           bridge,
           rewriteProjectIds({ ...pending.record.payload, threadId }, sb.hubProjectId, sb.vmProjectId) as Record<string, unknown>,
+          { failLost: true },
         );
         exit = await bridge.callUnary("orchestration.dispatchCommand", payload, 60_000);
       }
@@ -3274,7 +3286,7 @@ export class HubServer {
       : { threadId, sandboxId: sb.sandboxId, turns: [turn], error: null, createdAt: now };
     this.heldTurns.set(threadId, record);
     this.persistHeldTurns(record);
-    for (const id of this.stagedIdsIn(payload)) this.pinnedStagedAttachments.add(id);
+    this.pinStagedAttachments(payload);
     sendRpcExitSuccess(ws, reqId, { sequence: this.state.nextHubSequence() });
     const queued = record.turns.filter((t) => t.status === "queued").length;
     console.log(`[hub] chat ${threadId}: message held as queued (${queued} queued) while ${sb.sandboxId} wakes`);
@@ -3368,6 +3380,7 @@ export class HubServer {
           sb,
           bridge,
           rewriteProjectIds(turn.payload, sb.hubProjectId, sb.vmProjectId) as Record<string, unknown>,
+          { failLost: true },
         );
         const exit = await bridge.callUnary("orchestration.dispatchCommand", payload, 60_000);
         if (exit._tag === "Success") return { ok: true, bridge };
@@ -3378,6 +3391,11 @@ export class HubServer {
         }
         lastError = formatRpcFailure(exit.cause);
       } catch (err) {
+        // Not a transport failure: sending it again cannot bring the upload back
+        if (err instanceof StagedAttachmentLostError) {
+          console.warn(`[hub] held message for ${threadId} cannot be sent to ${sb.sandboxId}: ${err.message}`);
+          return { ok: false, closed: false, reason: err.message };
+        }
         lastError = redactForLog(err);
       }
       if (attempt >= this.heldTurnSendRetries) {
@@ -3497,7 +3515,7 @@ export class HubServer {
       if (payload.modelSelection && typeof payload.modelSelection === "object") edited.modelSelection = payload.modelSelection;
       const kept = new Set(this.stagedIdsIn(edited));
       for (const id of this.stagedIdsIn(turn.payload)) if (!kept.has(id)) this.dropStagedAttachment(id);
-      for (const id of kept) this.pinnedStagedAttachments.add(id);
+      this.pinStagedAttachments(edited);
       turns = record.turns.map((t) => (t.runId === runId ? { ...t, payload: edited } : t));
     } else if (cmdType === "queued-run.start") {
       // "Send now": the first queued message is already next; another moves to the front
@@ -3584,12 +3602,14 @@ export class HubServer {
       if (Object.keys(rest).length > 0) h.heldTurns = rest;
       else delete h.heldTurns;
     });
+    this.pruneStagedCopies();
   }
 
   private persistHeldTurns(record: HubHeldTurnsRecord): void {
     this.state.updateHub((h) => {
       h.heldTurns = { ...(h.heldTurns ?? {}), [record.threadId]: record };
     });
+    this.pruneStagedCopies();
   }
 
   /** After a Hub restart: failed messages stay shown, queued ones resume their VM's wake and delivery (sent ones are not sent again). */
@@ -4745,6 +4765,72 @@ export class HubServer {
       .filter((id): id is string => typeof id === "string" && this.stagedAttachments.has(id));
   }
 
+  /** Keeps a waiting message's staged uploads until it reaches the VM: in memory, and on disk for a Hub restart. */
+  private pinStagedAttachments(payload: Record<string, unknown>): void {
+    for (const id of this.stagedIdsIn(payload)) {
+      this.pinnedStagedAttachments.add(id);
+      const staged = this.stagedAttachments.get(id);
+      if (staged) this.stagedStore.save(staged);
+    }
+  }
+
+  /**
+   * Staged uploads a waiting message still has to send, read from the persisted messages (a held
+   * message still queued, a booting chat's first message), whether or not the Hub holds them in memory.
+   */
+  private stagedIdsAwaitingDelivery(): Set<string> {
+    const hub = this.state.getHub();
+    const payloads: Record<string, unknown>[] = [];
+    for (const record of Object.values(hub?.heldTurns ?? {})) {
+      if (record.failedDelivery) continue;
+      for (const turn of record.turns) if (turn.status === "queued") payloads.push(turn.payload);
+    }
+    for (const record of Object.values(hub?.pendingLaunches ?? {})) if (record.phase === "booting") payloads.push(record.payload);
+    const ids = new Set<string>();
+    for (const payload of payloads) {
+      const message = payload.initialMessage as { attachments?: unknown } | undefined;
+      for (const list of [message?.attachments, payload.attachments]) {
+        if (!Array.isArray(list)) continue;
+        for (const att of list) {
+          const id = att && typeof att === "object" ? (att as { id?: unknown }).id : undefined;
+          if (isHubStagedAttachmentId(id)) ids.add(id);
+        }
+      }
+    }
+    return ids;
+  }
+
+  /**
+   * Removes the disk copies no waiting message refers to any more (it was sent, dropped or failed),
+   * and those older than T3's sweep of pending uploads. Keeps the store as small as the waiting messages.
+   */
+  private pruneStagedCopies(): void {
+    const stored = this.stagedStore.storedIds();
+    if (stored.length === 0) return;
+    const awaiting = this.stagedIdsAwaitingDelivery();
+    const now = Date.now();
+    for (const id of stored) {
+      const createdAt = this.stagedStore.createdAt(id);
+      if (awaiting.has(id) && createdAt !== null && now - createdAt <= STAGED_ATTACHMENT_MAX_AGE_MS) continue;
+      this.stagedStore.remove(id);
+    }
+  }
+
+  /** After a Hub restart: the uploads of the messages still waiting come back from disk, pinned. */
+  private restoreStagedAttachments(): void {
+    this.pruneStagedCopies();
+    let restored = 0;
+    for (const id of this.stagedIdsAwaitingDelivery()) {
+      if (this.stagedAttachments.has(id)) continue;
+      const staged = this.stagedStore.load(id);
+      if (!staged) continue;
+      this.stagedAttachments.set(id, staged);
+      this.pinnedStagedAttachments.add(id);
+      restored++;
+    }
+    if (restored > 0) console.log(`[hub] restored ${restored} staged attachment(s) of queued messages from disk`);
+  }
+
   private dropStagedAttachment(attachmentId: string): void {
     this.pinnedStagedAttachments.delete(attachmentId);
     this.stagedAttachments.delete(attachmentId);
@@ -4763,10 +4849,16 @@ export class HubServer {
     }
   }
 
+  /**
+   * `failLost`: a staged id the Hub no longer holds fails the replay (`StagedAttachmentLostError`)
+   * instead of passing an id the VM does not know: for messages the Hub kept across a restart (held
+   * messages, a booting chat's first message). A direct send passes it on, as before.
+   */
   private async replayStagedAttachmentsInPayload(
     sb: HubSandboxRecord,
     bridge: HubVmBridge,
     payload: Record<string, unknown>,
+    opts: { failLost?: boolean } = {},
   ): Promise<Record<string, unknown>> {
     const msg =
       (payload.initialMessage as Record<string, unknown> | undefined) ??
@@ -4785,6 +4877,8 @@ export class HubServer {
       const id = typeof att.id === "string" ? att.id : "";
       const staged = this.stagedAttachments.get(id);
       if (!staged || !staged.bytes) {
+        // An id only the Hub knows would reach the VM as an unknown attachment: fail it here, clearly
+        if (opts.failLost && isHubStagedAttachmentId(id)) throw new StagedAttachmentLostError(typeof att.name === "string" ? att.name : id);
         nextAttachments.push(att);
         continue;
       }
