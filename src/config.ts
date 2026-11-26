@@ -117,6 +117,12 @@ export interface HubPreviewConfig {
   streamQuality?: number;
   /** Enable hover mouse-move and wheel coalescing on server-browser streams. */
   coalesceInput?: boolean;
+  /**
+   * In `desktop-proxy` mode, project agent-opened `runtime: "server"` preview tabs to native
+   * `runtime: "desktop"` Electron webview tabs pointing at the gateway URL (default `true`).
+   * Inside the VM the tab remains `runtime: "server"` so agent automation keeps working.
+   */
+  projectAgentTabs?: boolean;
 }
 
 export interface HubConfig {
@@ -394,6 +400,10 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
       const streamMaxHeight = optionalPositiveInteger(raw.streamMaxHeight, "hub.preview.streamMaxHeight");
       const streamQuality = optionalStreamQuality(raw.streamQuality);
 
+      if (raw.projectAgentTabs !== undefined && typeof raw.projectAgentTabs !== "boolean") {
+        throw new Error(`Config "hub.preview.projectAgentTabs" must be true or false`);
+      }
+
       preview = {
         mode: raw.mode === "desktop-proxy" ? "desktop-proxy" : "server",
         ...(edgeWorkerHost ? { edgeWorkerHost } : {}),
@@ -402,6 +412,7 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
         ...(streamMaxHeight !== undefined ? { streamMaxHeight } : {}),
         ...(streamQuality !== undefined ? { streamQuality } : {}),
         ...(raw.coalesceInput === true ? { coalesceInput: true } : {}),
+        ...(raw.projectAgentTabs !== undefined ? { projectAgentTabs: raw.projectAgentTabs } : {}),
       };
     }
     hub = {

@@ -6625,6 +6625,159 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       expect(destroyed.status).toBe(404);
     }, 15_000);
 
+    test("desktop-proxy projects agent-opened server preview tabs to native desktop webview tabs with gateway URLs", async () => {
+      const vm1 = startFakeVmT3Server("vm-proj1");
+      const vm2 = startFakeVmT3Server("vm-proj2");
+      cleanups.push(() => vm1.server.stop(true));
+      cleanups.push(() => vm2.server.stop(true));
+      const dev = startDevServer("proj");
+      const { handle, client } = await startDesktopHub(vm1, vm2, dev, "t3-sentinel-hub-proj-");
+
+      // Subscribe to preview events before agent opens a server tab on vm1
+      client.request("pev", "subscribePreviewEvents", {});
+      await until(() => vm1.previewEventStreams.length === 1 && vm2.previewEventStreams.length === 1);
+
+      const serverTabId = "tab_1_agent_epoch";
+      vm1.pushPreviewEvent({
+        type: "opened",
+        threadId: "thread-A",
+        tabId: serverTabId,
+        createdAt: "now",
+        serverEpoch: "e1",
+        revision: 1,
+        snapshot: {
+          threadId: "thread-A",
+          tabId: serverTabId,
+          runtime: "server",
+          headless: true,
+          automationOwner: "agent-1",
+          canGoBack: false,
+          canGoForward: false,
+          navStatus: { _tag: "Loading", url: "http://localhost:5173/", title: "" },
+          updatedAt: "now",
+        },
+      });
+
+      const openedChunk = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "pev");
+      const openedEvent = (openedChunk.values as Array<{ type: string; snapshot: Record<string, unknown> }>)[0];
+      expect(openedEvent.type).toBe("opened");
+      expect(openedEvent.snapshot.runtime).toBe("desktop");
+      expect(openedEvent.snapshot.headless).toBeUndefined();
+      expect(openedEvent.snapshot.automationOwner).toBeUndefined();
+      const openedUrl = new URL(String((openedEvent.snapshot.navStatus as { url: string }).url));
+      expect(openedUrl.host).toBe(`p5173-${sandboxSlug("sb-1")}.boat.example.com`);
+      expect(openedUrl.pathname).toBe("/");
+      expect(openedUrl.searchParams.get(PREVIEW_BOOTSTRAP_PARAM)).toBeTruthy();
+
+      // Same-URL Loading -> Loaded echo and resized events are suppressed so Electron does not reload
+      const inboxCountBefore = client.inbox.length;
+      vm1.pushPreviewEvent({
+        type: "navigated",
+        threadId: "thread-A",
+        tabId: serverTabId,
+        createdAt: "now",
+        serverEpoch: "e1",
+        revision: 2,
+        snapshot: {
+          threadId: "thread-A",
+          tabId: serverTabId,
+          runtime: "server",
+          headless: true,
+          canGoBack: false,
+          canGoForward: false,
+          navStatus: { _tag: "Loaded", url: "http://localhost:5173/", title: "Horizon" },
+          updatedAt: "now",
+        },
+      });
+      vm1.pushPreviewEvent({
+        type: "resized",
+        threadId: "thread-A",
+        tabId: serverTabId,
+        createdAt: "now",
+        serverEpoch: "e1",
+        revision: 3,
+        snapshot: {
+          threadId: "thread-A",
+          tabId: serverTabId,
+          runtime: "server",
+          canGoBack: false,
+          canGoForward: false,
+          navStatus: { _tag: "Loaded", url: "http://localhost:5173/", title: "Horizon" },
+          updatedAt: "now",
+        },
+      });
+      await Bun.sleep(60);
+      expect(client.inbox.length).toBe(inboxCountBefore);
+
+      // Navigating to a genuinely new URL IS projected and forwarded
+      vm1.pushPreviewEvent({
+        type: "navigated",
+        threadId: "thread-A",
+        tabId: serverTabId,
+        createdAt: "now",
+        serverEpoch: "e1",
+        revision: 4,
+        snapshot: {
+          threadId: "thread-A",
+          tabId: serverTabId,
+          runtime: "server",
+          canGoBack: true,
+          canGoForward: false,
+          navStatus: { _tag: "Loaded", url: "http://localhost:5173/analytics?tab=1", title: "Analytics" },
+          updatedAt: "now",
+        },
+      });
+      const navChunk = await client.waitForFrame((f) => f._tag === "Chunk" && f.requestId === "pev");
+      const navEvent = (navChunk.values as Array<{ type: string; snapshot: Record<string, unknown> }>)[0];
+      expect(navEvent.type).toBe("navigated");
+      expect(navEvent.snapshot.runtime).toBe("desktop");
+      const navUrl = new URL(String((navEvent.snapshot.navStatus as { url: string }).url));
+      expect(navUrl.host).toBe(`p5173-${sandboxSlug("sb-1")}.boat.example.com`);
+      expect(navUrl.pathname).toBe("/analytics");
+      expect(navUrl.searchParams.get("tab")).toBe("1");
+
+      // preview.reportStatus from T3 Desktop for a projected tab succeeds locally without hitting VM
+      const reportsBefore = vm1.seenMethods.filter((m) => m.tag === "preview.reportStatus").length;
+      client.request("rep-proj", "preview.reportStatus", {
+        threadId: "thread-A",
+        tabId: serverTabId,
+        navStatus: { _tag: "Loaded", url: navUrl.toString(), title: "Analytics" },
+        canGoBack: true,
+        canGoForward: false,
+      });
+      const repExit = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "rep-proj");
+      expect((repExit.exit as Record<string, unknown>)._tag).toBe("Success");
+      expect(vm1.seenMethods.filter((m) => m.tag === "preview.reportStatus").length).toBe(reportsBefore);
+
+      // preview.list also projects existing server sessions to native desktop tabs with gateway URLs
+      vm1.readAnswers.set("preview.list", {
+        serverEpoch: "e1",
+        revision: 5,
+        sessions: [
+          {
+            threadId: "thread-A",
+            tabId: serverTabId,
+            runtime: "server",
+            headless: true,
+            canGoBack: true,
+            canGoForward: false,
+            navStatus: { _tag: "Loaded", url: "http://localhost:5173/analytics", title: "Analytics" },
+            updatedAt: "now",
+          },
+        ],
+      });
+      client.request("plist", "preview.list", { threadId: "thread-A" });
+      const plistExit = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "plist");
+      const sessions = ((plistExit.exit as { value: { sessions: Array<Record<string, unknown>> } }).value).sessions;
+      expect(sessions).toHaveLength(1);
+      expect(sessions[0].runtime).toBe("desktop");
+      expect(sessions[0].headless).toBeUndefined();
+      const listedUrl = new URL(String((sessions[0].navStatus as { url: string }).url));
+      expect(listedUrl.host).toBe(`p5173-${sandboxSlug("sb-1")}.boat.example.com`);
+      expect(listedUrl.pathname).toBe("/analytics");
+      expect(handle.hub!.portGateway).toBeDefined();
+    }, 15_000);
+
     test("hub.preview stream caps reach the VM preview URL and coalesce hover input", async () => {
       const vm = startFakeVmT3Server("vm-tuned");
       cleanups.push(() => vm.server.stop(true));

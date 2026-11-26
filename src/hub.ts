@@ -1031,9 +1031,16 @@ export class HubServer {
   /** Preview streams and device-hub sockets, piped to the VM that runs the chat. */
   private readonly media = new HubMediaProxy((data) => this.resolveMediaTarget(data));
   /** Native T3 Desktop preview tunnel (`/api/preview/tunnel?port=<port>`), routed to the owning VM. */
-  private readonly tunnel = new HubTunnelProxy((clientId, port) => this.resolveTunnelCandidates(clientId, port));
+  private readonly tunnel = new HubTunnelProxy(
+    (clientId, port) => this.resolveTunnelCandidates(clientId, port),
+    { onConnected: (clientId, port, sandboxId) => this.rememberTunnelSandbox(clientId, port, sandboxId) },
+  );
   /** Most recently active running sandbox per client, used to prioritize `/api/preview/tunnel` routing. */
   private readonly lastActiveSandboxByClient = new Map<string, string>();
+  /** Last VM that accepted `/api/preview/tunnel` per `${clientId}:${port}` so subsequent sockets hit it first. */
+  private readonly lastTunnelSandboxByClientPort = new Map<string, string>();
+  /** Agent-opened `runtime: "server"` tabs projected to T3 Desktop as native `runtime: "desktop"` webview tabs. */
+  private readonly projectedDesktopTabs = new Map<string, { sandboxId: string; lastSourceUrl: string | null }>();
   /** Lazy public port gateway for desktop-proxy previews; present only in that mode. */
   readonly portGateway?: HubPortGateway;
   /** How long a media socket waits for its chat's VM to finish booting or waking. */
@@ -2359,6 +2366,13 @@ export class HubServer {
     }
     if (tag === "preview.reportStatus") {
       // A desktop-run tab's navigation, for the chat's VM; never wakes a VM just for this
+      const tabId = typeof (payload as { tabId?: unknown } | null)?.tabId === "string" ? (payload as { tabId: string }).tabId : "";
+      const projected = tabId ? this.projectedDesktopTabs.get(tabId) : undefined;
+      if (projected) {
+        this.lastActiveSandboxByClient.set(ws.data.clientId, projected.sandboxId);
+        sendRpcExitSuccess(ws, reqId, undefined);
+        return;
+      }
       const sandboxId = this.threadToSandbox.get(extractThreadId(payload) ?? "");
       const bridge = sandboxId ? this.bridges.get(sandboxId) : undefined;
       if (bridge?.isOpen() && this.state.getHubSandbox(sandboxId!)?.phase === "running") {
@@ -4449,6 +4463,19 @@ export class HubServer {
       const sb = await this.resolveSandboxForThread(threadId);
       this.lastActiveSandboxByClient.set(ws.data.clientId, sb.sandboxId);
       const bridge = await this.ensureBridgeOpen(sb);
+      if (tag === "preview.list" && this.shouldProjectAgentTabs()) {
+        const exit = await bridge.callUnary("preview.list", payload, 15_000);
+        if (exit._tag === "Success") {
+          sendRpcExitSuccess(ws, reqId, this.projectPreviewListResult(sb.sandboxId, exit.value));
+        } else {
+          sendRpcFrame(ws, { _tag: "Exit", requestId: reqId, exit });
+        }
+        return;
+      }
+      if (tag === "preview.close" && payload && typeof payload === "object") {
+        const tabId = (payload as { tabId?: unknown }).tabId;
+        if (typeof tabId === "string") this.projectedDesktopTabs.delete(tabId);
+      }
       let forwardedPayload = payload;
       if (tag === "preview.open" && this.portGateway && payload && typeof payload === "object") {
         const url = (payload as { url?: unknown }).url;
@@ -6773,6 +6800,15 @@ export class HubServer {
     }
   }
 
+  private rememberTunnelSandbox(clientId: string, port: number, sandboxId: string): void {
+    const key = `${clientId}:${port}`;
+    const prev = this.lastTunnelSandboxByClientPort.get(key);
+    this.lastTunnelSandboxByClientPort.set(key, sandboxId);
+    if (prev !== sandboxId) {
+      console.log(`[hub-tunnel] port=${port} routed to ${sandboxId}`);
+    }
+  }
+
   /** Ordered running VMs that could own `port` for `/api/preview/tunnel`. */
   private resolveTunnelCandidates(clientId: string, port: number): HubSandboxRecord[] {
     const running = this.state
@@ -6788,6 +6824,7 @@ export class HubServer {
     if (running.length <= 1) return running;
 
     const byId = new Map(running.map((sb) => [sb.sandboxId, sb]));
+    const cachedId = this.lastTunnelSandboxByClientPort.get(`${clientId}:${port}`);
     const activeId = this.lastActiveSandboxByClient.get(clientId);
     const ordered: HubSandboxRecord[] = [];
     const seen = new Set<string>();
@@ -6799,8 +6836,11 @@ export class HubServer {
 
     const hasPort = (sandboxId: string) =>
       this.discoveredServersBySandbox.get(sandboxId)?.servers.some((s) => s.port === port) ?? false;
+    const knownWithoutPort = (sandboxId: string) =>
+      this.discoveredServersBySandbox.has(sandboxId) && !hasPort(sandboxId);
 
-    if (activeId && hasPort(activeId)) add(byId.get(activeId));
+    if (activeId && !knownWithoutPort(activeId)) add(byId.get(activeId));
+    if (cachedId) add(byId.get(cachedId));
     for (const sb of running) {
       if (hasPort(sb.sandboxId)) add(sb);
     }
@@ -6809,12 +6849,111 @@ export class HubServer {
     return ordered;
   }
 
+  private shouldProjectAgentTabs(): boolean {
+    return Boolean(this.portGateway) && this.config.hub?.preview?.projectAgentTabs !== false;
+  }
+
+  private projectPreviewSnapshot(sandboxId: string, raw: unknown): Record<string, unknown> | null {
+    if (!this.shouldProjectAgentTabs() || !raw || typeof raw !== "object") return null;
+    const snap = raw as Record<string, unknown>;
+    if (snap.runtime !== "server") return null;
+    const tabId = typeof snap.tabId === "string" ? snap.tabId : null;
+    const navStatus =
+      snap.navStatus && typeof snap.navStatus === "object" ? (snap.navStatus as Record<string, unknown>) : null;
+    const sourceUrl = navStatus && typeof navStatus.url === "string" ? navStatus.url : null;
+    let nextNavStatus = navStatus;
+    if (navStatus && sourceUrl && this.portGateway) {
+      const parsed = parseLoopbackPreviewUrl(sourceUrl);
+      if (parsed) {
+        nextNavStatus = {
+          ...navStatus,
+          url: this.portGateway.buildPreviewUrl(sandboxId, parsed.port, parsed.pathAndQuery),
+        };
+      }
+    }
+    if (tabId) {
+      this.projectedDesktopTabs.set(tabId, { sandboxId, lastSourceUrl: sourceUrl });
+    }
+    const { headless: _headless, automationOwner: _owner, ...rest } = snap;
+    return {
+      ...rest,
+      runtime: "desktop",
+      ...(nextNavStatus ? { navStatus: nextNavStatus } : {}),
+    };
+  }
+
+  private projectPreviewListResult(sandboxId: string, raw: unknown): unknown {
+    if (!this.shouldProjectAgentTabs() || !raw || typeof raw !== "object") return raw;
+    const obj = raw as Record<string, unknown>;
+    if (!Array.isArray(obj.sessions)) return raw;
+    const sessions = obj.sessions.map((session) => this.projectPreviewSnapshot(sandboxId, session) ?? session);
+    return { ...obj, sessions };
+  }
+
+  private projectPreviewEvents(sandboxId: string, values: unknown[]): unknown[] {
+    if (!this.shouldProjectAgentTabs()) return values;
+    const out: unknown[] = [];
+    for (const raw of values) {
+      if (!raw || typeof raw !== "object") {
+        out.push(raw);
+        continue;
+      }
+      const ev = raw as Record<string, unknown>;
+      const type = ev.type;
+      const tabId = typeof ev.tabId === "string" ? ev.tabId : "";
+
+      if (type === "closed") {
+        if (tabId) this.projectedDesktopTabs.delete(tabId);
+        out.push(ev);
+        continue;
+      }
+
+      const snap = ev.snapshot && typeof ev.snapshot === "object" ? (ev.snapshot as Record<string, unknown>) : null;
+      if (snap && snap.runtime === "server") {
+        if (type === "opened") {
+          const projected = this.projectPreviewSnapshot(sandboxId, snap);
+          out.push(projected ? { ...ev, snapshot: projected } : ev);
+          continue;
+        }
+        if (type === "navigated") {
+          const prev = tabId ? this.projectedDesktopTabs.get(tabId) : undefined;
+          const navStatus =
+            snap.navStatus && typeof snap.navStatus === "object" ? (snap.navStatus as Record<string, unknown>) : null;
+          const sourceUrl = navStatus && typeof navStatus.url === "string" ? navStatus.url : null;
+          if (prev && sourceUrl === prev.lastSourceUrl) {
+            // Suppress Loading -> Loaded echo for the same URL so Electron does not reload the user's tab
+            continue;
+          }
+          const projected = this.projectPreviewSnapshot(sandboxId, snap);
+          out.push(projected ? { ...ev, snapshot: projected } : ev);
+          continue;
+        }
+        if (type === "resized") {
+          if (tabId && this.projectedDesktopTabs.has(tabId)) continue;
+        }
+      }
+
+      if (type === "failed" && tabId && this.projectedDesktopTabs.has(tabId)) {
+        continue;
+      }
+
+      out.push(ev);
+    }
+    return out;
+  }
+
   /** Drops every lazy preview endpoint, native preview tunnel, and discovered server of a VM that is asleep, gone, or being destroyed. */
   private invalidateSandboxNetworking(sandboxId: string): void {
     this.tunnel.closeSandbox(sandboxId, 1001, "Sandbox stopped");
     this.portGateway?.invalidateSandbox(sandboxId);
     for (const [cid, mapped] of Array.from(this.lastActiveSandboxByClient)) {
       if (mapped === sandboxId) this.lastActiveSandboxByClient.delete(cid);
+    }
+    for (const [key, mapped] of Array.from(this.lastTunnelSandboxByClientPort)) {
+      if (mapped === sandboxId) this.lastTunnelSandboxByClientPort.delete(key);
+    }
+    for (const [tabId, entry] of Array.from(this.projectedDesktopTabs)) {
+      if (entry.sandboxId === sandboxId) this.projectedDesktopTabs.delete(tabId);
     }
     const upReqId = this.discoveredServersUpstream.get(sandboxId);
     if (upReqId) {
@@ -6843,7 +6982,10 @@ export class HubServer {
     upReqId = bridge.openStream(
       stream.tag,
       stream.payload,
-      (values) => sendRpcFrame(ws, { _tag: "Chunk", requestId: stream.rawId, values }),
+      (values) => {
+        const out = stream.tag === "subscribePreviewEvents" ? this.projectPreviewEvents(sandboxId, values) : values;
+        if (out.length > 0) sendRpcFrame(ws, { _tag: "Chunk", requestId: stream.rawId, values: out });
+      },
       // The VM ended it or went away: forget it quietly; the bridge's next open subscribes again
       () => {
         if (stream.upstream.get(sandboxId) === upReqId) stream.upstream.delete(sandboxId);
