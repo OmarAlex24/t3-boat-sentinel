@@ -23,7 +23,14 @@ The default T3 `runtime: "server"` browser preview renders the page in the remot
 - `exposePort(sandboxId, port)` is 100% lazy. VMs without open previews do zero preview exposure work at boot; the first authenticated preview request exposes only that sandbox's requested port.
 - Preview state is isolated per `(sandbox, port)` hostname, so two chats never share cookies, `localStorage`, or Service Workers.
 
-`desktop-proxy` is a **Hub-wide** setting optimized for T3 Desktop: it omits `capabilities.serverBrowser` from the Hub descriptor so T3 Desktop opens user preview tabs in its native Electron `<webview>`. Clients without a native desktop webview (such as T3 Mobile or web clients) should use `mode: server` (or a separate Hub) if they need interactive browser previews; server/agent-created tabs that explicitly carry `runtime: "server"` continue to stream over `/api/preview-stream/ws` and use the Hub stream tuning below (see [Fallback server stream tuning](#fallback-server-stream-tuning)).
+`desktop-proxy` is a **Hub-wide** setting optimized for T3 Desktop:
+
+- It omits `capabilities.serverBrowser` from the Hub descriptor so T3 Desktop opens user preview tabs in its native Electron `<webview>`.
+- By default (`projectAgentTabs: true`), Sentinel also projects agent-opened `runtime: "server"` tabs to T3 Desktop as native `runtime: "desktop"` tabs pointing at `https://p<port>-<slug>.<domain>/...` (HTTP/2 + optional Edge Worker), while keeping the headless `runtime: "server"` tab intact inside the VM so agent `preview_snapshot`/`preview_act` automation keeps working. Set `projectAgentTabs: false` if you want agent tabs to stream over `/api/preview-stream/ws` instead.
+- Sentinel also routes T3 Desktop's built-in loopback tunnel (`wss://<hub>/api/preview/tunnel?port=<port>`) to the owning VM in both `server` and `desktop-proxy` modes, so typing `http://localhost:<port>/` directly, "Open on this device", and port forwarding work across multi-VM Hubs.
+- At VM boot in `desktop-proxy` mode, Sentinel automatically injects `__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS` (e.g. `.on.boat.dev` on Boat) into `t3code.service` and login shells so Vite 6+ dev servers work without editing `server.allowedHosts` in every repository.
+
+Clients without a native desktop webview (such as T3 Mobile or web clients) should use `mode: server` (or a separate Hub) if they need interactive browser previews; server-browser streams use the Hub stream tuning below (see [Fallback server stream tuning](#fallback-server-stream-tuning)).
 
 ## Configuration
 
@@ -34,6 +41,7 @@ hub:
   maxSandboxes: 20
   preview:
     mode: desktop-proxy        # "desktop-proxy" (recommended for Desktop) or "server" (default JPEG stream)
+    projectAgentTabs: true     # default true in desktop-proxy; set false to stream agent tabs over JPEG
     # edgeWorkerHost: example.com
     # edgeWorkerSecret: ${PREVIEW_EDGE_SECRET}
     streamMaxWidth: 1280

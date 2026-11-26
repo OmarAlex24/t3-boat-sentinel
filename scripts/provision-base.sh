@@ -97,6 +97,7 @@ while true; do
   mkdir -p "$(dirname "$log")"
   (
     if [ -f "$HOME/.klav-forward/env.systemd" ]; then set -a; . "$HOME/.klav-forward/env.systemd"; set +a; fi
+    if [ -f "$HOME/.t3-sentinel/preview.env" ]; then set -a; . "$HOME/.t3-sentinel/preview.env"; set +a; fi
     exec 9>&- "${cmd[@]}"
   ) >>"$log" 2>&1 </dev/null &
   child=$!
@@ -705,8 +706,8 @@ if [ "$BAKE_CLEAN" = "1" ]; then
       "$userdata_dir/environment-id" "$userdata_dir/settings.json" "$userdata_dir/keybindings.json" \
       "$userdata_dir/logs" "$userdata_dir/worktrees" "$userdata_dir/attachments" "$userdata_dir/auth" \
       "$userdata_dir/browser-profiles" "$userdata_dir/preview-downloads" \
-      "$sentinel_dir/watchdog.json" "$sentinel_dir/boot-secrets.json" "$sentinel_dir/t3-settings.json" "$sentinel_dir/saw-thread" "$sentinel_dir/browser-setup.log" \
-      "$HOME/.klav-forward" "$units/t3code.service.d/klav-env.conf" \
+      "$sentinel_dir/watchdog.json" "$sentinel_dir/boot-secrets.json" "$sentinel_dir/t3-settings.json" "$sentinel_dir/saw-thread" "$sentinel_dir/browser-setup.log" "$sentinel_dir/preview.env" \
+      "$HOME/.klav-forward" "$units/t3code.service.d/klav-env.conf" "$units/t3code.service.d/preview-env.conf" \
       "$sentinel_dir/provider-sessions" \
       "$userdata_dir"/providers/antigravity/*/antigravity-acp/antigravity-oauth-token \
       "$userdata_dir"/providers/antigravity/*/antigravity-acp/acp_token.json \
@@ -825,6 +826,30 @@ if [ -f "$HOME/.klav-forward/env.systemd" ]; then
     printf '[Service]\nEnvironmentFile=-%%h/.klav-forward/env.systemd\n' > "$units/t3code.service.d/klav-env.conf"
   fi
   restart_t3=1
+fi
+if [ -n "${T3_PREVIEW_ALLOWED_HOSTS:-}" ]; then
+  preview_env_file="$sentinel_dir/preview.env"
+  new_preview_env="__VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS=${T3_PREVIEW_ALLOWED_HOSTS}"
+  if [ ! -f "$preview_env_file" ] || [ "$(cat "$preview_env_file" 2>/dev/null || true)" != "$new_preview_env" ]; then
+    printf '%s\n' "$new_preview_env" > "$preview_env_file"
+    chmod 600 "$preview_env_file"
+    restart_t3=1
+  fi
+  if [ "$supervisor_mode" != "1" ]; then
+    mkdir -p "$units/t3code.service.d"
+    dropin="$units/t3code.service.d/preview-env.conf"
+    new_dropin="[Service]
+EnvironmentFile=-%h/.t3-sentinel/preview.env"
+    if [ ! -f "$dropin" ] || [ "$(cat "$dropin" 2>/dev/null || true)" != "$new_dropin" ]; then
+      printf '%s\n' "$new_dropin" > "$dropin"
+      restart_t3=1
+    fi
+  fi
+  for rc_file in "$HOME/.profile" "$HOME/.bashrc"; do
+    if [ ! -f "$rc_file" ] || ! grep -q "t3-sentinel-preview-env" "$rc_file" 2>/dev/null; then
+      printf '\n# t3-sentinel-preview-env\n[ -f "$HOME/.t3-sentinel/preview.env" ] && { set -a; . "$HOME/.t3-sentinel/preview.env"; set +a; }\n' >> "$rc_file"
+    fi
+  done
 fi
 t3_service_reload
 t3_service_is_active || restart_t3=1
