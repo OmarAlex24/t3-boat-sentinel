@@ -10,7 +10,7 @@ const LIVE_STATUSES = new Set(["queued", "preparing", "starting", "running", "wa
 /** Runtime requests T3 answers itself: they never wait on the person. */
 const SELF_SETTLED = new Set(["auth_refresh", "dynamic_tool_call"]);
 
-export type ParkBlocker = { threadId: string; reason: "running" | "not settled" };
+export type ParkBlocker = { threadId: string; reason: "running" | "not settled" | "open" };
 
 /** A delegated or subagent chat: it lives inside its parent's chat, never on its own in the sidebar. */
 export function isChildThreadRow(row: Record<string, unknown>): boolean {
@@ -47,11 +47,13 @@ function hasPendingBackgroundWork(row: Record<string, unknown>): boolean {
 }
 
 /**
- * Why the VM holding these rows must not be parked, or null when it may: a chat (any, delegated
- * children included) has a live run or pending background work and is not just waiting on the
- * person, or an open top-level chat (not a subagent, archived or deleted) is not settled.
+ * Why the VM holding these rows must not be closed (stopped or deleted because its chats are done),
+ * or null when it may: a chat (any, delegated children included) has a live run or pending background
+ * work and is not just waiting on the person, or an open top-level chat (not a subagent, archived or
+ * deleted) remains. With `settledIsClosed`, a settled chat counts as done (`deleteWhen:
+ * archived-or-settled`, and every park), as the watchdog counts it.
  */
-export function parkBlocker(rows: Array<Record<string, unknown>>): ParkBlocker | null {
+export function vmCloseBlocker(rows: Array<Record<string, unknown>>, opts: { settledIsClosed: boolean }): ParkBlocker | null {
   for (const row of rows) {
     if (hasPendingBackgroundWork(row) || (isLiveThreadRow(row) && !waitsOnPerson(row))) {
       return { threadId: String(row.id ?? ""), reason: "running" };
@@ -60,7 +62,13 @@ export function parkBlocker(rows: Array<Record<string, unknown>>): ParkBlocker |
   for (const row of rows) {
     if ((row.lineage as { relationshipToParent?: unknown } | undefined)?.relationshipToParent === "subagent") continue;
     if (row.archivedAt != null || row.deletedAt != null) continue;
-    if (!isSettledThreadRow(row)) return { threadId: String(row.id ?? ""), reason: "not settled" };
+    if (opts.settledIsClosed && isSettledThreadRow(row)) continue;
+    return { threadId: String(row.id ?? ""), reason: opts.settledIsClosed ? "not settled" : "open" };
   }
   return null;
+}
+
+/** Why the VM holding these rows must not be parked (see `vmCloseBlocker`), or null when it may. */
+export function parkBlocker(rows: Array<Record<string, unknown>>): ParkBlocker | null {
+  return vmCloseBlocker(rows, { settledIsClosed: true });
 }

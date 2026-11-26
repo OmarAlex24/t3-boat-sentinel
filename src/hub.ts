@@ -1197,6 +1197,12 @@ export class HubServer {
         destroySandbox: (sandboxId, reason) => this.destroyHubSandbox(sandboxId, reason),
         sleepSandbox: (sandboxId) => this.sleepHubSandbox(sandboxId),
         parkSandbox: (sandboxId, request) => this.parkHubSandbox(sandboxId, request),
+        readVmThreads: async (sandboxId) => {
+          const sb = this.state.getHubSandbox(sandboxId);
+          if (!sb || sb.phase !== "running") return null;
+          const bridge = await this.ensureBridgeOpen(sb, this.parkCheckTimeoutMs).catch(() => null);
+          return bridge ? bridge.readShellThreads(this.parkCheckTimeoutMs) : null;
+        },
         projectKeyFromHubId: (hubProjectId) => this.projectKeyFromHubId(hubProjectId),
         ensureHubProjectId: (projectKey) => {
           const hub = this.state.ensureHub(
