@@ -11,7 +11,7 @@ import {
 } from "./providers/index.ts";
 import { loadConfig, type SentinelConfig } from "./config.ts";
 import { ControlPlane } from "./control.ts";
-import { HubServer, type HubMediaWsData, type HubSocketData, type HubWsData } from "./hub.ts";
+import { HubServer, type HubMediaWsData, type HubSocketData, type HubTunnelWsData, type HubWsData } from "./hub.ts";
 import type { PortGatewayWsData } from "./hub-port-gateway.ts";
 import { JobManager } from "./jobs.ts";
 import { KlavCliProvider, type KlavClient } from "./klav.ts";
@@ -89,6 +89,8 @@ export function createSentinelServer(
           hub.onWsOpen(ws as Bun.ServerWebSocket<HubWsData>);
         } else if (hub && "kind" in ws.data && ws.data.kind === "hub-media") {
           hub.onMediaOpen(ws as Bun.ServerWebSocket<HubMediaWsData>);
+        } else if (hub && "kind" in ws.data && ws.data.kind === "hub-tunnel") {
+          hub.onTunnelOpen(ws as Bun.ServerWebSocket<HubTunnelWsData>);
         } else if (portGatewayWs && "kind" in ws.data && ws.data.kind === "port-gateway") {
           portGatewayWs.open?.(ws as Bun.ServerWebSocket<PortGatewayWsData>);
         } else {
@@ -100,6 +102,8 @@ export function createSentinelServer(
           hub.onWsMessage(ws as Bun.ServerWebSocket<HubWsData>, msg);
         } else if (hub && "kind" in ws.data && ws.data.kind === "hub-media") {
           hub.onMediaMessage(ws as Bun.ServerWebSocket<HubMediaWsData>, msg);
+        } else if (hub && "kind" in ws.data && ws.data.kind === "hub-tunnel") {
+          hub.onTunnelMessage(ws as Bun.ServerWebSocket<HubTunnelWsData>, msg);
         } else if (portGatewayWs && "kind" in ws.data && ws.data.kind === "port-gateway") {
           portGatewayWs.message?.(ws as Bun.ServerWebSocket<PortGatewayWsData>, msg);
         } else {
@@ -111,6 +115,8 @@ export function createSentinelServer(
           hub.onWsClose(ws as Bun.ServerWebSocket<HubWsData>, code, reason);
         } else if (hub && "kind" in ws.data && ws.data.kind === "hub-media") {
           hub.onMediaClose(ws as Bun.ServerWebSocket<HubMediaWsData>, code, reason);
+        } else if (hub && "kind" in ws.data && ws.data.kind === "hub-tunnel") {
+          hub.onTunnelClose(ws as Bun.ServerWebSocket<HubTunnelWsData>, code, reason);
         } else if (portGatewayWs && "kind" in ws.data && ws.data.kind === "port-gateway") {
           portGatewayWs.close?.(ws as Bun.ServerWebSocket<PortGatewayWsData>, code, reason);
         } else {
