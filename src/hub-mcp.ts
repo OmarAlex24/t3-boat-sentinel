@@ -35,6 +35,18 @@ export interface RepositoryIdentity {
   name: string;
 }
 
+/** Who asked for a park (logged with it); an MCP settle also names the chat it settled. */
+export interface HubParkRequest {
+  trigger: string;
+  /** The chat an MCP `t3_thread_organize` settle settled: it must be one of the VM's top-level chats. */
+  settledThreadId?: string;
+}
+
+/** The MCP client that made a request (its paired credential's label), for the Hub's logs. */
+export interface HubMcpCaller {
+  label: string;
+}
+
 export interface HubMcpBridge {
   callVmUnary: (
     sandboxId: string,
@@ -48,8 +60,11 @@ export interface HubMcpBridge {
   wakeSandbox: (sandboxId: string) => Promise<HubSandboxRecord>;
   destroySandbox: (sandboxId: string, reason: string) => Promise<void>;
   sleepSandbox: (sandboxId: string) => Promise<void>;
-  /** Parks a VM whose chats are all settled (see `boat.settleAction`); true when it ends parked. */
-  parkSandbox: (sandboxId: string) => Promise<boolean>;
+  /**
+   * Parks a VM whose chats are all settled (see `boat.settleAction`); true when it ends parked.
+   * Refused while a chat on it is live or an open top-level chat is not settled.
+   */
+  parkSandbox: (sandboxId: string, request: HubParkRequest) => Promise<boolean>;
   projectKeyFromHubId: (hubProjectId: string) => string | null;
   ensureHubProjectId: (projectKey: string) => string;
   spawnSandboxForThread: (
@@ -497,7 +512,7 @@ export class HubMcpHandler {
           params.arguments && typeof params.arguments === "object"
             ? (params.arguments as Record<string, unknown>)
             : {};
-        const toolResult = await this.executeTool(toolName, toolArgs);
+        const toolResult = await this.executeTool(toolName, toolArgs, { label: client.label });
         responses.push({ jsonrpc: "2.0", id: msg.id, result: toolResult });
         continue;
       }
@@ -559,9 +574,10 @@ export class HubMcpHandler {
   private async executeTool(
     name: string,
     args: Record<string, unknown>,
+    caller: HubMcpCaller,
   ): Promise<Record<string, unknown>> {
     try {
-      const data = await this.dispatchTool(name, args);
+      const data = await this.dispatchTool(name, args, caller);
       return {
         content: [{ type: "text", text: JSON.stringify(data) }],
         structuredContent: data,
@@ -578,7 +594,7 @@ export class HubMcpHandler {
     }
   }
 
-  private async dispatchTool(name: string, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private async dispatchTool(name: string, args: Record<string, unknown>, caller: HubMcpCaller): Promise<Record<string, unknown>> {
     switch (name) {
       case "t3_project_list":
         return this.toolProjectList(args);
@@ -591,7 +607,7 @@ export class HubMcpHandler {
       case "t3_thread_send":
         return this.toolThreadSend(args);
       case "t3_thread_organize":
-        return this.toolThreadOrganize(args);
+        return this.toolThreadOrganize(args, caller);
       case "list_thread_pull_requests":
         return this.toolListThreadPullRequests(args);
       case "t3_pending_request":
@@ -1384,7 +1400,28 @@ export class HubMcpHandler {
     };
   }
 
-  private async toolThreadOrganize(args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  /** Each call is logged once (client, action, chat, VM, outcome): a settle may park a whole VM. */
+  private async toolThreadOrganize(args: Record<string, unknown>, caller: HubMcpCaller): Promise<Record<string, unknown>> {
+    const log = { action: String(args.action ?? ""), threadId: String(args.threadId ?? ""), sandboxId: "-", outcome: "error" };
+    try {
+      const result = await this.organizeThread(args, caller, log);
+      if (log.outcome === "error") log.outcome = "ok";
+      return result;
+    } catch (err) {
+      log.outcome = `error: ${err instanceof Error ? err.message : String(err)}`;
+      throw err;
+    } finally {
+      console.log(
+        `[hub-mcp] t3_thread_organize by ${JSON.stringify(caller.label)}: action=${log.action} thread=${log.threadId} sandbox=${log.sandboxId} -> ${log.outcome}`,
+      );
+    }
+  }
+
+  private async organizeThread(
+    args: Record<string, unknown>,
+    caller: HubMcpCaller,
+    log: { sandboxId: string; outcome: string },
+  ): Promise<Record<string, unknown>> {
     const threadId = requireString(args.threadId, "threadId");
     const action = requireString(args.action, "action");
     const isDestructiveCleanup = action === "settle" || action === "archive";
@@ -1396,18 +1433,22 @@ export class HubMcpHandler {
       this.pendingLaunches.delete(threadId);
       this.destroyedThreads.set(threadId, { destroyedAt: Date.now(), reason: `mcp-${action}` });
       if (pending.sandboxId) {
+        log.sandboxId = pending.sandboxId;
         await this.bridge.destroySandbox(pending.sandboxId, `mcp-${action}`).catch(() => {});
       }
+      log.outcome = "booting chat cancelled, VM destroyed";
       return { ok: true, threadId, action, sandboxDestroyed: true };
     }
 
     const sb = this.bridge.getSandboxForThread(threadId);
     if (!sb) {
       if (this.destroyedThreads.has(threadId) && isDestructiveCleanup) {
+        log.outcome = "VM already destroyed";
         return { ok: true, threadId, action, sandboxDestroyed: true, alreadyDestroyed: true };
       }
       throw new HubMcpToolError("thread_not_found", `Thread "${threadId}" was not found.`);
     }
+    log.sandboxId = sb.sandboxId;
 
     const commandId = randomUUID();
     let command: Record<string, unknown>;
@@ -1435,29 +1476,44 @@ export class HubMcpHandler {
         throw new HubMcpToolError("invalid_request", `Unsupported organize action "${action}".`);
     }
 
+    let refused: string | null = null;
     if (sb.phase === "running") {
       const exit = await this.bridge.callVmUnary(sb.sandboxId, "orchestration.dispatchCommand", command, 10_000);
-      if (exit._tag === "Failure" && !isDestructiveCleanup) {
-        throw new HubMcpToolError("orchestration_error", `Organize failed: ${formatRpcFailure(exit.cause)}`);
+      if (exit._tag === "Failure") {
+        if (!isDestructiveCleanup) {
+          throw new HubMcpToolError("orchestration_error", `Organize failed: ${formatRpcFailure(exit.cause)}`);
+        }
+        refused = formatRpcFailure(exit.cause);
       }
     }
 
     let sandboxDestroyed = false;
-    let sandboxParked = false;
     const parksOnSettle = this.config.boat.settleAction === "park" && this.config.boat.deleteWhen === "archived-or-settled";
     if (action === "settle" && parksOnSettle) {
-      // Like a settle in the app: the chat stays, its VM is parked
-      sandboxParked = await this.bridge.parkSandbox(sb.sandboxId);
-    } else if (isDestructiveCleanup) {
+      // Like a settle in the app: the chat stays, and its VM is parked once nothing on it is open or
+      // running. A settle the VM refused parks nothing; the Hub checks the rest with what the VM lists now
+      let sandboxParked = false;
+      if (refused === null) {
+        sandboxParked = await this.bridge.parkSandbox(sb.sandboxId, {
+          trigger: `MCP t3_thread_organize settle of ${threadId} by ${JSON.stringify(caller.label)}`,
+          settledThreadId: threadId,
+        });
+      }
+      log.outcome = refused !== null ? `the VM refused the settle (${refused}); not parked` : sandboxParked ? "VM parked" : "settled; VM not parked";
+      return { ok: true, threadId, action, sandboxDestroyed, sandboxParked };
+    }
+    if (isDestructiveCleanup) {
       if (this.config.boat.archiveAction === "stop") {
         await this.bridge.sleepSandbox(sb.sandboxId);
+        log.outcome = "VM stopped";
       } else {
         await this.bridge.destroySandbox(sb.sandboxId, `mcp-${action}`);
         sandboxDestroyed = true;
+        log.outcome = "VM destroyed";
       }
     }
 
-    return { ok: true, threadId, action, sandboxDestroyed, ...(sandboxParked ? { sandboxParked } : {}) };
+    return { ok: true, threadId, action, sandboxDestroyed };
   }
 
   private async toolListThreadPullRequests(args: Record<string, unknown>): Promise<Record<string, unknown>> {

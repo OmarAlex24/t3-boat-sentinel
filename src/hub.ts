@@ -26,7 +26,8 @@ import {
   type AuthRateLimiter,
 } from "./security.ts";
 import type { ProjectConfig, ProjectKlavConfig, SentinelConfig } from "./config.ts";
-import { HubMcpHandler, formatRpcFailure, type HubSandboxPhase } from "./hub-mcp.ts";
+import { HubMcpHandler, formatRpcFailure, type HubParkRequest, type HubSandboxPhase } from "./hub-mcp.ts";
+import { isChildThreadRow, parkBlocker } from "./hub-park-guard.ts";
 import {
   CACHED_READ_STREAMS,
   CACHED_READ_TAGS,
@@ -719,6 +720,37 @@ class HubVmBridge {
     });
   }
 
+  /**
+   * The VM's thread rows as it lists them now (delegated children included), from a one-off
+   * `orchestration.subscribeShell`; null when no complete snapshot arrives in time. Only a full
+   * snapshot counts: neither the one that only resolves repository identity nor a trimmed one.
+   */
+  readShellThreads(timeoutMs: number): Promise<Array<Record<string, unknown>> | null> {
+    return new Promise((resolve) => {
+      if (!this.isOpen()) return resolve(null);
+      const upReqId = `hub-shell-read-${++this.reqCounter}`;
+      const finish = (rows: Array<Record<string, unknown>> | null) => {
+        clearTimeout(timer);
+        if (this.pending.delete(upReqId)) this.sendRaw({ _tag: "Interrupt", requestId: upReqId });
+        resolve(rows);
+      };
+      const timer = setTimeout(() => finish(null), timeoutMs);
+      this.pending.set(upReqId, {
+        onChunk: (values) => {
+          for (const raw of values) {
+            const item = raw as { kind?: unknown; snapshot?: { threads?: unknown } } | null;
+            if (!item || item.kind !== "snapshot" || !item.snapshot || typeof item.snapshot !== "object") continue;
+            if ("resolvedRepositoryIdentityRoots" in item || "olderSettled" in item.snapshot) continue;
+            const threads = item.snapshot.threads;
+            return finish(Array.isArray(threads) ? (threads.filter((t) => t && typeof t === "object") as Array<Record<string, unknown>>) : null);
+          }
+        },
+        resolve: () => finish(null),
+      });
+      this.sendRaw({ _tag: "Request", id: upReqId, tag: "orchestration.subscribeShell", payload: {}, headers: [] });
+    });
+  }
+
   callUnary(
     tag: string,
     payload: unknown,
@@ -993,6 +1025,8 @@ export class HubServer {
   unparkHoldMs = 120_000;
   /** Parks that found a chat with no cached history; the park is retried this many times before going ahead. */
   parkCacheRetries = 5;
+  /** How long a park waits for the VM to list its chats (the check before the stop). */
+  parkCheckTimeoutMs = 5_000;
   private readonly parkCacheMisses = new Map<string, number>();
   /** When each parked VM last woke, by sandbox id (see `unparkHoldMs`). */
   private readonly unparkedAt = new Map<string, number>();
@@ -1150,7 +1184,7 @@ export class HubServer {
         wakeSandbox: (sandboxId) => this.wakeHubSandbox(sandboxId),
         destroySandbox: (sandboxId, reason) => this.destroyHubSandbox(sandboxId, reason),
         sleepSandbox: (sandboxId) => this.sleepHubSandbox(sandboxId),
-        parkSandbox: (sandboxId) => this.parkHubSandbox(sandboxId),
+        parkSandbox: (sandboxId, request) => this.parkHubSandbox(sandboxId, request),
         projectKeyFromHubId: (hubProjectId) => this.projectKeyFromHubId(hubProjectId),
         ensureHubProjectId: (projectKey) => {
           const hub = this.state.ensureHub(
@@ -3787,29 +3821,63 @@ export class HubServer {
   /**
    * Parks a VM whose chats are all settled: stopped like an idle sleep (history cached, Klav and LLM
    * credentials released), recorded with `parkedAt`, and no longer counted toward the limit. A VM
-   * already asleep is only marked. True when the VM ends parked.
+   * already asleep is only marked. Refused (the VM is left as it is) while any chat on it is live or
+   * an open top-level chat is not settled (see `parkRefusal`). True when the VM ends parked.
    */
-  async parkHubSandbox(sandboxId: string): Promise<boolean> {
+  async parkHubSandbox(sandboxId: string, request: HubParkRequest): Promise<boolean> {
     const sb = this.state.getHubSandbox(sandboxId);
     if (!sb || this.destroyingSandboxes.has(sandboxId) || this.inFlightWakes.has(sandboxId)) return false;
     const inFlightSleep = this.inFlightSleeps.get(sandboxId);
     if (inFlightSleep) {
       await inFlightSleep.catch(() => {});
-      return this.parkHubSandbox(sandboxId);
+      return this.parkHubSandbox(sandboxId, request);
     }
     if (sb.phase === "sleeping") {
       if (!sb.parkedAt) {
+        // Asleep: only the rows the Hub kept can tell whether its chats are settled
+        const refusal = this.parkRefusal(sb, request, null);
+        if (refusal) {
+          console.log(`[hub] not parking ${sandboxId}: ${refusal} — trigger: ${request.trigger}`);
+          return false;
+        }
         this.state.updateHubSandbox(sandboxId, (s) => {
           s.parkedAt = new Date().toISOString();
         });
-        console.log(`[hub] parked sleeping sandbox ${sandboxId}: its chats are settled`);
+        console.log(`[hub] parked sleeping sandbox ${sandboxId} (${sb.project}): its chats are settled — trigger: ${request.trigger}`);
       }
       return true;
     }
     if (sb.phase !== "running") return false;
-    await this.sleepHubSandbox(sandboxId, { park: true });
+    await this.sleepHubSandbox(sandboxId, { park: request });
     const after = this.state.getHubSandbox(sandboxId);
     return after?.phase === "sleeping" && !!after.parkedAt;
+  }
+
+  /**
+   * Why the VM must not be parked now, or null when it may. `fresh` is what the VM lists now
+   * (delegated children included); without it the Hub's rows are used, except for an MCP settle of
+   * a running VM, which is refused (unknown is never all clear). The settled chat of an MCP settle
+   * must be one of the VM's top-level chats: settling a delegated chat never parks its parent's VM.
+   */
+  private parkRefusal(sb: HubSandboxRecord, request: HubParkRequest, fresh: Array<Record<string, unknown>> | null): string | null {
+    if (request.settledThreadId !== undefined && !fresh && sb.phase === "running") return "could not read its chats";
+    const rows =
+      fresh ?? sb.threadIds.map((tid) => this.threadShells.get(tid)).filter((row): row is Record<string, unknown> => !!row);
+    const blocker = parkBlocker(rows);
+    if (blocker) return `chat ${blocker.threadId} is ${blocker.reason}`;
+    if (request.settledThreadId !== undefined) {
+      const target = rows.find((row) => row.id === request.settledThreadId);
+      if (!target) return `chat ${request.settledThreadId} is not one of its listed chats`;
+      if (isChildThreadRow(target)) return `chat ${request.settledThreadId} is a delegated chat`;
+    }
+    return null;
+  }
+
+  /** The VM's thread rows as it lists them now, or null when its bridge is not open or does not answer in time. */
+  private async readVmThreadRows(sandboxId: string): Promise<Array<Record<string, unknown>> | null> {
+    const bridge = this.bridges.get(sandboxId);
+    if (!bridge?.isOpen()) return null;
+    return bridge.readShellThreads(this.parkCheckTimeoutMs);
   }
 
   /** Turns every parked VM stopped for `parkedTtlMs` into read-only chats; returns how many. */
@@ -5377,7 +5445,7 @@ export class HubServer {
     }
   }
 
-  async sleepHubSandbox(sandboxId: string, opts: { park?: boolean } = {}): Promise<void> {
+  async sleepHubSandbox(sandboxId: string, opts: { park?: HubParkRequest } = {}): Promise<void> {
     const sb = this.state.getHubSandbox(sandboxId);
     if (!sb) return;
     if (sb.phase === "sleeping" && sb.wakeFailure?.vmPaused === false) {
@@ -5391,7 +5459,7 @@ export class HubServer {
     if (this.inFlightWakes.has(sandboxId)) return;
     const existing = this.inFlightSleeps.get(sandboxId);
     if (existing) return existing;
-    const promise = this.doSleepHubSandbox(sandboxId, opts.park === true).finally(() => {
+    const promise = this.doSleepHubSandbox(sandboxId, opts.park ?? null).finally(() => {
       this.inFlightSleeps.delete(sandboxId);
       const after = this.state.getHubSandbox(sandboxId);
       if (after?.phase === "running") {
@@ -5404,12 +5472,26 @@ export class HubServer {
     return promise;
   }
 
-  private async doSleepHubSandbox(sandboxId: string, park: boolean): Promise<void> {
+  private async doSleepHubSandbox(sandboxId: string, park: HubParkRequest | null): Promise<void> {
     const sb = this.state.getHubSandbox(sandboxId);
     if (!sb || sb.phase !== "running" || !this.boat.pause) return;
-    console.log(`[hub] ${park ? "parking settled" : "pausing idle"} sandbox ${sandboxId} (${sb.project})`);
+    if (!park) console.log(`[hub] pausing idle sandbox ${sandboxId} (${sb.project})`);
+    if (park) {
+      // Checked before caching every chat's history (a refused park should cost little)...
+      const early = this.parkRefusal(sb, park, await this.readVmThreadRows(sandboxId));
+      if (early) {
+        console.log(`[hub] not parking ${sandboxId}: ${early} — trigger: ${park.trigger}`);
+        return;
+      }
+    }
     await this.cacheThreadProjections(sb).catch(() => {});
     if (park) {
+      // ...and again last before the stop: a chat may have started meanwhile
+      const refusal = this.parkRefusal(sb, park, await this.readVmThreadRows(sandboxId));
+      if (refusal) {
+        console.log(`[hub] not parking ${sandboxId}: ${refusal} — trigger: ${park.trigger}`);
+        return;
+      }
       // A parked chat is read from this copy only: without one, wait for the watchdog's next report
       const missing = this.openTopLevelThreads(sb).filter((tid) => !this.readProjectionCache(tid));
       const misses = (this.parkCacheMisses.get(sandboxId) ?? 0) + 1;
@@ -5420,6 +5502,7 @@ export class HubServer {
       }
       if (missing.length > 0) console.warn(`[hub] parking ${sandboxId} without a copy of chat(s) ${missing.join(", ")}`);
       this.parkCacheMisses.delete(sandboxId);
+      console.log(`[hub] parking settled sandbox ${sandboxId} (${sb.project}) — trigger: ${park.trigger}`);
     }
     this.bridges.get(sandboxId)?.stop();
     this.bridges.delete(sandboxId);
@@ -5590,7 +5673,7 @@ export class HubServer {
           // VM's watchdog may still report its pre-park state; the user's unsettle has not landed yet
           const unparked = this.unparkedAt.get(sb.sandboxId);
           if (unparked !== undefined && Date.now() - unparked < this.unparkHoldMs) break;
-          await this.parkHubSandbox(sb.sandboxId);
+          await this.parkHubSandbox(sb.sandboxId, { trigger: "watchdog all-archived" });
         } else if (this.config.boat.archiveAction === "stop") {
           await this.sleepHubSandbox(sb.sandboxId);
         } else {
