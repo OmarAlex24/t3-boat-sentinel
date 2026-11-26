@@ -282,12 +282,62 @@ function dialUpstreamTunnel(
 export interface HubTunnelProxyOptions {
   dialTimeoutMs?: number;
   totalDialTimeoutMs?: number;
+  onConnected?: (clientId: string, port: number, sandboxId: string) => void;
+}
+
+/**
+ * Races multiple candidate VMs in parallel and returns the first one that accepts the tunnel.
+ * Every losing candidate that opens later is immediately aborted so no upstream sockets leak.
+ */
+function raceDialCandidates(
+  candidates: MediaSandbox[],
+  port: number,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<{ ok: true; sandbox: MediaSandbox; connection: TunnelUpstreamConnection } | { ok: false }> {
+  if (candidates.length === 0 || signal?.aborted || timeoutMs <= 0) {
+    return Promise.resolve({ ok: false });
+  }
+  return new Promise((resolve) => {
+    const raceAbort = new AbortController();
+    const onParentAbort = () => raceAbort.abort();
+    signal?.addEventListener("abort", onParentAbort, { once: true });
+
+    let settled = false;
+    let remaining = candidates.length;
+
+    const finish = (
+      result: { ok: true; sandbox: MediaSandbox; connection: TunnelUpstreamConnection } | { ok: false },
+    ) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", onParentAbort);
+      raceAbort.abort();
+      resolve(result);
+    };
+
+    for (const candidate of candidates) {
+      void dialUpstreamTunnel(candidate, port, timeoutMs, raceAbort.signal).then((attempt) => {
+        if (attempt.ok) {
+          if (settled) {
+            attempt.connection.abort();
+            return;
+          }
+          finish({ ok: true, sandbox: candidate, connection: attempt.connection });
+          return;
+        }
+        remaining--;
+        if (remaining === 0) finish({ ok: false });
+      });
+    }
+  });
 }
 
 export class HubTunnelProxy {
   private readonly bySandbox = new Map<string, Set<ServerWebSocket<HubTunnelWsData>>>();
   private readonly dialTimeoutMs: number;
   private readonly totalDialTimeoutMs: number;
+  private readonly onConnected?: (clientId: string, port: number, sandboxId: string) => void;
 
   constructor(
     private readonly resolveCandidates: (clientId: string, port: number) => MediaSandbox[],
@@ -295,6 +345,7 @@ export class HubTunnelProxy {
   ) {
     this.dialTimeoutMs = opts.dialTimeoutMs ?? DEFAULT_DIAL_TIMEOUT_MS;
     this.totalDialTimeoutMs = opts.totalDialTimeoutMs ?? DEFAULT_TOTAL_DIAL_TIMEOUT_MS;
+    this.onConnected = opts.onConnected;
   }
 
   async handleUpgrade(
@@ -317,37 +368,47 @@ export class HubTunnelProxy {
     }
 
     const deadline = Date.now() + this.totalDialTimeoutMs;
-    for (const candidate of candidates) {
-      if (req.signal?.aborted) break;
-      const remainingMs = deadline - Date.now();
-      if (remainingMs <= 0) break;
-      const attempt = await dialUpstreamTunnel(
-        candidate,
-        port,
-        Math.min(this.dialTimeoutMs, remainingMs),
-        req.signal,
-      );
-      if (!attempt.ok) continue;
+    const [primary, ...fallbacks] = candidates;
 
-      const upgraded = (server as unknown as Bun.Server<HubTunnelWsData>).upgrade(req, {
-        data: {
-          kind: "hub-tunnel",
-          clientId,
-          sandboxId: candidate.sandboxId,
-          port,
-          connection: attempt.connection,
-          closed: false,
-          pingTimer: null,
-        } satisfies HubTunnelWsData,
-      });
-      if (!upgraded) {
-        attempt.connection.abort();
-        return new Response("WebSocket upgrade failed", { status: 400 });
+    let winner: { sandbox: MediaSandbox; connection: TunnelUpstreamConnection } | null = null;
+    if (primary && !req.signal?.aborted) {
+      const remainingMs = deadline - Date.now();
+      const first = await dialUpstreamTunnel(primary, port, Math.min(this.dialTimeoutMs, remainingMs), req.signal);
+      if (first.ok) {
+        winner = { sandbox: primary, connection: first.connection };
       }
-      return undefined;
     }
 
-    return portRefusedResponse(502, `Port ${port} is not reachable on any running sandbox`);
+    if (!winner && fallbacks.length > 0 && !req.signal?.aborted) {
+      const remainingMs = deadline - Date.now();
+      const raced = await raceDialCandidates(fallbacks, port, Math.min(this.dialTimeoutMs, remainingMs), req.signal);
+      if (raced.ok) {
+        winner = { sandbox: raced.sandbox, connection: raced.connection };
+      }
+    }
+
+    if (!winner) {
+      return portRefusedResponse(502, `Port ${port} is not reachable on any running sandbox`);
+    }
+
+    this.onConnected?.(clientId, port, winner.sandbox.sandboxId);
+
+    const upgraded = (server as unknown as Bun.Server<HubTunnelWsData>).upgrade(req, {
+      data: {
+        kind: "hub-tunnel",
+        clientId,
+        sandboxId: winner.sandbox.sandboxId,
+        port,
+        connection: winner.connection,
+        closed: false,
+        pingTimer: null,
+      } satisfies HubTunnelWsData,
+    });
+    if (!upgraded) {
+      winner.connection.abort();
+      return new Response("WebSocket upgrade failed", { status: 400 });
+    }
+    return undefined;
   }
 
   open(ws: ServerWebSocket<HubTunnelWsData>): void {

@@ -248,4 +248,39 @@ describe("HubTunnelProxy", () => {
     c2.ws.send("ping");
     expect(await c2.nextMessage()).toBe("sb-2:3000:ping");
   });
+
+  test("races fallback candidates in parallel and reports the winning sandbox via onConnected", async () => {
+    const vm1 = startMockVmTunnel("sb-1", { openPorts: [] }); // primary refuses
+    // Slow fallback that never responds within 1s
+    const slowServer = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      async fetch() {
+        await Bun.sleep(2_000);
+        return new Response("too slow", { status: 502 });
+      },
+    });
+    cleanups.push(() => slowServer.stop(true));
+    const slowSandbox: MediaSandbox = {
+      sandboxId: "sb-slow",
+      upstreamUrl: `http://127.0.0.1:${slowServer.port}`,
+      upstreamToken: "tok-slow",
+    };
+    const vmFast = startMockVmTunnel("sb-fast", { openPorts: [5173] });
+
+    const connected: Array<{ clientId: string; port: number; sandboxId: string }> = [];
+    const proxy = new HubTunnelProxy(() => [vm1.sandbox, slowSandbox, vmFast.sandbox], {
+      dialTimeoutMs: 1_500,
+      onConnected: (clientId, port, sandboxId) => connected.push({ clientId, port, sandboxId }),
+    });
+    const { baseWs } = startHubTunnelServer(proxy);
+
+    const startedAt = Date.now();
+    const client = await openClientWs(`${baseWs}${PREVIEW_TUNNEL_PATH}?port=5173`);
+    const elapsedMs = Date.now() - startedAt;
+    expect(elapsedMs).toBeLessThan(800); // raced past slowSandbox instead of waiting 1500ms sequentially
+    client.ws.send("fast-hit");
+    expect(await client.nextMessage()).toBe("sb-fast:5173:fast-hit");
+    expect(connected).toEqual([{ clientId: "client-1", port: 5173, sandboxId: "sb-fast" }]);
+  });
 });
