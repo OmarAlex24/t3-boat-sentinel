@@ -26,6 +26,7 @@ hub:
   # Fast Native Desktop Preview Gateway (60-120 FPS in T3 Desktop Electron <webview>, 0 disk on Sentinel)
   # preview:
   #   mode: desktop-proxy        # "desktop-proxy" (recommended for Desktop) or "server" (default JPEG stream)
+  #   projectAgentTabs: true     # Project agent-opened server previews to native desktop webview tabs (default true in desktop-proxy)
   #   # Optional: offload preview HTTP + HMR WebSocket traffic directly to Cloudflare's edge (1 Worker for all sandboxes).
   #   # Sentinel NEVER needs a Cloudflare API key — only a locally generated 32-byte shared secret!
   #   # edgeWorkerHost: example.com

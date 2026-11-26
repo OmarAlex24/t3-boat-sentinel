@@ -1151,6 +1151,10 @@ export class LifecycleManager {
       envVars.push(`PROJECT_WORKDIR=${shellQuote(project.workdir)}`);
       envVars.push(`PROJECT_TITLE=${shellQuote(projectName)}`);
     }
+    const previewAllowedHosts = defaultPreviewAllowedHosts(this.config);
+    if (previewAllowedHosts) {
+      envVars.push(`T3_PREVIEW_ALLOWED_HOSTS=${shellQuote(previewAllowedHosts)}`);
+    }
 
     // Runtime installs at boot can take minutes (Antigravity validation alone up to 90s)
     const provisionTimeout = bootAcpAgents.length > 0 || bootProviders.length > 0 ? 900 : 300;
@@ -1426,6 +1430,25 @@ async function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined
   } finally {
     signal.removeEventListener("abort", onAbort);
   }
+}
+
+export function defaultPreviewAllowedHosts(config: SentinelConfig): string | null {
+  if (config.hub?.preview?.mode !== "desktop-proxy") return null;
+  const provider = config.provider;
+  if (!provider || provider.type === "boat") return ".on.boat.dev";
+  if (provider.type === "celesto") return ".celesto.ai";
+  if (provider.type === "sandbox-sdk") {
+    const known: Record<string, string> = {
+      e2b: ".e2b.app",
+      daytona: ".daytona.works",
+      modal: ".modal.run",
+      railway: ".up.railway.app",
+      vercel: ".vercel.run",
+      freestyle: ".freestyle.sh",
+    };
+    return known[provider.adapter.toLowerCase()] ?? `.${config.domain}`;
+  }
+  return null;
 }
 
 function shellQuote(s: string): string {

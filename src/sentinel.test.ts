@@ -18,7 +18,7 @@ import {
   type KlavClient,
 } from "./klav.ts";
 import { HubWakeCooldownError, redactForLog, wakeBackoffMs } from "./hub-wake.ts";
-import { LifecycleManager } from "./lifecycle.ts";
+import { LifecycleManager, defaultPreviewAllowedHosts } from "./lifecycle.ts";
 import { formatRpcFailure } from "./hub-mcp.ts";
 import { buildPlaceholderThread, failPlaceholderThread, placeholderInputFrom } from "./hub-placeholder.ts";
 import { chatThreadIdOf, threadGoneError } from "./hub.ts";
@@ -386,7 +386,14 @@ describe("config & auth primitives", () => {
   test("loadConfig rejects invalid hub.preview mode, mismatched edge settings, placeholders, and bad streamQuality", () => {
     const base = "hub:\n  host: hub.example.com\n  preview:\n";
     expect(() => loadConfig(writePreviewConfig(`${base}    mode: sideways\n`))).toThrow("hub.preview.mode");
+    expect(() => loadConfig(writePreviewConfig(`${base}    projectAgentTabs: yes\n`))).toThrow("hub.preview.projectAgentTabs");
     expect(() => loadConfig(writePreviewConfig(`${base}    edgeWorkerHost: preview.example.com\n`))).toThrow("must be set together");
+
+    const dpBoat = loadConfig(writePreviewConfig(`${base}    mode: desktop-proxy\n`));
+    expect(defaultPreviewAllowedHosts(dpBoat)).toBe(".on.boat.dev");
+    expect(defaultPreviewAllowedHosts({ ...dpBoat, provider: { type: "celesto", apiKey: "k" } })).toBe(".celesto.ai");
+    expect(defaultPreviewAllowedHosts({ ...dpBoat, provider: { type: "sandbox-sdk", adapter: "e2b" } })).toBe(".e2b.app");
+    expect(defaultPreviewAllowedHosts({ ...dpBoat, hub: { ...dpBoat.hub!, preview: { mode: "server" } } })).toBeNull();
     expect(() => loadConfig(writePreviewConfig(`${base}    edgeWorkerSecret: edge-secret\n`))).toThrow("must be set together");
     expect(() =>
       loadConfig(writePreviewConfig(`${base}    edgeWorkerHost: preview.example.com\n    edgeWorkerSecret: \${EDGE_SECRET_UNSET_X}\n`)),
