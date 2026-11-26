@@ -45,6 +45,7 @@ import { ATTACHMENT_UPLOAD_URL_TTL_MS, parseUploadRequest } from "./hub-attachme
 import { loadT3Contracts } from "./testing/t3-contracts.ts";
 import { HubMediaProxy, PREVIEW_ACK, newMediaWsData, type HubMediaWsData } from "./hub-media.ts";
 import { PREVIEW_BOOTSTRAP_PARAM, PREVIEW_COOKIE_NAME, sandboxSlug } from "./hub-port-gateway.ts";
+import { PREVIEW_TUNNEL_PATH, PREVIEW_TUNNEL_PORT_REFUSED_HEADER } from "./hub-tunnel.ts";
 
 /**
  * The installed T3 app's own RPC schemas (`T3_APP_ASAR`, else the macOS Nightly app), or null when
@@ -1160,6 +1161,9 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
     // Preview media, like T3's /api/preview-stream: who connected (and how), and what they sent
     const mediaConnections: Array<{ path: string; query: Record<string, string>; authorization: string | null }> = [];
     const mediaMessages: string[] = [];
+    /** Open ports simulated for T3 Desktop's `/api/preview/tunnel?port=<port>` endpoint. */
+    const tunnelPorts = new Set<number>();
+    const tunnelConnections: Array<{ port: number; query: Record<string, string>; authorization: string | null }> = [];
     const previewEventStreams: Array<{ ws: { sendText(data: string): unknown }; requestId: string }> = [];
     const discoveredServerStreams: Array<{ ws: { sendText(data: string): unknown }; requestId: string }> = [];
     /**
@@ -1177,6 +1181,25 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       hostname: "127.0.0.1",
       fetch(req, srv) {
         const url = new URL(req.url);
+        if (url.pathname === PREVIEW_TUNNEL_PATH) {
+          const port = Number(url.searchParams.get("port") ?? "0");
+          tunnelConnections.push({
+            port,
+            query: Object.fromEntries(url.searchParams),
+            authorization: req.headers.get("authorization"),
+          });
+          if (!tunnelPorts.has(port)) {
+            return new Response("Port refused", {
+              status: 502,
+              headers: { [PREVIEW_TUNNEL_PORT_REFUSED_HEADER]: "1" },
+            });
+          }
+          if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
+            (srv as unknown as Bun.Server<{ tunnelPort: number }>).upgrade(req, { data: { tunnelPort: port } });
+            return undefined;
+          }
+          return new Response("Upgrade Required", { status: 426 });
+        }
         if (url.pathname.startsWith("/api/preview-stream/") || url.pathname.startsWith("/api/device-hub/")) {
           mediaConnections.push({
             path: url.pathname,
@@ -1221,6 +1244,12 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
           if ((ws.data as { media?: boolean } | undefined)?.media) ws.sendBinary(new TextEncoder().encode(`frame-from-${vmTag}`));
         },
         message(ws, raw) {
+          const tunnelPort = (ws.data as { tunnelPort?: number } | undefined)?.tunnelPort;
+          if (tunnelPort !== undefined) {
+            if (typeof raw === "string") ws.sendText(`tunnel:${vmTag}:${tunnelPort}:${raw}`);
+            else ws.sendBinary(Buffer.concat([Buffer.from(`tunnel:${vmTag}:${tunnelPort}:`), Buffer.from(raw)]));
+            return;
+          }
           if ((ws.data as { media?: boolean } | undefined)?.media) {
             const text = typeof raw === "string" ? raw : new TextDecoder().decode(raw);
             mediaMessages.push(text);
@@ -1602,6 +1631,8 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       threads,
       mediaConnections,
       mediaMessages,
+      tunnelPorts,
+      tunnelConnections,
       previewEventStreams,
       discoveredServerStreams,
       pushPreviewEvent,
@@ -6269,6 +6300,103 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       await until(() => awake.binary.length > 0);
       expect(awake.binary).toEqual(["frame-from-vm-pv-sleep"]);
     });
+
+    test("native /api/preview/tunnel routes localhost ports to the owning VM, reuses media tickets, and closes on VM sleep", async () => {
+      const { vm1, vm2, client, cfg, handle } = await twoChats("vm-tun");
+      const hub = handle.hub!;
+      vm2.tunnelPorts.add(5173);
+
+      const ticket = await mediaTicket(client, cfg);
+      const wsUpgradeHeaders = {
+        host: cfg.hub!.host,
+        upgrade: "websocket",
+        connection: "Upgrade",
+        "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==",
+        "sec-websocket-version": "13",
+      };
+
+      // Unauthenticated request is rejected
+      const unauth = await fetch(`http://127.0.0.1:${handle.server.port}${PREVIEW_TUNNEL_PATH}?port=5173`, {
+        headers: wsUpgradeHeaders,
+      });
+      expect(unauth.status).toBe(401);
+
+      // Port 3773 (T3 control port) is always refused with x-t3-tunnel-port-refused
+      const reserved = await fetch(
+        `http://127.0.0.1:${handle.server.port}${PREVIEW_TUNNEL_PATH}?wsTicket=${ticket}&port=3773`,
+        { headers: wsUpgradeHeaders },
+      );
+      expect(reserved.status).toBe(403);
+      expect(reserved.headers.get(PREVIEW_TUNNEL_PORT_REFUSED_HEADER)).toBe("1");
+
+      // Unbound port returns 502 + x-t3-tunnel-port-refused so T3 Desktop stops cleanly
+      const closedPort = await fetch(
+        `http://127.0.0.1:${handle.server.port}${PREVIEW_TUNNEL_PATH}?wsTicket=${ticket}&port=9999`,
+        { headers: wsUpgradeHeaders },
+      );
+      expect(closedPort.status).toBe(502);
+      expect(closedPort.headers.get(PREVIEW_TUNNEL_PORT_REFUSED_HEADER)).toBe("1");
+
+      // Port 5173 is only open on vm2: Hub falls through vm1 and connects to vm2, stripping wsTicket
+      const openTunnel = async (port: number) => {
+        const ws = new WebSocket(
+          `ws://127.0.0.1:${handle.server.port}${PREVIEW_TUNNEL_PATH}?wsTicket=${ticket}&port=${port}`,
+          { headers: { host: cfg.hub!.host } } as unknown as string[],
+        );
+        ws.binaryType = "arraybuffer";
+        cleanups.push(() => ws.close());
+        const queue: Array<string | Uint8Array> = [];
+        const waiters: Array<(v: string | Uint8Array) => void> = [];
+        ws.addEventListener("message", (ev) => {
+          const val = typeof ev.data === "string" ? ev.data : new Uint8Array(ev.data as ArrayBuffer);
+          const w = waiters.shift();
+          if (w) w(val);
+          else queue.push(val);
+        });
+        const closed = new Promise<{ code: number; reason: string }>((resolve) => {
+          ws.addEventListener("close", (ev) => resolve({ code: ev.code, reason: ev.reason }));
+        });
+        await new Promise<void>((resolve, reject) => {
+          ws.addEventListener("open", () => resolve(), { once: true });
+          ws.addEventListener("error", () => reject(new Error(`tunnel failed for port ${port}`)), { once: true });
+        });
+        return {
+          ws,
+          next: () => (queue.length > 0 ? Promise.resolve(queue.shift()!) : new Promise<string | Uint8Array>((r) => waiters.push(r))),
+          closed,
+        };
+      };
+
+      const t1 = await openTunnel(5173);
+      t1.ws.send(new TextEncoder().encode("GET / HTTP/1.1"));
+      const r1 = await t1.next();
+      expect(new TextDecoder().decode(r1 as Uint8Array)).toBe("tunnel:vm-tun2:5173:GET / HTTP/1.1");
+      expect(hub.tunnelSocketCount("sb-2")).toBe(1);
+      expect(vm2.tunnelConnections.at(-1)).toEqual({
+        port: 5173,
+        query: { port: "5173" },
+        authorization: `Bearer ${handle.state.getHubSandbox("sb-2")!.upstreamToken}`,
+      });
+
+      // Same cached media ticket works for concurrent tunnel sockets, and active thread prioritizes its VM
+      vm1.tunnelPorts.add(5173);
+      client.request("touch-a", "preview.list", { threadId: "thread-A" });
+      await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "touch-a");
+      const t2 = await openTunnel(5173);
+      t2.ws.send("hello-a");
+      expect(await t2.next()).toBe("tunnel:vm-tun1:5173:hello-a");
+      expect(hub.tunnelSocketCount("sb-1")).toBe(1);
+      expect(hub.tunnelSocketCount()).toBe(2);
+
+      // Sleeping sb-2 closes t1 while keeping t2 alive
+      await hub.sleepHubSandbox("sb-2");
+      const c1 = await t1.closed;
+      expect([1000, 1001]).toContain(c1.code);
+      expect(hub.tunnelSocketCount("sb-2")).toBe(0);
+      expect(hub.tunnelSocketCount("sb-1")).toBe(1);
+      t2.ws.send("still-alive");
+      expect(await t2.next()).toBe("tunnel:vm-tun1:5173:still-alive");
+    }, 15_000);
   });
 
   describe("desktop-proxy preview integration", () => {

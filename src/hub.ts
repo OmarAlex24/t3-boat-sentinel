@@ -80,6 +80,7 @@ import {
   type PreviewStreamTuneOptions,
 } from "./hub-media.ts";
 import { HubPortGateway, PREVIEW_BOOTSTRAP_PATH, parseLoopbackPreviewUrl } from "./hub-port-gateway.ts";
+import { HubTunnelProxy, PREVIEW_TUNNEL_PATH, type HubTunnelWsData } from "./hub-tunnel.ts";
 import {
   buildPlaceholderThread,
   failPlaceholderThread,
@@ -150,9 +151,10 @@ export interface HubWsData {
   upstreamRequests: Map<string, { sandboxId: string; upReqId: string }>;
 }
 
-/** Data of any socket the Hub upgrades: its RPC socket, or a media socket piped to a VM. */
-export type HubSocketData = HubWsData | HubMediaWsData;
+/** Data of any socket the Hub upgrades: its RPC socket, media socket, or native preview tunnel socket. */
+export type HubSocketData = HubWsData | HubMediaWsData | HubTunnelWsData;
 export type { HubMediaWsData } from "./hub-media.ts";
+export type { HubTunnelWsData } from "./hub-tunnel.ts";
 
 /** An event stream the Hub opens on every open VM bridge for one client request. */
 interface FanoutStream {
@@ -1028,6 +1030,10 @@ export class HubServer {
   private readonly urlTokenToSandbox = new Map<string, string>();
   /** Preview streams and device-hub sockets, piped to the VM that runs the chat. */
   private readonly media = new HubMediaProxy((data) => this.resolveMediaTarget(data));
+  /** Native T3 Desktop preview tunnel (`/api/preview/tunnel?port=<port>`), routed to the owning VM. */
+  private readonly tunnel = new HubTunnelProxy((clientId, port) => this.resolveTunnelCandidates(clientId, port));
+  /** Most recently active running sandbox per client, used to prioritize `/api/preview/tunnel` routing. */
+  private readonly lastActiveSandboxByClient = new Map<string, string>();
   /** Lazy public port gateway for desktop-proxy previews; present only in that mode. */
   readonly portGateway?: HubPortGateway;
   /** How long a media socket waits for its chat's VM to finish booting or waking. */
@@ -1294,6 +1300,7 @@ export class HubServer {
     }
     this.bridges.clear();
     this.media.closeAll(MEDIA_RETRY_CLOSE, "The Hub is restarting");
+    this.tunnel.closeAll(1001, "The Hub is restarting");
     this.portGateway?.closeAll();
     this.lifecycle.providerSessions.stop();
   }
@@ -2016,6 +2023,20 @@ export class HubServer {
       return undefined;
     }
 
+    // 9b. Native T3 Desktop loopback preview tunnel (`/api/preview/tunnel?port=<port>`)
+    if (path === PREVIEW_TUNNEL_PATH) {
+      const wsTicket = url.searchParams.get("wsTicket");
+      const clientId =
+        (wsTicket ? (this.auth.checkTicket(wsTicket, "media") ?? this.auth.checkTicket(wsTicket, "rpc")) : null) ??
+        authenticateClient(hub.clients, req.headers)?.id ??
+        null;
+      if (!clientId) {
+        return withCors(Response.json({ error: "unauthorized" }, { status: 401 }));
+      }
+      const res = await this.tunnel.handleUpgrade(req, url, server, clientId);
+      return res ? withCors(res) : undefined;
+    }
+
     // 10. WebSocket upgrade
     if (isUpgrade) {
       const wsTicket = url.searchParams.get("wsTicket");
@@ -2095,6 +2116,23 @@ export class HubServer {
   /** Open media sockets piped to a VM (every VM when omitted). */
   mediaSocketCount(sandboxId?: string): number {
     return this.media.count(sandboxId);
+  }
+
+  onTunnelOpen(ws: ServerWebSocket<HubTunnelWsData>): void {
+    this.tunnel.open(ws);
+  }
+
+  onTunnelMessage(ws: ServerWebSocket<HubTunnelWsData>, msg: string | Buffer): void {
+    this.tunnel.message(ws, msg);
+  }
+
+  onTunnelClose(ws: ServerWebSocket<HubTunnelWsData>, code?: number, reason?: string): void {
+    this.tunnel.close(ws, code, reason);
+  }
+
+  /** Open native preview tunnel sockets piped to a VM (every VM when omitted). */
+  tunnelSocketCount(sandboxId?: string): number {
+    return this.tunnel.count(sandboxId);
   }
 
   private previewStreamTuneOptions(): PreviewStreamTuneOptions | undefined {
@@ -2324,6 +2362,7 @@ export class HubServer {
       const sandboxId = this.threadToSandbox.get(extractThreadId(payload) ?? "");
       const bridge = sandboxId ? this.bridges.get(sandboxId) : undefined;
       if (bridge?.isOpen() && this.state.getHubSandbox(sandboxId!)?.phase === "running") {
+        this.lastActiveSandboxByClient.set(ws.data.clientId, sandboxId!);
         bridge.forwardToClient(ws, reqId, tag, payload, headers);
       } else {
         sendRpcExitSuccess(ws, reqId, undefined);
@@ -4408,6 +4447,7 @@ export class HubServer {
     }
     try {
       const sb = await this.resolveSandboxForThread(threadId);
+      this.lastActiveSandboxByClient.set(ws.data.clientId, sb.sandboxId);
       const bridge = await this.ensureBridgeOpen(sb);
       let forwardedPayload = payload;
       if (tag === "preview.open" && this.portGateway && payload && typeof payload === "object") {
@@ -6733,9 +6773,49 @@ export class HubServer {
     }
   }
 
-  /** Drops every lazy preview endpoint and discovered server of a VM that is asleep, gone, or being destroyed. */
+  /** Ordered running VMs that could own `port` for `/api/preview/tunnel`. */
+  private resolveTunnelCandidates(clientId: string, port: number): HubSandboxRecord[] {
+    const running = this.state
+      .listHubSandboxes()
+      .filter(
+        (sb) =>
+          sb.phase === "running" &&
+          Boolean(sb.upstreamUrl) &&
+          !this.destroyingSandboxes.has(sb.sandboxId) &&
+          !this.inFlightSleeps.has(sb.sandboxId),
+      )
+      .sort((a, b) => (b.lastActiveAt ?? "").localeCompare(a.lastActiveAt ?? ""));
+    if (running.length <= 1) return running;
+
+    const byId = new Map(running.map((sb) => [sb.sandboxId, sb]));
+    const activeId = this.lastActiveSandboxByClient.get(clientId);
+    const ordered: HubSandboxRecord[] = [];
+    const seen = new Set<string>();
+    const add = (sb: HubSandboxRecord | undefined) => {
+      if (!sb || seen.has(sb.sandboxId)) return;
+      seen.add(sb.sandboxId);
+      ordered.push(sb);
+    };
+
+    const hasPort = (sandboxId: string) =>
+      this.discoveredServersBySandbox.get(sandboxId)?.servers.some((s) => s.port === port) ?? false;
+
+    if (activeId && hasPort(activeId)) add(byId.get(activeId));
+    for (const sb of running) {
+      if (hasPort(sb.sandboxId)) add(sb);
+    }
+    if (activeId) add(byId.get(activeId));
+    for (const sb of running) add(sb);
+    return ordered;
+  }
+
+  /** Drops every lazy preview endpoint, native preview tunnel, and discovered server of a VM that is asleep, gone, or being destroyed. */
   private invalidateSandboxNetworking(sandboxId: string): void {
+    this.tunnel.closeSandbox(sandboxId, 1001, "Sandbox stopped");
     this.portGateway?.invalidateSandbox(sandboxId);
+    for (const [cid, mapped] of Array.from(this.lastActiveSandboxByClient)) {
+      if (mapped === sandboxId) this.lastActiveSandboxByClient.delete(cid);
+    }
     const upReqId = this.discoveredServersUpstream.get(sandboxId);
     if (upReqId) {
       this.discoveredServersUpstream.delete(sandboxId);
