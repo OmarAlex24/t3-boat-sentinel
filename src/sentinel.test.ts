@@ -1353,7 +1353,8 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
           }
 
           if (frame.tag === "orchestration.subscribeShell") {
-            shellStream = { ws, requestId: frame.id };
+            // The Hub's persistent stream; a one-off read (a park's check) answers the same snapshot
+            if (frame.id === "hub-shell" || !shellStream) shellStream = { ws, requestId: frame.id };
             ws.sendText(
               JSON.stringify({
                 _tag: "Chunk",
@@ -2957,7 +2958,9 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       const parked = await awakeChatWithPanels("vm-panels-delete");
       parked.vm.projectionAttachments.push({ type: "image", id: "img-1", name: "shot.png", mimeType: "image/png", sizeBytes: 64 });
       parked.vm.assetFiles.set("img-1", { bytes: PNG(64), mimeType: "image/png" });
-      await parked.handle.hub!.sleepHubSandbox(parked.sandboxId, { park: true });
+      // Parked only once the chat is settled and idle on its VM
+      parked.vm.pushThreadRow("thread-zz", { status: "idle", settledAt: new Date().toISOString() });
+      await parked.handle.hub!.sleepHubSandbox(parked.sandboxId, { park: { trigger: "test" } });
       expect(parked.handle.state.getHubSandbox(parked.sandboxId)!.parkedAt).toBeTruthy();
       parked.client.request("refs", "vcs.listRefs", { cwd: parked.worktree, limit: 100 });
       const refs = await parked.client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "refs");
@@ -3812,6 +3815,180 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       expect(handle.state.getHubSandbox(sandboxId)).toBeUndefined();
       expect(handle.state.getHub()?.expiredThreads?.["thread-p"]).toMatchObject({ reason: "gone-remotely" });
       expect((await shellThreads(client, "shell2")).map((t) => t.id)).toEqual(["thread-p"]);
+    });
+
+    // ── A park never stops a VM with a running or open chat (whoever asks) ──────────────────────
+
+    /** One running chat on a VM that parks settled chats; nothing settled yet. */
+    async function chatOnParkingHub(prefix: string, opts: { failCommands?: string[] } = {}) {
+      const vm = startFakeVmT3Server(prefix, { failCommands: opts.failCommands });
+      cleanups.push(() => vm.server.stop(true));
+      const hub = await startHubWithVm(vm, `t3-sentinel-hub-${prefix}-`, {
+        patchConfig: (cfg) => {
+          const settled = settledConfig(cfg);
+          return { ...settled, boat: { ...settled.boat, settleAction: "park" } };
+        },
+      });
+      const client: HubClient = await connectHubClient(hub.handle, hub.cfg);
+      await launchThreadOnHub(client, "thread-p");
+      const sandboxId = hub.handle.state.listHubSandboxes()[0].sandboxId;
+      return { vm, client, sandboxId, ...hub };
+    }
+
+    /** A delegated child of `parentId` as its VM lists it (the Hub has no row for it), settled and done. */
+    function delegatedChildRow(vm: ReturnType<typeof startFakeVmT3Server>, childId: string, parentId: string) {
+      const parent = vm.threads.get(parentId)!;
+      return {
+        ...parent,
+        id: childId,
+        title: "paquete-dominio-ola1-p4",
+        lineage: { parentThreadId: parentId, relationshipToParent: "subagent", rootThreadId: parentId },
+        status: "completed",
+        activeRunId: null,
+        activityRunStatus: null,
+        settledAt: new Date().toISOString(),
+      };
+    }
+
+    /** Calls a Hub MCP tool with a token paired under `label`, like an MCP client (T3 Code Desktop, zumith...). */
+    async function mcpTool(handle: SentinelServerHandle, cfg: SentinelConfig, label: string, name: string, args: Record<string, unknown>) {
+      const base = `http://127.0.0.1:${handle.server.port}`;
+      const tok = (await (
+        await fetch(`${base}/api/token`, {
+          method: "POST",
+          headers: { host: cfg.controlHost, authorization: `Bearer ${cfg.controlSecret}`, "content-type": "application/json" },
+          body: JSON.stringify({ slot: "hub", label }),
+        })
+      ).json()) as { token: string };
+      const res = await fetch(`${base}/mcp`, {
+        method: "POST",
+        headers: { host: "boat.boat.example.com", authorization: `Bearer ${tok.token}`, "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }),
+      });
+      const body = (await res.json()) as { result: { isError?: boolean; structuredContent: Record<string, unknown> } };
+      return { result: body.result, token: tok.token };
+    }
+
+    /** Captures the Hub's log lines for the rest of the test. */
+    function captureLogs(): string[] {
+      const logged: string[] = [];
+      const origLog = console.log;
+      console.log = (...args: unknown[]) => {
+        logged.push(args.map(String).join(" "));
+        origLog(...args);
+      };
+      cleanups.push(() => (console.log = origLog));
+      return logged;
+    }
+
+    test("an MCP settle of a delegated chat never parks the VM while its parent chat runs", async () => {
+      const { vm, boat, handle, cfg, sandboxId } = await chatOnParkingHub("park-mcp-child");
+      // As in production: the parent runs a turn; its delegated child finished and is listed by the VM only
+      vm.pushThreadRow("thread-p", { status: "running", activeRunId: "run-22", activityRunStatus: "running", settledAt: null });
+      const childId = "thread:delegated-task:command%3Amcp%3Aabc%3Adelegate-task%3Apaquete-dominio-ola1-p4";
+      vm.threads.set(childId, delegatedChildRow(vm, childId, "thread-p"));
+      (handle.hub as unknown as { bindThreadToSandbox(t: string, s: string): void }).bindThreadToSandbox(childId, sandboxId);
+      const logged = captureLogs();
+      const seenBefore = vm.seenMethods.length;
+
+      const { result, token } = await mcpTool(handle, cfg, "zumith", "t3_thread_organize", { threadId: childId, action: "settle" });
+      expect(result.isError).toBeUndefined();
+      expect(result.structuredContent).toMatchObject({ ok: true, threadId: childId, action: "settle", sandboxParked: false });
+      // The settle reached the VM; the VM keeps running
+      expect(
+        vm.seenMethods.some(
+          (m) => m.tag === "orchestration.dispatchCommand" && (m.payload as { type?: string; threadId?: string }).type === "thread.settle" && (m.payload as { threadId?: string }).threadId === childId,
+        ),
+      ).toBe(true);
+      expect(boat.stopped).toEqual([]);
+      expect(handle.state.getHubSandbox(sandboxId)).toMatchObject({ phase: "running" });
+      expect(handle.state.getHubSandbox(sandboxId)?.parkedAt ?? null).toBeNull();
+      // Refused before caching any chat's history
+      expect(vm.seenMethods.slice(seenBefore).some((m) => m.tag === "orchestration.getThreadProjection")).toBe(false);
+      // Who asked and what happened is logged once; no park, no token
+      const organize = logged.filter((l) => l.includes("t3_thread_organize by"));
+      expect(organize).toHaveLength(1);
+      expect(organize[0]).toContain(`by "zumith": action=settle thread=${childId} sandbox=${sandboxId} -> settled; VM not parked`);
+      expect(logged.some((l) => l.includes(`not parking ${sandboxId}: chat thread-p is running`))).toBe(true);
+      expect(logged.some((l) => l.includes("parking settled"))).toBe(false);
+      expect(logged.some((l) => l.includes(token))).toBe(false);
+    });
+
+    test("an MCP settle of a delegated chat does not park even when every other chat is done", async () => {
+      const { vm, boat, handle, cfg, sandboxId } = await chatOnParkingHub("park-mcp-child-idle");
+      // The parent is settled and idle, but the settled chat is a child: it never parks the VM by itself
+      vm.pushThreadRow("thread-p", { status: "idle", activeRunId: null, settledAt: new Date().toISOString() });
+      const childId = "thread:delegated-task:child-2";
+      vm.threads.set(childId, delegatedChildRow(vm, childId, "thread-p"));
+      (handle.hub as unknown as { bindThreadToSandbox(t: string, s: string): void }).bindThreadToSandbox(childId, sandboxId);
+      const logged = captureLogs();
+      const { result } = await mcpTool(handle, cfg, "T3 Code Desktop", "t3_thread_organize", { threadId: childId, action: "settle" });
+      expect(result.structuredContent).toMatchObject({ ok: true, sandboxParked: false });
+      expect(boat.stopped).toEqual([]);
+      expect(logged.some((l) => l.includes(`not parking ${sandboxId}: chat ${childId} is a delegated chat`))).toBe(true);
+    });
+
+    test("an MCP settle the VM refuses parks nothing", async () => {
+      const { vm, boat, handle, cfg, sandboxId } = await chatOnParkingHub("park-mcp-refused", { failCommands: ["thread.settle"] });
+      vm.pushThreadRow("thread-p", { status: "idle", activeRunId: null, settledAt: new Date().toISOString() });
+      const logged = captureLogs();
+      const { result } = await mcpTool(handle, cfg, "T3 Code Mobile", "t3_thread_organize", { threadId: "thread-p", action: "settle" });
+      expect(result.structuredContent).toMatchObject({ ok: true, sandboxParked: false });
+      expect(boat.stopped).toEqual([]);
+      expect(handle.state.getHubSandbox(sandboxId)?.phase).toBe("running");
+      expect(logged.find((l) => l.includes("t3_thread_organize by"))).toContain("the VM refused the settle");
+    });
+
+    test("an MCP settle of the VM's last open chat still parks it, and says who asked", async () => {
+      const { vm, boat, handle, cfg, sandboxId } = await chatOnParkingHub("park-mcp-last");
+      // The VM applied the settle: the chat is settled and idle (the fake VM does not apply commands itself)
+      vm.pushThreadRow("thread-p", { status: "idle", activeRunId: null, settledAt: new Date().toISOString() });
+      const logged = captureLogs();
+      const { result } = await mcpTool(handle, cfg, "zumith", "t3_thread_organize", { threadId: "thread-p", action: "settle" });
+      expect(result.structuredContent).toMatchObject({ ok: true, sandboxParked: true });
+      expect(boat.stopped).toEqual([sandboxId]);
+      expect(handle.state.getHubSandbox(sandboxId)?.parkedAt).toBeTruthy();
+      expect(
+        logged.some((l) => l.includes(`parking settled sandbox ${sandboxId} (my-app) — trigger: MCP t3_thread_organize settle of thread-p by "zumith"`)),
+      ).toBe(true);
+      expect(logged.find((l) => l.includes("t3_thread_organize by"))).toContain("-> VM parked");
+    });
+
+    test("watchdog all-archived does not park a VM whose chat runs (fresh VM state), and parks it once it is settled", async () => {
+      const { vm, boat, handle, client, sandboxId } = await chatOnParkingHub("park-watchdog-running");
+      // The Hub's row says settled and idle (what it cached), but the VM now runs a turn in that chat
+      const settledRow = { ...vm.threads.get("thread-p")!, status: "idle", activeRunId: null, settledAt: new Date().toISOString() };
+      vm.pushThreadRow("thread-p", settledRow);
+      await client.waitForFrame(shellThreadUpdate("thread-p", (t) => typeof t.settledAt === "string"));
+      vm.threads.set("thread-p", { ...settledRow, status: "running", activeRunId: "run-23", settledAt: null });
+      const logged = captureLogs();
+      await handle.hub!.handleWatchdogEvent({ slot: `hub:${sandboxId}`, sandboxId, event: "all-archived" });
+      expect(boat.stopped).toEqual([]);
+      expect(handle.state.getHubSandbox(sandboxId)?.phase).toBe("running");
+      expect(logged.some((l) => l.includes(`not parking ${sandboxId}: chat thread-p is running — trigger: watchdog all-archived`))).toBe(true);
+
+      // An open top-level chat not settled also keeps it running (e.g. a second chat on the VM)
+      vm.threads.set("thread-p", settledRow);
+      vm.threads.set("thread-open", { ...settledRow, id: "thread-open", settledAt: null });
+      await handle.hub!.handleWatchdogEvent({ slot: `hub:${sandboxId}`, sandboxId, event: "all-archived" });
+      expect(boat.stopped).toEqual([]);
+      expect(logged.some((l) => l.includes(`not parking ${sandboxId}: chat thread-open is not settled`))).toBe(true);
+
+      // Once everything is settled, the next report parks it
+      vm.threads.delete("thread-open");
+      await handle.hub!.handleWatchdogEvent({ slot: `hub:${sandboxId}`, sandboxId, event: "all-archived" });
+      expect(boat.stopped).toEqual([sandboxId]);
+      expect(handle.state.getHubSandbox(sandboxId)?.parkedAt).toBeTruthy();
+      expect(logged.some((l) => l.includes(`parking settled sandbox ${sandboxId} (my-app) — trigger: watchdog all-archived`))).toBe(true);
+    });
+
+    test("idle sleep is not held back by the park check", async () => {
+      const { vm, boat, handle, sandboxId } = await chatOnParkingHub("park-idle-unaffected");
+      vm.pushThreadRow("thread-p", { status: "idle", activeRunId: null, settledAt: null });
+      await handle.hub!.handleWatchdogEvent({ slot: `hub:${sandboxId}`, sandboxId, event: "idle" });
+      expect(boat.stopped).toEqual([sandboxId]);
+      expect(handle.state.getHubSandbox(sandboxId)).toMatchObject({ phase: "sleeping" });
+      expect(handle.state.getHubSandbox(sandboxId)?.parkedAt ?? null).toBeNull();
     });
   });
 
