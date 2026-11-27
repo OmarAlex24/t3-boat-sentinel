@@ -22,7 +22,17 @@
 # Images without one (e.g. Celesto: no systemctl, custom PID 1) use supervisor mode instead: a small
 # bash loop per service (`~/.t3-sentinel/t3-supervisor.sh`, `watchdog-supervisor.sh`) started with
 # nohup/setsid, one instance each (flock + pidfile). T3_SENTINEL_SUPERVISOR=1|0 forces the choice.
-set -euo pipefail
+set -Eeuo pipefail
+
+# An unexpected failure names its line and command on stderr. Without this, a command whose output
+# goes to a log file fails the script with an empty error (the Hub sees only `exit 1`). Handled
+# failures (`|| true`, `if` tests) never trigger it; command substitutions report through their caller.
+on_err() {
+  local rc=$? line=$1 cmd=$2
+  [ "$BASH_SUBSHELL" = 0 ] || return 0
+  printf '[provision] unexpected failure (exit %s) at line %s: %.200s\n' "$rc" "$line" "${cmd%%$'\n'*}" >&2
+}
+trap 'on_err "$LINENO" "$BASH_COMMAND"' ERR
 
 T3_VERSION="${T3_VERSION:-latest}"
 T3_CHANNEL="${T3_CHANNEL:-stable}"
@@ -217,7 +227,18 @@ if [ ! -x "$t3" ]; then
   fi
   restart_t3=1
 elif [ "$T3_VERSION" = "latest" ]; then
-  "$t3" update --channel "$T3_CHANNEL" --yes >"$sentinel_dir/update.log" 2>&1
+  if ! "$t3" update --channel "$T3_CHANNEL" --yes >"$sentinel_dir/update.log" 2>&1; then
+    # A wake or boot keeps a working T3 rather than failing on a transient release-listing error;
+    # a bake fails, so it never freezes an outdated T3 into the golden snapshot
+    if [ "$BAKE_CLEAN" != "1" ] && "$t3" --version >/dev/null 2>&1; then
+      echo "[provision] warning: t3 update failed; keeping ${installed_ver:-the installed t3}. End of $sentinel_dir/update.log:" >&2
+      tail -n 20 "$sentinel_dir/update.log" >&2 || true
+    else
+      echo "[provision] t3 update failed; end of $sentinel_dir/update.log:" >&2
+      tail -n 20 "$sentinel_dir/update.log" >&2 || true
+      exit 1
+    fi
+  fi
   new_ver="$("$t3" --version 2>/dev/null || true)"
   [ "$installed_ver" = "$new_ver" ] || restart_t3=1
 elif [ "$installed_ver" != "t3 v$T3_VERSION" ]; then

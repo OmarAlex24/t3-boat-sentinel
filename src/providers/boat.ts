@@ -151,7 +151,10 @@ export class BoatProvider implements SandboxProvider, LegacyBoatClient {
     if (res.ok) return "resumed";
     const combined = `${res.stderr}\n${res.stdout}`;
     if (combined.includes("snapshot_data_expired")) return "data_expired";
-    throw new Error(`boat resume failed: ${(res.stderr.trim() || res.stdout.trim()).slice(0, 600)}`);
+    const detail = (res.stderr.trim() || res.stdout.trim()).slice(0, 600);
+    // Callers retry this one once the stop finishes; keep the code even when it sits outside `detail`
+    const code = combined.includes("sandbox_stopping") && !detail.includes("sandbox_stopping") ? "sandbox_stopping: " : "";
+    throw new Error(`boat resume failed: ${code}${detail}`);
   }
 
   async pause(id: string): Promise<void> {

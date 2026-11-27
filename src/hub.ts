@@ -19,6 +19,7 @@ import {
   asSandboxProvider,
   hasCapability,
   type LegacyBoatClient,
+  type ResumeResult,
   type SandboxProvider,
 } from "./providers/types.ts";
 import {
@@ -272,6 +273,10 @@ const CLOSING_COMMANDS = new Set(["thread.archive", "thread.delete", "thread.set
 
 /** A VM that is up: Boat reports it `running`, or `idle` when nothing in it is busy. */
 const isLiveSandboxState = (state: string | undefined): boolean => state === "running" || state === "idle";
+
+/** Boat refuses a resume while its stop is still snapshotting the VM. */
+const isSandboxStoppingError = (err: unknown): boolean =>
+  (err instanceof Error ? err.message : String(err)).includes("sandbox_stopping");
 
 /** Commands that only record what the user did; answered at once and sent once the VM is up. */
 const BOOKKEEPING_COMMANDS = new Set([
@@ -1078,6 +1083,10 @@ export class HubServer {
   forwarderTermTimeoutSecs = 10;
   /** How long a woken VM's bridge may take to open. */
   wakeBridgeTimeoutMs = 20_000;
+  /** Poll interval while a stopped VM is still `stopping` (Boat's `stop` returns before its snapshot ends). */
+  stopSettlePollMs = 1_000;
+  /** How long a resize or wake waits for a `stopping` VM to reach `stopped` before giving up. */
+  stopSettleTimeoutMs = 120_000;
   /** How long archive or delete waits for a VM's bridge before treating the VM as unreachable. */
   closeBridgeTimeoutMs = 8_000;
   /** Delay between a VM bridge's reconnect attempts. */
@@ -5752,6 +5761,36 @@ export class HubServer {
     return null;
   }
 
+  /**
+   * Waits until the provider no longer reports the VM `stopping`. Boat's `stop` returns while the VM is
+   * still being snapshotted (7–15 s), and a `resume` in that window fails with `sandbox_stopping`.
+   * Returns at once when the VM is past `stopping` or `info` fails; throws once `stopSettleTimeoutMs` passes.
+   */
+  private async waitForSandboxStopped(sandboxId: string): Promise<void> {
+    const deadline = Date.now() + this.stopSettleTimeoutMs;
+    for (;;) {
+      const info = await this.boat.info(sandboxId).catch(() => null);
+      if (info?.state !== "stopping") return;
+      if (Date.now() >= deadline) {
+        throw new Error(`Sandbox ${sandboxId} is still stopping after ${Math.round(this.stopSettleTimeoutMs / 1000)}s`);
+      }
+      await Bun.sleep(this.stopSettlePollMs);
+    }
+  }
+
+  /** `resume`, retried once after the VM finishes stopping when Boat refused it with `sandbox_stopping`. */
+  private async resumeAfterStop(sandboxId: string, size: string): Promise<ResumeResult> {
+    const resume = this.boat.resume!.bind(this.boat);
+    try {
+      return await resume(sandboxId, size);
+    } catch (err) {
+      if (!isSandboxStoppingError(err)) throw err;
+      console.log(`[hub] sandbox ${sandboxId} is still stopping; resuming once it has stopped`);
+      await this.waitForSandboxStopped(sandboxId);
+      return resume(sandboxId, size);
+    }
+  }
+
   private async doWakeHubSandbox(sandboxId: string): Promise<HubSandboxRecord> {
     // A sleep still releasing Klav or pausing must finish before the resume
     await this.inFlightSleeps.get(sandboxId)?.catch(() => {});
@@ -5770,7 +5809,7 @@ export class HubServer {
     let resumed = false;
     let newKlavSandbox: string | null = null;
     try {
-      const res = await this.boat.resume(sandboxId, sb.size);
+      const res = await this.resumeAfterStop(sandboxId, sb.size);
       if (res === "data_expired" && sb.parkedAt) {
         // Boat dropped the parked VM early: the chat stays, read only
         const threadIds = [...sb.threadIds];
@@ -6295,6 +6334,9 @@ export class HubServer {
 
       let woken: HubSandboxRecord;
       try {
+        // Boat's `stop` returns while the VM is still stopping; resuming then fails with `sandbox_stopping`.
+        // Waited for after the new size is recorded, so a wake arriving meanwhile resumes at the target size.
+        await this.waitForSandboxStopped(sandboxId);
         woken = await this.wakeHubSandbox(sandboxId);
       } catch (err) {
         // If Boat refuses the target size (e.g. shrink rejected or plan cap) or resume fails,

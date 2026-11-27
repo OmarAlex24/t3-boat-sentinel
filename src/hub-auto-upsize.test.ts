@@ -305,6 +305,12 @@ class MiniBoatClient {
   resumed: Array<{ id: string; size: string }> = [];
   execScripts: string[] = [];
   resumeGate: Promise<void> | null = null;
+  /** Like Boat: when set, `stop` leaves the VM `stopping` until `info` has been polled this many times. */
+  stopPolls = 0;
+  private stoppingPollsLeft = new Map<string, number>();
+  infoCalls = 0;
+  /** Resumes refused with `sandbox_stopping`. */
+  resumeRefusals = 0;
 
   constructor(id: string) {
     this.sandboxes.set(id, { id, name: `test-${id}`, state: "running", stoppedAt: null });
@@ -317,7 +323,17 @@ class MiniBoatClient {
   async info(id: string): Promise<BoatSandbox> {
     const sb = this.sandboxes.get(id);
     if (!sb) throw new Error(`sandbox ${id} not found`);
-    return sb;
+    this.infoCalls++;
+    const left = this.stoppingPollsLeft.get(id);
+    if (sb.state === "stopping" && left !== undefined) {
+      if (left <= 1) {
+        this.stoppingPollsLeft.delete(id);
+        sb.state = "stopped";
+      } else {
+        this.stoppingPollsLeft.set(id, left - 1);
+      }
+    }
+    return { ...sb };
   }
   async list(): Promise<BoatSandbox[]> {
     return [...this.sandboxes.values()];
@@ -326,6 +342,10 @@ class MiniBoatClient {
     if (this.resumeGate) await this.resumeGate;
     const sb = this.sandboxes.get(id);
     if (!sb) return "data_expired";
+    if (sb.state === "stopping") {
+      this.resumeRefusals++;
+      throw new Error(`boat resume failed: {"error":{"code":"sandbox_stopping","message":"sandbox is stopping"}}`);
+    }
     this.resumed.push({ id, size });
     sb.state = "running";
     sb.stoppedAt = null;
@@ -335,7 +355,8 @@ class MiniBoatClient {
     this.stopped.push(id);
     const sb = this.sandboxes.get(id);
     if (sb) {
-      sb.state = "stopped";
+      sb.state = this.stopPolls > 0 ? "stopping" : "stopped";
+      if (this.stopPolls > 0) this.stoppingPollsLeft.set(id, this.stopPolls);
       sb.stoppedAt = new Date().toISOString();
     }
   }
@@ -648,6 +669,92 @@ describe("Hub automatic sandbox upsize", () => {
     const third = await handle.hub!.upsizeHubSandbox("sb-1", "xxlarge", { trigger: "test" });
     expect(third).toMatchObject({ ok: false, skipped: "already-upsized" });
     expect(boat.resumed).toEqual([{ id: "sb-1", size: "xlarge" }]);
+  });
+});
+
+describe("resume after a stop that is still stopping", () => {
+  test("upsize waits until Boat reports the stopped VM `stopped`, then resumes it once at the target size", async () => {
+    const { handle, boat } = await setupHub();
+    handle.hub!.stopSettlePollMs = 5;
+    boat.stopPolls = 3;
+    seedThread(handle, "sb-1", threadRow("thread-live", handle.state.getHub()!.projectIds["my-app"], true));
+
+    await handle.hub!.handleWatchdogEvent(overloaded());
+
+    expect(boat.stopped).toEqual(["sb-1"]);
+    expect(boat.resumeRefusals).toBe(0);
+    expect(boat.resumed).toEqual([{ id: "sb-1", size: "xlarge" }]);
+    expect(handle.state.getHubSandbox("sb-1")).toMatchObject({ size: "xlarge", upsizedFrom: "large", phase: "running" });
+    expect(handle.state.getHubSandbox("sb-1")!.wakeFailure ?? null).toBeNull();
+  });
+
+  test("a VM stuck stopping fails the upsize without resuming, keeps its size and records no wake failure", async () => {
+    const { handle, boat } = await setupHub();
+    handle.hub!.stopSettlePollMs = 5;
+    handle.hub!.stopSettleTimeoutMs = 60;
+    boat.stopPolls = Number.POSITIVE_INFINITY;
+
+    await expect(handle.hub!.upsizeHubSandbox("sb-1", "xlarge", { trigger: "test" })).rejects.toThrow(
+      "Sandbox sb-1 is still stopping after 0s",
+    );
+
+    expect(boat.stopped).toEqual(["sb-1"]);
+    expect(boat.resumed).toEqual([]);
+    expect(boat.resumeRefusals).toBe(0);
+    const record = handle.state.getHubSandbox("sb-1")!;
+    expect(record).toMatchObject({ size: "large", phase: "sleeping" });
+    expect(record.upsizedAt ?? null).toBeNull();
+    expect(record.wakeFailure ?? null).toBeNull();
+  });
+
+  test("a wake that arrives while the upsize waits for the stop resumes at the target size", async () => {
+    const { handle, boat } = await setupHub();
+    handle.hub!.stopSettlePollMs = 5;
+    boat.stopPolls = 10;
+
+    const upsize = handle.hub!.upsizeHubSandbox("sb-1", "xlarge", { trigger: "test" });
+    await waitFor(() => boat.stopped.length > 0 && handle.state.getHubSandbox("sb-1")!.phase === "sleeping");
+    const wake = handle.hub!.wakeHubSandbox("sb-1");
+    const [result] = await Promise.all([upsize, wake]);
+
+    expect(result.ok).toBe(true);
+    expect(boat.resumed).toEqual([{ id: "sb-1", size: "xlarge" }]);
+    expect(handle.state.getHubSandbox("sb-1")).toMatchObject({ size: "xlarge", phase: "running" });
+  });
+
+  test("a wake right after a sleep retries the refused resume once the stop finishes", async () => {
+    const { handle, boat } = await setupHub();
+    handle.hub!.stopSettlePollMs = 5;
+    boat.stopPolls = 3;
+
+    await handle.hub!.sleepHubSandbox("sb-1");
+    expect(handle.state.getHubSandbox("sb-1")!.phase).toBe("sleeping");
+    await handle.hub!.wakeHubSandbox("sb-1");
+
+    expect(boat.resumeRefusals).toBe(1);
+    expect(boat.resumed).toEqual([{ id: "sb-1", size: "large" }]);
+    const record = handle.state.getHubSandbox("sb-1")!;
+    expect(record.phase).toBe("running");
+    expect(record.wakeFailure ?? null).toBeNull();
+  });
+
+  test("an already stopped VM or a failing `info` adds no wait", async () => {
+    const { handle, boat } = await setupHub();
+    handle.hub!.stopSettlePollMs = 60_000;
+    const started = Date.now();
+    const first = await handle.hub!.upsizeHubSandbox("sb-1", "xlarge", { trigger: "test" });
+    expect(first.ok).toBe(true);
+
+    boat.info = async () => {
+      throw new Error("boat info failed");
+    };
+    const second = await handle.hub!.upsizeHubSandbox("sb-1", "xxlarge", { trigger: "test", force: true });
+    expect(second.ok).toBe(true);
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(boat.resumed).toEqual([
+      { id: "sb-1", size: "xlarge" },
+      { id: "sb-1", size: "xxlarge" },
+    ]);
   });
 });
 
