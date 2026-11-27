@@ -132,7 +132,9 @@ export interface HubMcpBridge {
   nextSequence?: () => number;
   wakeSandbox: (sandboxId: string) => Promise<HubSandboxRecord>;
   destroySandbox: (sandboxId: string, reason: string) => Promise<void>;
-  sleepSandbox: (sandboxId: string) => Promise<void>;
+  sleepSandbox: (sandboxId: string, reason?: string) => Promise<void>;
+  /** In-flight in-place resize metadata, while `t3_thread_wait` must keep waiting instead of reporting `interrupted`. */
+  getUpsizeProgress?: (sandboxId: string) => { fromSize: string; toSize: string; trigger: string } | undefined;
   /**
    * Parks a VM whose chats are all settled (see `boat.settleAction`); true when it ends parked.
    * Refused while a chat on it is live or an open top-level chat is not settled.
@@ -1260,6 +1262,54 @@ export class HubMcpHandler {
     return this.formatProjectRecord(projectKey, proj);
   }
 
+  private sandboxMcpView(sb: HubSandboxRecord): Record<string, unknown> {
+    const upsizing = this.bridge.getUpsizeProgress?.(sb.sandboxId);
+    const step = upsizing
+      ? `Upsizing ${upsizing.fromSize} -> ${upsizing.toSize} (${upsizing.trigger})`
+      : sb.phase === "running"
+        ? "Running"
+        : sb.phase === "sleeping"
+          ? sb.sleepReason
+            ? `Sleeping (${sb.sleepReason})`
+            : sb.parkedAt
+              ? "Parked"
+              : "Sleeping"
+          : sb.phase;
+    return {
+      sandboxId: sb.sandboxId,
+      phase: sb.phase === "provisioning" ? "booting" : sb.phase,
+      step,
+      error: null,
+      pauseReason: upsizing ? null : sb.phase === "sleeping" ? (sb.sleepReason ?? null) : null,
+    };
+  }
+
+  private runStoppedByPause(status: unknown): boolean {
+    return typeof status === "string" && (ACTIVE_RUN_STATUSES.has(status) || status === "interrupted");
+  }
+
+  private syntheticPauseNotice(threadId: string, sb: HubSandboxRecord, latestRunId: string): Record<string, unknown> | null {
+    if (sb.phase !== "sleeping" || !sb.sleepReason || this.bridge.getUpsizeProgress?.(sb.sandboxId)) return null;
+    const now = new Date().toISOString();
+    const at = sb.sleepingSince ?? now;
+    return {
+      visibility: "local",
+      sourceThreadId: threadId,
+      itemId: `hub-pause-notice:${sb.sandboxId}:${at}`,
+      runId: latestRunId,
+      messageId: null,
+      createdBy: null,
+      creationSource: null,
+      type: "assistant_message",
+      status: "completed",
+      title: "Sandbox paused",
+      text:
+        `[t3-boat-sentinel] This chat's Boat VM (${sb.sandboxId}) was paused while a turn was active: ${sb.sleepReason}. ` +
+        "Its disk, worktree, and chat history are preserved — send a message to wake it and continue.",
+      updatedAt: at,
+    };
+  }
+
   private formatShellThread(
     threadId: string,
     shell: Record<string, unknown>,
@@ -1335,14 +1385,7 @@ export class HubMcpHandler {
       itemCount,
       createdAt,
       updatedAt,
-      sandbox: sb
-        ? {
-            sandboxId: sb.sandboxId,
-            phase: sb.phase === "provisioning" ? "booting" : sb.phase,
-            step: sb.phase === "running" ? "Running" : sb.phase === "sleeping" ? "Sleeping" : sb.phase,
-            error: null,
-          }
-        : null,
+      sandbox: sb ? this.sandboxMcpView(sb) : null,
     };
   }
 
@@ -1523,6 +1566,7 @@ export class HubMcpHandler {
     threadId: string,
     shell: Record<string, unknown> | undefined,
     sb: HubSandboxRecord,
+    opts?: { beforePosition: number | null; itemId: string | null },
   ): Record<string, unknown> {
     const now = new Date().toISOString();
     const base = shell
@@ -1557,26 +1601,31 @@ export class HubMcpHandler {
           itemCount: 0,
           createdAt: sb.createdAt ?? now,
           updatedAt: sb.sleepingSince ?? sb.lastActiveAt ?? now,
-          sandbox: {
-            sandboxId: sb.sandboxId,
-            phase: sb.phase === "provisioning" ? "booting" : sb.phase,
-            step: sb.phase === "sleeping" ? "Sleeping" : sb.phase,
-            error: null,
-          },
+          sandbox: this.sandboxMcpView(sb),
         };
+    const shellStatus = shell ? normalizeThreadStatus(shell) : "idle";
+    const latestRunId = typeof base.latestRunId === "string" && base.latestRunId ? base.latestRunId : null;
+    const pausedMidRun =
+      sb.phase === "sleeping" &&
+      !this.bridge.getUpsizeProgress?.(sb.sandboxId) &&
+      latestRunId !== null &&
+      this.runStoppedByPause(shellStatus);
+    const notice = pausedMidRun && latestRunId ? this.syntheticPauseNotice(threadId, sb, latestRunId) : null;
+    const includeNotice = notice !== null && opts?.itemId == null && opts?.beforePosition == null;
     return {
       thread: {
         ...base,
-        activeRunId: typeof shell?.activeRunId === "string" ? shell.activeRunId : null,
+        status: pausedMidRun ? "interrupted" : base.status,
+        activeRunId: pausedMidRun ? null : typeof shell?.activeRunId === "string" ? shell.activeRunId : null,
         titleRegeneration: null,
         branch: typeof shell?.branch === "string" ? shell.branch : null,
         worktreePath: typeof shell?.worktreePath === "string" ? shell.worktreePath : null,
         runCount: base.latestRunId ? 1 : 0,
         archived: shell?.archivedAt != null,
       },
-      items: [],
+      items: includeNotice ? [{ position: 0, ...notice, textTruncated: false, nextTextOffset: null }] : [],
       recentRuns: [],
-      nextPosition: null,
+      nextPosition: includeNotice ? 0 : null,
       hasMore: false,
       earlierPosition: null,
     };
@@ -1620,7 +1669,7 @@ export class HubMcpHandler {
       }
       const shell = this.bridge.getThreadShell(threadId);
       if (shell) {
-        return this.buildFallbackShellReadResult(threadId, shell, sb);
+        return this.buildFallbackShellReadResult(threadId, shell, sb, readOpts);
       }
       throw new HubMcpToolError("orchestration_error", `Failed to read projection for thread "${threadId}".`);
     }
@@ -1631,7 +1680,7 @@ export class HubMcpHandler {
         return this.mapProjectionToThreadRead(cached, sb, readOpts);
       }
       const shell = this.bridge.getThreadShell(threadId);
-      return this.buildFallbackShellReadResult(threadId, shell, sb);
+      return this.buildFallbackShellReadResult(threadId, shell, sb, readOpts);
     }
 
     const destroyed = this.destroyedThreads.get(threadId);
@@ -1703,6 +1752,13 @@ export class HubMcpHandler {
     } else if (latestRun && typeof latestRun.status === "string" && VALID_THREAD_STATUSES.has(latestRun.status)) {
       status = latestRun.status;
     }
+    const latestRunId = latestRun ? String(latestRun.id ?? latestRun.runId ?? "") || null : null;
+    const pausedMidRun =
+      sb.phase === "sleeping" &&
+      !this.bridge.getUpsizeProgress?.(sb.sandboxId) &&
+      latestRun !== undefined &&
+      this.runStoppedByPause(latestRun.status);
+    if (pausedMidRun) status = "interrupted";
 
     const threadModelSel = normalizeModelSelection(rawThread.modelSelection);
     const threadProviderId =
@@ -1853,6 +1909,13 @@ export class HubMcpHandler {
       }
     }
 
+    if (pausedMidRun && latestRunId && opts.itemId === null) {
+      const notice = this.syntheticPauseNotice(threadId, sb, latestRunId);
+      if (notice && !fullTimeline.some((entry) => entry.itemId === notice.itemId)) {
+        fullTimeline.push(notice as unknown as TimelineEntry);
+      }
+    }
+
     const formatSliceItem = (entry: TimelineEntry, position: number, offset: number): Record<string, unknown> => {
       const fullText = entry.text;
       if (fullText === null) {
@@ -1940,9 +2003,12 @@ export class HubMcpHandler {
         typeof r.ordinal === "number" && Number.isInteger(r.ordinal) && r.ordinal >= 1
           ? r.ordinal
           : Math.max(1, sortedRunsDesc.length - idx);
-      const rawStatus = typeof r.status === "string" && VALID_THREAD_STATUSES.has(r.status) && r.status !== "idle"
-        ? r.status
-        : "completed";
+      const rawStatus =
+        pausedMidRun && runId === latestRunId
+          ? "interrupted"
+          : typeof r.status === "string" && VALID_THREAD_STATUSES.has(r.status) && r.status !== "idle"
+            ? r.status
+            : "completed";
       const activeAttemptId = typeof r.activeAttemptId === "string" ? r.activeAttemptId : null;
       const executedModel =
         typeof r.executedModel === "string"
@@ -1996,8 +2062,8 @@ export class HubMcpHandler {
         createdBy: validActor(rawThread.createdBy, "user"),
         creationSource: validCreationSource(rawThread.creationSource, "web"),
         status,
-        latestRunId: latestRun ? String(latestRun.id ?? latestRun.runId ?? "") || null : null,
-        activeRunId: activeRun ? String(activeRun.id ?? activeRun.runId ?? "") || null : null,
+        latestRunId,
+        activeRunId: pausedMidRun ? null : activeRun ? String(activeRun.id ?? activeRun.runId ?? "") || null : null,
         providerInstanceId: threadProviderId,
         model: threadModel,
         runtimeMode: isRuntimeMode(rawThread.runtimeMode) ? rawThread.runtimeMode : "full-access",
@@ -2025,12 +2091,7 @@ export class HubMcpHandler {
         pendingBackgroundTasks: Array.isArray(rawThread.pendingBackgroundTasks) ? rawThread.pendingBackgroundTasks : [],
         createdAt: threadCreatedAt,
         updatedAt: threadUpdatedAt,
-        sandbox: {
-          sandboxId: sb.sandboxId,
-          phase: sb.phase === "provisioning" ? "booting" : sb.phase,
-          step: sb.phase === "running" ? "Running" : sb.phase === "sleeping" ? "Sleeping" : sb.phase,
-          error: null,
-        },
+        sandbox: this.sandboxMcpView(sb),
       },
       items: page,
       recentRuns,
@@ -2672,6 +2733,7 @@ export class HubMcpHandler {
     while (true) {
       const pending = this.pendingLaunches.get(threadId);
       const sb = this.bridge.getSandboxForThread(threadId);
+      const upsizing = sb ? this.bridge.getUpsizeProgress?.(sb.sandboxId) : undefined;
 
       // 1. Thread is still booting its Boat VM
       if (pending && (!sb || sb.phase === "provisioning" || pending.phase !== "running")) {
@@ -2687,6 +2749,14 @@ export class HubMcpHandler {
         }
         lastStatus = "preparing";
         lastRunId = pending.launchedRunId ?? null;
+      } else if (sb && upsizing) {
+        // An in-place resize pauses the VM, resumes it, then dispatches its auto-continue. Both the
+        // sleeping window and the short post-wake window are preparation, never an interrupted run.
+        lastStatus = "preparing";
+        if (!lastRunId) {
+          const shell = this.bridge.getThreadShell(threadId);
+          lastRunId = typeof shell?.latestRunId === "string" && shell.latestRunId ? shell.latestRunId : null;
+        }
       } else if (sb && sb.phase === "running") {
         // 2. Live running VM: inspect projection
         const res = await this.bridge.callVmUnary(sb.sandboxId, "orchestration.getThreadProjection", { threadId }, 10_000);
@@ -3029,7 +3099,7 @@ export class HubMcpHandler {
         }
       } else if (this.config.boat.archiveAction === "stop") {
         console.log(`[hub] stopping ${sb.sandboxId} (${sb.project}): no open or running chat left — trigger: ${trigger}`);
-        await this.bridge.sleepSandbox(sb.sandboxId);
+        await this.bridge.sleepSandbox(sb.sandboxId, "Paused via MCP");
         log.outcome = "VM stopped";
       } else {
         console.log(`[hub] destroying ${sb.sandboxId} (${sb.project}): no open or running chat left — trigger: ${trigger}`);

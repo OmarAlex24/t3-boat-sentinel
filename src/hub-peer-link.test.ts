@@ -36,6 +36,7 @@ class MiniBoatClient {
   upstreamBaseUrl: string | null = null;
   createGate: Promise<void> | null = null;
   createError: Error | null = null;
+  resumeGate: Promise<void> | null = null;
   private seq = 1;
 
   async create(name: string, _size: string, _fromSnapshot?: string): Promise<string> {
@@ -57,6 +58,7 @@ class MiniBoatClient {
   }
 
   async resume(id: string): Promise<ResumeResult> {
+    if (this.resumeGate) await this.resumeGate;
     const sb = this.sandboxes.get(id);
     if (!sb) return "data_expired";
     sb.state = "running";
@@ -547,6 +549,14 @@ function startFakeVm(name: string): FakeVmHandle {
     setThreadCompleted,
   };
   return handle;
+}
+
+async function waitFor(cond: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const started = Date.now();
+  while (!cond()) {
+    if (Date.now() - started > timeoutMs) throw new Error("condition not met in time");
+    await Bun.sleep(15);
+  }
 }
 
 function makeHubConfig(stateDir: string): SentinelConfig {
@@ -1424,6 +1434,7 @@ describe("Hub Linked Environment (Native T3 Peer Link)", () => {
     expect(settled.parsedText.sandboxParked).toBe(true);
     const sb = handle.state.listHubSandboxes().find((s) => s.threadIds.includes(tid));
     expect(sb?.parkedAt).toBeTruthy();
+    expect(sb?.sleepReason).toBe("Settled via MCP (VM parked)");
 
     // 4. Parked snapshot still carries delegatedFrom for the sidebar
     const parkedClient = await connectShellClient();
@@ -1589,5 +1600,156 @@ describe("Hub Linked Environment (Native T3 Peer Link)", () => {
     expect(sent5[1].commandId).toBe("cmd_steer-refused-5_q");
     expect((sent5[1].dispatchMode as { type?: string })?.type).toBe("queue_after_active");
     vm.onMessageDispatch = undefined;
+  });
+
+  test("upsize keeps t3_thread_wait preparing, and pause reasons are exposed with a synthetic mid-run reply", async () => {
+    const dir = makeTempDir();
+    const cfg = makeHubConfig(dir);
+    const vm = startFakeVm("pause-reasons");
+    cleanups.push(() => vm.server.stop(true));
+    const boat = new MiniBoatClient();
+    boat.upstreamBaseUrl = vm.baseUrl;
+    const handle = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+    cleanups.push(() => handle.stop());
+    const base = `http://127.0.0.1:${handle.server.port}`;
+    const ownerToken = await pairOwnerClient(base, cfg);
+    const peer = await linkPeerViaOAuth(base, cfg.hub!.host, ownerToken, "full-access", "Pause Reason Coordinator");
+    const mcp = makeMcpCaller(base, cfg.hub!.host, peer.accessToken);
+
+    const projectId = String((await mcp.callTool("t3_project_list")).parsedText.projects[0].id);
+    const launch = await mcp.callTool("t3_thread_launch", {
+      projectId,
+      title: "Pause reason worker",
+      message: "Work until interrupted",
+      delegatedFrom: { environmentId: "env-mac", threadId: "coordinator", title: "Coordinator" },
+    });
+    expect(launch.result?.isError).toBeFalsy();
+    const tid = String(launch.parsedText.threadId);
+    await waitFor(() => vm.threads.has(tid));
+    const sandboxId = handle.state.listHubSandboxes()[0].sandboxId;
+    await waitFor(() =>
+      (handle.hub as unknown as { threadShells: Map<string, Record<string, unknown>> }).threadShells.get(tid)?.status === "running",
+    );
+
+    // Keep the resize in its resume window. While it is there, waiters must see preparation, never
+    // the transient sleeping/interrupted state of the old run.
+    let releaseResume!: () => void;
+    boat.resumeGate = new Promise<void>((resolve) => {
+      releaseResume = resolve;
+    });
+    const continuationRunId = "run-upsize-continuation";
+    vm.onMessageDispatch = (payload) => {
+      if (String(payload.commandId ?? "").startsWith("cmd_upsize_continue_")) {
+        const now = new Date().toISOString();
+        const proj = vm.projections.get(tid);
+        if (proj) {
+          proj.thread = { ...(proj.thread as Record<string, unknown>), status: "running", activeRunId: continuationRunId, updatedAt: now };
+          proj.runs = [
+            { id: continuationRunId, ordinal: 2, status: "running", mode: "normal", requestedAt: now, startedAt: now, completedAt: null },
+          ];
+        }
+      }
+      return undefined;
+    };
+    const upsizePromise = handle.hub!.upsizeHubSandbox(sandboxId, "xlarge", { trigger: "test-upsize" });
+    await waitFor(() => handle.state.getHubSandbox(sandboxId)?.phase === "sleeping");
+    expect(handle.state.getHubSandbox(sandboxId)?.sleepReason).toBe("Scaling VM from 2gb to xlarge (test-upsize)");
+
+    const waitDuringUpsize = await mcp.callTool("t3_thread_wait", { threadId: tid, timeoutMs: 350 });
+    expect(waitDuringUpsize.result?.isError).toBeFalsy();
+    expect(waitDuringUpsize.parsedText).toMatchObject({ timedOut: true, status: "preparing" });
+    expect(waitDuringUpsize.parsedText.status).not.toBe("interrupted");
+
+    const continuedWaitPromise = mcp.callTool("t3_thread_wait", {
+      threadId: tid,
+      timeoutMs: 5_000,
+      untilDelegatedWorkSettled: true,
+    });
+    releaseResume();
+    boat.resumeGate = null;
+    const upsizeResult = await upsizePromise;
+    expect(upsizeResult.ok).toBe(true);
+    expect(vm.dispatches.some((d) => String(d.commandId ?? "").startsWith("cmd_upsize_continue_"))).toBe(true);
+    vm.setThreadCompleted(tid, "Continued after resize", continuationRunId);
+    const continuedWait = await continuedWaitPromise;
+    expect(continuedWait.result?.isError).toBeFalsy();
+    expect(continuedWait.parsedText).toMatchObject({ timedOut: false, status: "completed" });
+    vm.onMessageDispatch = undefined;
+
+    // Now pause a genuinely active turn. The cached projection still says `running`, but MCP must
+    // normalize it to interrupted and add an assistant reply explaining the pause to the coordinator.
+    const midRunId = "run-paused-mid-turn";
+    const nowRunning = new Date().toISOString();
+    const existing = vm.projections.get(tid)!;
+    const runningRow = {
+      ...(vm.threads.get(tid) as Record<string, unknown>),
+      status: "running",
+      activeRunId: midRunId,
+      updatedAt: nowRunning,
+    };
+    existing.thread = runningRow;
+    existing.runs = [
+      { id: midRunId, ordinal: 3, status: "running", mode: "normal", requestedAt: nowRunning, startedAt: nowRunning, completedAt: null },
+    ];
+    vm.pushShellUpdate(runningRow);
+    const unreachableReason = "T3 server inside the VM became unreachable (watchdog backstop)";
+    await handle.hub!.handleWatchdogEvent({
+      slot: `hub:${sandboxId}`,
+      sandboxId,
+      event: "idle",
+      detail: { reason: "t3-unreachable" },
+    });
+    expect(handle.state.getHubSandbox(sandboxId)?.sleepReason).toBe(unreachableReason);
+
+    const pausedRead = await mcp.callTool("t3_thread_read", { threadId: tid, view: "messages" });
+    expect(pausedRead.result?.isError).toBeFalsy();
+    expect(pausedRead.parsedText.thread.status).toBe("interrupted");
+    expect(pausedRead.parsedText.thread.sandbox).toMatchObject({
+      sandboxId,
+      pauseReason: unreachableReason,
+      step: `Sleeping (${unreachableReason})`,
+    });
+    const pauseNotice = (pausedRead.parsedText.items as Array<Record<string, unknown>>).find((item) =>
+      String(item.itemId).startsWith("hub-pause-notice:"),
+    );
+    expect(pauseNotice).toBeTruthy();
+    expect(pauseNotice).toMatchObject({
+      type: "assistant_message",
+      runId: midRunId,
+      status: "completed",
+      title: "Sandbox paused",
+      visibility: "local",
+    });
+    expect(String(pauseNotice!.text)).toContain(unreachableReason);
+    expect(String(pauseNotice!.text)).toContain("send a message to wake it and continue");
+
+    const pausedList = await mcp.callTool("t3_thread_list", { allProjects: true, titleContains: "Pause reason" });
+    const listed = (pausedList.parsedText.threads as Array<Record<string, unknown>>).find((t) => t.threadId === tid)!;
+    expect(listed.sandbox).toMatchObject({ pauseReason: unreachableReason, step: `Sleeping (${unreachableReason})` });
+
+    // A pause after a clean completion must never clobber the real final assistant answer.
+    await handle.hub!.wakeHubSandbox(sandboxId);
+    expect(handle.state.getHubSandbox(sandboxId)?.sleepReason ?? null).toBeNull();
+    vm.setThreadCompleted(tid, "REAL FINAL ANSWER", "run-completed-cleanly");
+    await handle.hub!.handleWatchdogEvent({ slot: `hub:${sandboxId}`, sandboxId, event: "idle" });
+    const completedReason = "Paused after inactivity (idle timeout)";
+    const completedRead = await mcp.callTool("t3_thread_read", { threadId: tid, view: "messages" });
+    expect(completedRead.result?.isError).toBeFalsy();
+    expect(completedRead.parsedText.thread.status).toBe("completed");
+    expect(completedRead.parsedText.thread.sandbox).toMatchObject({
+      pauseReason: completedReason,
+      step: `Sleeping (${completedReason})`,
+    });
+    const completedItems = completedRead.parsedText.items as Array<Record<string, unknown>>;
+    expect(completedItems.some((item) => String(item.itemId).startsWith("hub-pause-notice:"))).toBe(false);
+    const assistantTexts = completedItems.filter((item) => item.type === "assistant_message").map((item) => String(item.text));
+    expect(assistantTexts.at(-1)).toContain("REAL FINAL ANSWER");
+
+    if (t3Contracts?.exported("OrchestratorMcpThreadReadResult")) {
+      for (const payload of [pausedRead.parsedText, completedRead.parsedText]) {
+        const decoded = t3Contracts.decodeWith("OrchestratorMcpThreadReadResult", payload);
+        expect(decoded.error ?? "").toBe("");
+      }
+    }
   });
 });
