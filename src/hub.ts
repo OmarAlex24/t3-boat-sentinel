@@ -282,6 +282,8 @@ const BOOKKEEPING_COMMANDS = new Set([
   "thread.pin.reorder",
   "thread.active.reorder",
   "thread.tag.set",
+  "thread.snooze",
+  "thread.unsnooze",
 ]);
 
 /**

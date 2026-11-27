@@ -2763,6 +2763,48 @@ describe("Single-Environment Hub Multiplexer (1 env -> N parallel Boat VMs)", ()
       );
     });
 
+    test("snoozing a sleeping chat never wakes it; the command reaches the VM on the next wake", async () => {
+      const { vm, client, boat, sandboxId } = await sleepingChat("vm-snooze");
+      const seenBefore = vm.seenMethods.length;
+      const snoozedUntil = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+
+      client.request("snooze", "orchestration.dispatchCommand", {
+        type: "thread.snooze",
+        commandId: "cmd-snooze",
+        threadId: "thread-zz",
+        snoozedUntil,
+      });
+      client.request("unsnooze", "orchestration.dispatchCommand", {
+        type: "thread.unsnooze",
+        commandId: "cmd-unsnooze",
+        threadId: "thread-zz",
+        reason: "user",
+      });
+      for (const reqId of ["snooze", "unsnooze"]) {
+        const frame = await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === reqId, 1_000);
+        expect((frame.exit as { _tag: string })._tag).toBe("Success");
+      }
+      await Bun.sleep(200);
+      expect(boat.resumed).toEqual([]);
+
+      client.request("send", "orchestration.dispatchCommand", {
+        type: "thread.turn.start",
+        commandId: "cmd-send",
+        threadId: "thread-zz",
+        message: { messageId: "m-1", text: "Back to work", attachments: [] },
+      });
+      expect((await client.waitForFrame((f) => f._tag === "Exit" && f.requestId === "send", 5_000)).exit).toMatchObject({ _tag: "Success" });
+      expect(boat.resumed).toEqual([sandboxId]);
+      const after = () => vm.seenMethods.slice(seenBefore);
+      const bookkeeping = (type: string) =>
+        after().find((m) => m.tag === "orchestration.dispatchCommand" && (m.payload as { type?: string }).type === type)?.payload as
+          | Record<string, unknown>
+          | undefined;
+      await until(() => bookkeeping("thread.snooze") !== undefined && bookkeeping("thread.unsnooze") !== undefined);
+      expect(bookkeeping("thread.snooze")).toMatchObject({ type: "thread.snooze", snoozedUntil });
+      expect(bookkeeping("thread.unsnooze")).toMatchObject({ type: "thread.unsnooze" });
+    });
+
     test("the app's whole open sequence never wakes a sleeping chat; a message then wakes it, delivers the held visit and hands over", async () => {
       const { vm, client, boat, handle, sandboxId } = await sleepingChat("vm-open-seq");
       const worktree = String(vm.threads.get("thread-zz")!.worktreePath);
