@@ -904,6 +904,7 @@ export class LifecycleManager {
           s.parkedAt = null;
           if (endKlav) s.klavAgentName = null;
           s.sleepingSince = remote.stoppedAt ?? new Date().toISOString();
+          s.sleepReason = "Stopped externally in Boat (or by watchdog backstop)";
         });
         this.onHubSandboxStopped?.(hubSb.sandboxId);
       }

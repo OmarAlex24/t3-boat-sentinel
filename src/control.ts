@@ -184,6 +184,7 @@ export class ControlPlane {
                   createdAt: sb.createdAt,
                   lastHeartbeatAt: sb.lastHeartbeatAt,
                   sleepingSince: sb.sleepingSince,
+                  sleepReason: sb.sleepReason ?? null,
                   parkedAt: sb.parkedAt ?? null,
                 })),
               }

@@ -246,6 +246,7 @@ class MiniBoatClient {
   stopped: string[] = [];
   resumed: Array<{ id: string; size: string }> = [];
   execScripts: string[] = [];
+  resumeGate: Promise<void> | null = null;
 
   constructor(id: string) {
     this.sandboxes.set(id, { id, name: `test-${id}`, state: "running", stoppedAt: null });
@@ -264,6 +265,7 @@ class MiniBoatClient {
     return [...this.sandboxes.values()];
   }
   async resume(id: string, size: string): Promise<ResumeResult> {
+    if (this.resumeGate) await this.resumeGate;
     const sb = this.sandboxes.get(id);
     if (!sb) return "data_expired";
     this.resumed.push({ id, size });
@@ -441,6 +443,14 @@ async function setupHub(patch?: (cfg: SentinelConfig) => void) {
   cleanups.push(() => handle.stop());
   seedHubSandbox(handle, cfg, vm.url, "sb-1");
   return { dir, vm, boat, cfg, handle };
+}
+
+async function waitFor(cond: () => boolean, timeoutMs = 2_000): Promise<void> {
+  const started = Date.now();
+  while (!cond()) {
+    if (Date.now() - started > timeoutMs) throw new Error("condition not met in time");
+    await Bun.sleep(10);
+  }
 }
 
 const overloaded = (sandboxId = "sb-1") => ({
@@ -627,5 +637,74 @@ describe("manual Control API resize", () => {
       { id: "sb-1", size: "xxlarge" },
     ]);
     expect(handle.state.getHubSandbox("sb-1")).toMatchObject({ size: "xxlarge", upsizedFrom: "xlarge" });
+  });
+});
+
+describe("Hub sandbox pause reasons", () => {
+  test("persist idle, watchdog-backstop, external-stop and settled-park reasons, and clear them on wake", async () => {
+    const { handle, boat, cfg, dir } = await setupHub();
+    const projectId = handle.state.getHub()!.projectIds["my-app"];
+    const row = threadRow("thread-rest", projectId, false);
+    seedThread(handle, "sb-1", row);
+
+    await handle.hub!.handleWatchdogEvent({ slot: "hub:sb-1", sandboxId: "sb-1", event: "idle" });
+    expect(handle.state.getHubSandbox("sb-1")?.sleepReason).toBe("Paused after inactivity (idle timeout)");
+    const reloaded = new StateStore(dir, cfg);
+    expect(reloaded.getHubSandbox("sb-1")?.sleepReason).toBe("Paused after inactivity (idle timeout)");
+
+    await handle.hub!.wakeHubSandbox("sb-1");
+    expect(handle.state.getHubSandbox("sb-1")?.sleepReason ?? null).toBeNull();
+
+    await handle.hub!.handleWatchdogEvent({
+      slot: "hub:sb-1",
+      sandboxId: "sb-1",
+      event: "idle",
+      detail: { reason: "t3-unreachable" },
+    });
+    expect(handle.state.getHubSandbox("sb-1")?.sleepReason).toBe(
+      "T3 server inside the VM became unreachable (watchdog backstop)",
+    );
+
+    await handle.hub!.wakeHubSandbox("sb-1");
+    expect(handle.state.getHubSandbox("sb-1")?.sleepReason ?? null).toBeNull();
+
+    const remote = boat.sandboxes.get("sb-1")!;
+    remote.state = "stopped";
+    remote.stoppedAt = new Date().toISOString();
+    await handle.lifecycle.reaperTick();
+    expect(handle.state.getHubSandbox("sb-1")?.sleepReason).toBe("Stopped externally in Boat (or by watchdog backstop)");
+
+    row.settledAt = new Date().toISOString();
+    expect(await handle.hub!.parkHubSandbox("sb-1", { trigger: "watchdog all-archived" })).toBe(true);
+    expect(handle.state.getHubSandbox("sb-1")).toMatchObject({
+      parkedAt: expect.any(String),
+      sleepReason: "Settled (all chats settled; VM parked)",
+    });
+
+    await handle.hub!.wakeHubSandbox("sb-1");
+    expect(handle.state.getHubSandbox("sb-1")?.sleepReason ?? null).toBeNull();
+  });
+
+  test("an in-flight upsize records the scaling reason and replaces the sleeping notice while the VM resumes", async () => {
+    const { handle, boat } = await setupHub();
+    seedThread(handle, "sb-1", threadRow("thread-scale", handle.state.getHub()!.projectIds["my-app"], false));
+    let releaseResume!: () => void;
+    boat.resumeGate = new Promise<void>((resolve) => {
+      releaseResume = resolve;
+    });
+
+    const upsize = handle.hub!.upsizeHubSandbox("sb-1", "xlarge", { trigger: "test-trigger", autoContinue: false });
+    await waitFor(() => handle.state.getHubSandbox("sb-1")?.phase === "sleeping");
+
+    expect(handle.state.getHubSandbox("sb-1")?.sleepReason).toBe("Scaling VM from large to xlarge (test-trigger)");
+    const notice = (
+      handle.hub as unknown as { sleepNotice(sandboxId: string): { summary: string; detail?: string } }
+    ).sleepNotice("sb-1");
+    expect(notice.summary).toBe("Scaling this chat's VM from large to xlarge…");
+    expect(notice.detail).toBe("Trigger: test-trigger. The same disk, worktree, and chat history will resume automatically.");
+
+    releaseResume();
+    expect((await upsize).ok).toBe(true);
+    expect(handle.state.getHubSandbox("sb-1")?.sleepReason ?? null).toBeNull();
   });
 });

@@ -73,6 +73,8 @@ export interface HubSandboxRecord {
   lastActiveAt: string;
   lastHeartbeatAt: string | null;
   sleepingSince: string | null;
+  /** Human-readable reason this VM entered `sleeping` (idle, parked, scaling, external stop...); cleared by the next successful wake. */
+  sleepReason?: string | null;
   /** Last failed wake of this sleeping VM; cleared by the next successful wake. Holds no secrets. */
   wakeFailure?: HubWakeFailure | null;
   /**
@@ -320,6 +322,7 @@ export class StateStore {
           phase: sb.phase === "provisioning" ? "sleeping" : sb.phase,
           threadIds: Array.isArray(sb.threadIds) ? sb.threadIds : [],
           worktreePaths: Array.isArray(sb.worktreePaths) ? sb.worktreePaths : [],
+          sleepReason: typeof sb.sleepReason === "string" ? sb.sleepReason : null,
           upsizedFrom: typeof sb.upsizedFrom === "string" ? sb.upsizedFrom : null,
           upsizedAt: typeof sb.upsizedAt === "string" ? sb.upsizedAt : null,
         };

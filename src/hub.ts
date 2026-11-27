@@ -1032,6 +1032,13 @@ const DELIVERY_FAILED_NOTICE =
 const MAX_HELD_BOOKKEEPING = 50;
 const PARKED_RPC_DETAIL =
   "This chat is settled and its VM is parked, so it cannot answer this. Unsettle the chat or send a message to wake it.";
+const IDLE_SLEEP_REASON = "Paused after inactivity (idle timeout)";
+const SETTLED_PARK_SLEEP_REASON = "Settled (all chats settled; VM parked)";
+const MCP_SETTLED_PARK_SLEEP_REASON = "Settled via MCP (VM parked)";
+
+function parkSleepReason(request: HubParkRequest): string {
+  return request.trigger.startsWith("MCP t3_thread_organize") ? MCP_SETTLED_PARK_SLEEP_REASON : SETTLED_PARK_SLEEP_REASON;
+}
 
 export class HubServer {
   private readonly auth = new SlotAuth();
@@ -1057,6 +1064,7 @@ export class HubServer {
   private readonly inFlightWakes = new Map<string, Promise<HubSandboxRecord>>();
   private readonly inFlightSleeps = new Map<string, Promise<void>>();
   private readonly inFlightUpsizes = new Map<string, Promise<UpsizeResult>>();
+  private readonly upsizeProgress = new Map<string, { fromSize: string; toSize: string; trigger: string }>();
   private readonly wakeListeners = new Set<HubWakeListener>();
   /** Pause retries for VMs a failed wake left running. */
   private readonly pauseRetries = new Map<string, ReturnType<typeof setTimeout>>();
@@ -1267,8 +1275,9 @@ export class HubServer {
         },
         wakeSandbox: (sandboxId) => this.wakeHubSandbox(sandboxId),
         destroySandbox: (sandboxId, reason) => this.destroyHubSandbox(sandboxId, reason),
-        sleepSandbox: (sandboxId) => this.sleepHubSandbox(sandboxId),
+        sleepSandbox: (sandboxId, reason) => this.sleepHubSandbox(sandboxId, reason ? { reason } : {}),
         parkSandbox: (sandboxId, request) => this.parkHubSandbox(sandboxId, request),
+        getUpsizeProgress: (sandboxId) => this.upsizeProgress.get(sandboxId),
         readVmThreads: async (sandboxId) => {
           const sb = this.state.getHubSandbox(sandboxId);
           if (!sb || sb.phase !== "running") return null;
@@ -4159,8 +4168,10 @@ export class HubServer {
         }
         this.state.updateHubSandbox(sandboxId, (s) => {
           s.parkedAt = new Date().toISOString();
+          s.sleepReason = parkSleepReason(request);
         });
         console.log(`[hub] parked sleeping sandbox ${sandboxId} (${sb.project}): its chats are settled — trigger: ${request.trigger}`);
+        this.pushSleepingSandboxViews(sandboxId);
         await this.evictExcessParkedSandboxes(sandboxId);
       }
       return true;
@@ -4345,8 +4356,28 @@ export class HubServer {
     }
   }
 
+  /** Pushes this sandbox's current sleeping/scaling view to open local thread streams and wakes MCP waiters. */
+  private pushSleepingSandboxViews(sandboxId: string): void {
+    const sb = this.state.getHubSandbox(sandboxId);
+    if (!sb) return;
+    for (const threadId of sb.threadIds) {
+      this.mcp.notifyThreadChanged(threadId);
+      if (this.liveLocalThreadSubs(threadId).length === 0) continue;
+      const view = this.sleepingThreadView(threadId, sandboxId);
+      if (view) this.pushLocalThreadSnapshot(threadId, view, !this.readProjectionCache(threadId));
+    }
+  }
+
   /** `delivering`: the chat's held messages are on their way (its VM is waking, or up and taking them). */
   private sleepNotice(sandboxId: string, delivering = false): StatusNotice {
+    const upsize = this.upsizeProgress.get(sandboxId);
+    if (upsize) {
+      return {
+        outcome: "updated",
+        summary: `Scaling this chat's VM from ${upsize.fromSize} to ${upsize.toSize}…`,
+        detail: `Trigger: ${upsize.trigger}. The same disk, worktree, and chat history will resume automatically.`,
+      };
+    }
     // After a Hub restart only the stored failure is left
     const stored = this.state.getHubSandbox(sandboxId)?.wakeFailure;
     const status: WakeStatus | undefined =
@@ -4368,8 +4399,11 @@ export class HubServer {
         detail: status.error,
       };
     }
-    if (this.state.getHubSandbox(sandboxId)?.parkedAt) return { outcome: "updated", summary: PARKED_NOTICE };
-    return { outcome: "updated", summary: SLEEPING_NOTICE };
+    const sb = this.state.getHubSandbox(sandboxId);
+    if (sb?.parkedAt) {
+      return { outcome: "updated", summary: PARKED_NOTICE, ...(sb.sleepReason ? { detail: sb.sleepReason } : {}) };
+    }
+    return { outcome: "updated", summary: SLEEPING_NOTICE, ...(sb?.sleepReason ? { detail: sb.sleepReason } : {}) };
   }
 
   /**
@@ -5574,6 +5608,7 @@ export class HubServer {
         lastActiveAt: now,
         lastHeartbeatAt: now,
         sleepingSince: null,
+        sleepReason: null,
       };
 
       const injected = provisioned.injectedProviderSessions ?? [];
@@ -5826,6 +5861,11 @@ export class HubServer {
         this.unparkedAt.set(sandboxId, Date.now());
         console.log(`[hub] unparked sandbox ${sandboxId}; it counts toward the limit again`);
       }
+      // Only a wake that reached a healthy bridge clears the pause reason; a bridge/settings failure
+      // rolls the record back to sleeping with the reason that paused it still intact.
+      this.state.updateHubSandbox(sandboxId, (s) => {
+        s.sleepReason = null;
+      });
       this.emitWake({ type: "wake-success", sandboxId, threadIds: [...updated.threadIds] });
       return this.state.getHubSandbox(sandboxId) ?? updated;
     } catch (err) {
@@ -5944,7 +5984,7 @@ export class HubServer {
     }
   }
 
-  async sleepHubSandbox(sandboxId: string, opts: { park?: HubParkRequest } = {}): Promise<void> {
+  async sleepHubSandbox(sandboxId: string, opts: { park?: HubParkRequest; reason?: string } = {}): Promise<void> {
     const sb = this.state.getHubSandbox(sandboxId);
     if (!sb) return;
     if (sb.phase === "sleeping" && sb.wakeFailure?.vmPaused === false) {
@@ -5958,7 +5998,7 @@ export class HubServer {
     if (this.inFlightWakes.has(sandboxId)) return;
     const existing = this.inFlightSleeps.get(sandboxId);
     if (existing) return existing;
-    const promise = this.doSleepHubSandbox(sandboxId, opts.park ?? null).finally(() => {
+    const promise = this.doSleepHubSandbox(sandboxId, opts.park ?? null, opts.reason).finally(() => {
       this.inFlightSleeps.delete(sandboxId);
       const after = this.state.getHubSandbox(sandboxId);
       if (after?.phase === "running") {
@@ -5971,9 +6011,10 @@ export class HubServer {
     return promise;
   }
 
-  private async doSleepHubSandbox(sandboxId: string, park: HubParkRequest | null): Promise<void> {
+  private async doSleepHubSandbox(sandboxId: string, park: HubParkRequest | null, reason?: string): Promise<void> {
     const sb = this.state.getHubSandbox(sandboxId);
     if (!sb || sb.phase !== "running" || !this.boat.pause) return;
+    const resolvedReason = reason ?? (park ? parkSleepReason(park) : IDLE_SLEEP_REASON);
     if (!park) console.log(`[hub] pausing idle sandbox ${sandboxId} (${sb.project})`);
     if (park) {
       // Checked before caching every chat's history (a refused park should cost little)...
@@ -6039,6 +6080,7 @@ export class HubServer {
       s.phase = "sleeping";
       s.llmToken = null; // immediately revoke LLM token while sleeping
       s.sleepingSince = now;
+      s.sleepReason = resolvedReason;
       s.parkedAt = park ? now : null;
     });
     this.announceStoppedRuns(sandboxId);
@@ -6212,92 +6254,112 @@ export class HubServer {
 
     // Capture before the stop rewrites live rows to their interrupted projection.
     const interruptedTopLevelThreadIds = this.interruptedTopLevelThreadIds(initial);
+    this.upsizeProgress.set(sandboxId, { fromSize: initial.size, toSize: targetSize, trigger: opts.trigger });
+    this.pushSleepingSandboxViews(sandboxId);
 
-    if (initial.phase === "running") {
-      await this.sleepHubSandbox(sandboxId);
-    }
-    const slept = this.state.getHubSandbox(sandboxId);
-    if (!slept) return { ok: false, skipped: "not-found" };
-    if (slept.phase !== "sleeping") {
-      return { ok: false, skipped: "invalid-phase", error: `Sandbox ${sandboxId} is ${slept.phase}, not sleeping` };
-    }
-    if (slept.size === targetSize) return { ok: false, skipped: "already-target-size" };
-    if (!opts.force && slept.upsizedAt) return { ok: false, skipped: "already-upsized" };
-
-    const previousSize = slept.size;
-    const previousUpsizedFrom = slept.upsizedFrom ?? null;
-    const previousUpsizedAt = slept.upsizedAt ?? null;
-    const upsizedAt = new Date().toISOString();
-    console.log(`[hub] upsizing sandbox ${sandboxId} (${slept.project}) from ${previousSize} to ${targetSize} — trigger: ${opts.trigger}`);
-    this.state.updateHubSandbox(sandboxId, (s) => {
-      s.size = targetSize;
-      s.upsizedFrom = previousSize;
-      s.upsizedAt = upsizedAt;
-    });
-
-    let woken: HubSandboxRecord;
     try {
-      woken = await this.wakeHubSandbox(sandboxId);
-    } catch (err) {
-      // If Boat refuses the target size (e.g. shrink rejected or plan cap) or resume fails,
-      // restore the prior size/upsize metadata so later wakes do not get stuck on the failed size.
+      const initialScaleReason = `Scaling VM from ${initial.size} to ${targetSize} (${opts.trigger})`;
+      if (initial.phase === "running") {
+        await this.sleepHubSandbox(sandboxId, { reason: initialScaleReason });
+      }
+      const slept = this.state.getHubSandbox(sandboxId);
+      if (!slept) return { ok: false, skipped: "not-found" };
+      if (slept.phase !== "sleeping") {
+        return { ok: false, skipped: "invalid-phase", error: `Sandbox ${sandboxId} is ${slept.phase}, not sleeping` };
+      }
+      if (slept.size === targetSize) return { ok: false, skipped: "already-target-size" };
+      if (!opts.force && slept.upsizedAt) return { ok: false, skipped: "already-upsized" };
+
+      const previousSize = slept.size;
+      const previousUpsizedFrom = slept.upsizedFrom ?? null;
+      const previousUpsizedAt = slept.upsizedAt ?? null;
+      const scaleReason = `Scaling VM from ${previousSize} to ${targetSize} (${opts.trigger})`;
+      const progress = this.upsizeProgress.get(sandboxId);
+      if (progress && progress.fromSize !== previousSize) {
+        this.upsizeProgress.set(sandboxId, { fromSize: previousSize, toSize: targetSize, trigger: opts.trigger });
+      }
       this.state.updateHubSandbox(sandboxId, (s) => {
-        if (s.size === targetSize && s.upsizedAt === upsizedAt) {
-          s.size = previousSize;
-          s.upsizedFrom = previousUpsizedFrom;
-          s.upsizedAt = previousUpsizedAt;
-        }
+        if (s.phase === "sleeping") s.sleepReason = scaleReason;
       });
-      throw err;
-    }
-    const continuedThreadIds: string[] = [];
-    const continueErrors: Record<string, string> = {};
-    if (opts.autoContinue !== false && interruptedTopLevelThreadIds.length > 0) {
-      const bridge = await this.ensureBridgeOpen(woken, this.wakeBridgeTimeoutMs);
-      for (const threadId of interruptedTopLevelThreadIds) {
-        const commandId = `cmd_upsize_continue_${sandboxId}_${threadId}_${upsizedAt}`;
-        const messageId = `msg_upsize_continue_${sandboxId}_${threadId}_${upsizedAt}`;
-        const command = {
-          type: "message.dispatch",
-          commandId,
-          threadId,
-          messageId,
-          text:
-            `This chat's Boat VM was automatically scaled from ${previousSize} to ${targetSize} (${opts.trigger}). ` +
-            "The same sandbox disk, worktree, files, and chat history are intact. " +
-            "Please run `git status`, inspect what was in progress, and continue exactly where you left off.",
-          attachments: [],
-          deliveryIntent: "auto",
-          dispatchMode: { type: "start_immediately" },
-          createdBy: "agent",
-          creationSource: "mcp",
-        };
-        try {
-          const exit = await bridge.callUnary("orchestration.dispatchCommand", command, 60_000);
-          if (exit._tag === "Success") {
-            continuedThreadIds.push(threadId);
-          } else {
-            const reason = formatRpcFailure(exit.cause);
+      this.pushSleepingSandboxViews(sandboxId);
+
+      const upsizedAt = new Date().toISOString();
+      console.log(`[hub] upsizing sandbox ${sandboxId} (${slept.project}) from ${previousSize} to ${targetSize} — trigger: ${opts.trigger}`);
+      this.state.updateHubSandbox(sandboxId, (s) => {
+        s.size = targetSize;
+        s.upsizedFrom = previousSize;
+        s.upsizedAt = upsizedAt;
+      });
+
+      let woken: HubSandboxRecord;
+      try {
+        woken = await this.wakeHubSandbox(sandboxId);
+      } catch (err) {
+        // If Boat refuses the target size (e.g. shrink rejected or plan cap) or resume fails,
+        // restore the prior size/upsize metadata so later wakes do not get stuck on the failed size.
+        this.state.updateHubSandbox(sandboxId, (s) => {
+          if (s.size === targetSize && s.upsizedAt === upsizedAt) {
+            s.size = previousSize;
+            s.upsizedFrom = previousUpsizedFrom;
+            s.upsizedAt = previousUpsizedAt;
+          }
+        });
+        throw err;
+      }
+      const continuedThreadIds: string[] = [];
+      const continueErrors: Record<string, string> = {};
+      if (opts.autoContinue !== false && interruptedTopLevelThreadIds.length > 0) {
+        const bridge = await this.ensureBridgeOpen(woken, this.wakeBridgeTimeoutMs);
+        for (const threadId of interruptedTopLevelThreadIds) {
+          const commandId = `cmd_upsize_continue_${sandboxId}_${threadId}_${upsizedAt}`;
+          const messageId = `msg_upsize_continue_${sandboxId}_${threadId}_${upsizedAt}`;
+          const command = {
+            type: "message.dispatch",
+            commandId,
+            threadId,
+            messageId,
+            text:
+              `This chat's Boat VM was automatically scaled from ${previousSize} to ${targetSize} (${opts.trigger}). ` +
+              "The same sandbox disk, worktree, files, and chat history are intact. " +
+              "Please run `git status`, inspect what was in progress, and continue exactly where you left off.",
+            attachments: [],
+            deliveryIntent: "auto",
+            dispatchMode: { type: "start_immediately" },
+            createdBy: "agent",
+            creationSource: "mcp",
+          };
+          try {
+            const exit = await bridge.callUnary("orchestration.dispatchCommand", command, 60_000);
+            if (exit._tag === "Success") {
+              continuedThreadIds.push(threadId);
+            } else {
+              const reason = formatRpcFailure(exit.cause);
+              continueErrors[threadId] = reason;
+              console.warn(`[hub] auto-continue dispatch failed for thread ${threadId} on ${sandboxId}: ${reason}`);
+            }
+          } catch (err) {
+            const reason = err instanceof Error ? err.message : String(err);
             continueErrors[threadId] = reason;
             console.warn(`[hub] auto-continue dispatch failed for thread ${threadId} on ${sandboxId}: ${reason}`);
           }
-        } catch (err) {
-          const reason = err instanceof Error ? err.message : String(err);
-          continueErrors[threadId] = reason;
-          console.warn(`[hub] auto-continue dispatch failed for thread ${threadId} on ${sandboxId}: ${reason}`);
         }
       }
-    }
 
-    return {
-      ok: true,
-      sandboxId,
-      previousSize,
-      targetSize,
-      upsizedAt,
-      continuedThreadIds,
-      continueErrors,
-    };
+      return {
+        ok: true,
+        sandboxId,
+        previousSize,
+        targetSize,
+        upsizedAt,
+        continuedThreadIds,
+        continueErrors,
+      };
+    } finally {
+      // Kept through the wake and every auto-continue dispatch: MCP waiters must never see the
+      // stopped mid-run projection in between and report a premature `interrupted`.
+      this.upsizeProgress.delete(sandboxId);
+      this.pushSleepingSandboxViews(sandboxId);
+    }
   }
 
   async handleWatchdogEvent(payload: WatchdogEventPayload): Promise<void> {
@@ -6319,14 +6381,19 @@ export class HubServer {
           if (unparked !== undefined && Date.now() - unparked < this.unparkHoldMs) break;
           await this.parkHubSandbox(sb.sandboxId, { trigger: "watchdog all-archived" });
         } else if (this.config.boat.archiveAction === "stop") {
-          await this.sleepHubSandbox(sb.sandboxId);
+          await this.sleepHubSandbox(sb.sandboxId, { reason: "Paused after all chats were archived" });
         } else {
           await this.destroyHubSandbox(sb.sandboxId, "chat-settled-or-archived");
         }
         break;
 
       case "idle":
-        await this.sleepHubSandbox(sb.sandboxId);
+        await this.sleepHubSandbox(sb.sandboxId, {
+          reason:
+            payload.detail?.reason === "t3-unreachable"
+              ? "T3 server inside the VM became unreachable (watchdog backstop)"
+              : IDLE_SLEEP_REASON,
+        });
         break;
 
       case "overloaded": {
