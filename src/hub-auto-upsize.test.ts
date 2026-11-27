@@ -119,6 +119,7 @@ describe("autoUpsize config", () => {
       to: "xlarge",
       minAvailableMemPct: 12,
       minLoadPerCpu: 1.5,
+      highLoadPerCpu: 3,
       sustainSecs: 30,
       onOomKill: false,
       autoContinue: false,
@@ -129,10 +130,17 @@ describe("autoUpsize config", () => {
       to: "xxlarge",
       minAvailableMemPct: 15,
       minLoadPerCpu: 2,
+      highLoadPerCpu: 3,
       sustainSecs: 45,
       onOomKill: true,
       autoContinue: true,
     });
+    expect(
+      resolveAutoUpsizeConfig(cfg, { ...cfg.projects["my-app"], autoUpsize: { to: "xxlarge", minLoadPerCpu: 4 } }),
+    ).toMatchObject({ minLoadPerCpu: 4, highLoadPerCpu: 4 });
+    expect(
+      resolveAutoUpsizeConfig(cfg, { ...cfg.projects["my-app"], autoUpsize: { to: "xxlarge", highLoadPerCpu: 0 } }),
+    ).toMatchObject({ minLoadPerCpu: 2, highLoadPerCpu: 0 });
     expect(resolveAutoUpsizeConfig(cfg, { ...cfg.projects["my-app"], autoUpsize: false })).toBeNull();
 
     cfg.boat.autoUpsize = undefined;
@@ -140,6 +148,7 @@ describe("autoUpsize config", () => {
       to: "xxlarge",
       minAvailableMemPct: 15,
       minLoadPerCpu: 2,
+      highLoadPerCpu: 3,
       sustainSecs: 45,
       onOomKill: true,
       autoContinue: true,
@@ -148,18 +157,19 @@ describe("autoUpsize config", () => {
 
   test("loadConfig accepts global and per-project autoUpsize and rejects invalid values", () => {
     const good = loadYaml(
-      `  autoUpsize:\n    to: xlarge\n    minAvailableMemPct: 20\n    minLoadPerCpu: 1.25\n    sustainSecs: 10\n    onOomKill: false\n    autoContinue: false`,
-      `    autoUpsize:\n      to: xxlarge\n      sustainSecs: 15`,
+      `  autoUpsize:\n    to: xlarge\n    minAvailableMemPct: 20\n    minLoadPerCpu: 1.25\n    highLoadPerCpu: 2.5\n    sustainSecs: 10\n    onOomKill: false\n    autoContinue: false`,
+      `    autoUpsize:\n      to: xxlarge\n      highLoadPerCpu: 0\n      sustainSecs: 15`,
     );
-    expect(good.boat.autoUpsize).toMatchObject({ to: "xlarge", minAvailableMemPct: 20, sustainSecs: 10 });
-    expect(good.projects["my-app"].autoUpsize).toMatchObject({ to: "xxlarge", sustainSecs: 15 });
-    expect(resolveAutoUpsizeConfig(good, good.projects["my-app"])).toMatchObject({ to: "xxlarge", sustainSecs: 15 });
+    expect(good.boat.autoUpsize).toMatchObject({ to: "xlarge", minAvailableMemPct: 20, highLoadPerCpu: 2.5, sustainSecs: 10 });
+    expect(good.projects["my-app"].autoUpsize).toMatchObject({ to: "xxlarge", highLoadPerCpu: 0, sustainSecs: 15 });
+    expect(resolveAutoUpsizeConfig(good, good.projects["my-app"])).toMatchObject({ to: "xxlarge", highLoadPerCpu: 0, sustainSecs: 15 });
 
     const invalidGlobalValues = [
       `  autoUpsize:\n    to: ""`,
       `  autoUpsize:\n    to: xlarge\n    minAvailableMemPct: 0`,
       `  autoUpsize:\n    to: xlarge\n    minAvailableMemPct: 100`,
       `  autoUpsize:\n    to: xlarge\n    minLoadPerCpu: 0`,
+      `  autoUpsize:\n    to: xlarge\n    highLoadPerCpu: -1`,
       `  autoUpsize:\n    to: xlarge\n    sustainSecs: 4`,
     ];
     for (const extra of invalidGlobalValues) {
@@ -219,6 +229,52 @@ describe("watchdog overload evaluator", () => {
     expect(evaluateWatchdogOverload(cfg, input({ memTotalKb: null, memAvailableKb: null })).pressure).toBe(false);
   });
 
+  test("sustained high CPU/IO load triggers even with plenty of free RAM unless highLoadPerCpu is 0", () => {
+    const highLoadInput = (patch: Record<string, unknown> = {}) =>
+      input({
+        cpus: 8,
+        memTotalKb: 16 * 1024 * 1024,
+        memAvailableKb: 12 * 1024 * 1024,
+        load1: 24,
+        ...patch,
+      });
+
+    const first = evaluateWatchdogOverload(cfg, highLoadInput({ overloadedSince: null }));
+    expect(first.pressure).toBe(true);
+    expect(first.overloadedSince).toBe(100_000);
+    expect(first.trigger).toBeNull();
+
+    const early = evaluateWatchdogOverload(cfg, highLoadInput({ now: 109_999, overloadedSince: first.overloadedSince }));
+    expect(early.trigger).toBeNull();
+
+    const due = evaluateWatchdogOverload(cfg, highLoadInput({ now: 110_000, overloadedSince: first.overloadedSince }));
+    expect(due.trigger?.reason).toBe("sustained-high-load");
+    expect(due.trigger?.detail).toMatchObject({
+      reason: "sustained-high-load",
+      sustainedSecs: 10,
+      memAvailPct: 75,
+      load1: 24,
+      cpus: 8,
+    });
+
+    // An unresponsive shell under high load with plentiful RAM still reports sustained-high-load (not low-mem).
+    const withFailingShell = evaluateWatchdogOverload(
+      cfg,
+      highLoadInput({ now: 110_000, overloadedSince: first.overloadedSince, shellFailingSince: 95_000 }),
+    );
+    expect(withFailingShell.trigger?.reason).toBe("sustained-high-load");
+
+    // Load dipping below highLoadPerCpu resets the timer when memory is healthy.
+    const cooled = evaluateWatchdogOverload(cfg, highLoadInput({ load1: 16, overloadedSince: first.overloadedSince }));
+    expect(cooled.pressure).toBe(false);
+    expect(cooled.overloadedSince).toBeNull();
+
+    // Setting highLoadPerCpu: 0 disables standalone load-only triggering.
+    const disabled = evaluateWatchdogOverload({ ...cfg, highLoadPerCpu: 0 }, highLoadInput({ load1: 40 }));
+    expect(disabled.pressure).toBe(false);
+    expect(disabled.trigger).toBeNull();
+  });
+
   test("scripts/watchdog.mjs stays self-contained and checks overload before the shell-failure return", () => {
     const script = readFileSync(join(import.meta.dir, "..", "scripts", "watchdog.mjs"), "utf8");
     const imports = [...script.matchAll(/^import .* from "([^"]+)";$/gm)].map((m) => m[1]);
@@ -228,6 +284,8 @@ describe("watchdog overload evaluator", () => {
     expect(script).toContain("/proc/loadavg");
     expect(script).toContain("/proc/vmstat");
     expect(script).toContain("baselineOomKill");
+    expect(script).toContain("DEFAULT_HIGH_LOAD_PER_CPU");
+    expect(script).toContain("sustained-high-load");
     const tickStart = script.indexOf("lastTickAt = now;");
     const firstOverloadCheck = script.indexOf("await checkOverload(now);", tickStart);
     expect(firstOverloadCheck).toBeGreaterThan(tickStart);
@@ -476,6 +534,7 @@ describe("watchdog autoUpsize propagation", () => {
       to: "xlarge",
       minAvailableMemPct: 15,
       minLoadPerCpu: 2,
+      highLoadPerCpu: 3,
       sustainSecs: 5,
       onOomKill: true,
       autoContinue: true,

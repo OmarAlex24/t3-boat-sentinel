@@ -5,6 +5,7 @@
 export interface WatchdogOverloadConfig {
   minAvailableMemPct?: number;
   minLoadPerCpu?: number;
+  highLoadPerCpu?: number;
   sustainSecs?: number;
   onOomKill?: boolean;
 }
@@ -28,13 +29,14 @@ export interface WatchdogOverloadEvaluation {
   memAvailMb: number | null;
   pressure: boolean;
   trigger: {
-    reason: "oom-kill" | "shell-unresponsive-low-mem" | "sustained-pressure";
+    reason: "oom-kill" | "shell-unresponsive-low-mem" | "sustained-pressure" | "sustained-high-load";
     detail: Record<string, unknown>;
   } | null;
 }
 
 const DEFAULT_MIN_AVAILABLE_MEM_PCT = 15;
 const DEFAULT_MIN_LOAD_PER_CPU = 2.0;
+const DEFAULT_HIGH_LOAD_PER_CPU = 3.0;
 const DEFAULT_SUSTAIN_SECS = 180;
 
 export function evaluateWatchdogOverload(
@@ -43,6 +45,7 @@ export function evaluateWatchdogOverload(
 ): WatchdogOverloadEvaluation {
   const minAvailableMemPct = config.minAvailableMemPct ?? DEFAULT_MIN_AVAILABLE_MEM_PCT;
   const minLoadPerCpu = config.minLoadPerCpu ?? DEFAULT_MIN_LOAD_PER_CPU;
+  const highLoadPerCpu = config.highLoadPerCpu ?? Math.max(DEFAULT_HIGH_LOAD_PER_CPU, minLoadPerCpu);
   const sustainSecs = config.sustainSecs ?? DEFAULT_SUSTAIN_SECS;
   const onOomKill = config.onOomKill !== false;
 
@@ -78,8 +81,11 @@ export function evaluateWatchdogOverload(
   }
 
   const lowMemory = memAvailPct !== null && memAvailPct < minAvailableMemPct;
-  const saturatedLoad = input.load1 !== null && input.load1 >= minLoadPerCpu * input.cpus;
-  const pressure = lowMemory && (saturatedLoad || input.shellFailingSince !== null);
+  const saturatedLoad = input.cpus > 0 && input.load1 !== null && input.load1 >= minLoadPerCpu * input.cpus;
+  const highLoad =
+    highLoadPerCpu > 0 && input.cpus > 0 && input.load1 !== null && input.load1 >= highLoadPerCpu * input.cpus;
+  const lowMemPressure = lowMemory && (saturatedLoad || input.shellFailingSince !== null);
+  const pressure = lowMemPressure || highLoad;
   if (!pressure) {
     return { baselineOomKill, overloadedSince: null, memAvailPct, memAvailMb, pressure, trigger: null };
   }
@@ -90,7 +96,12 @@ export function evaluateWatchdogOverload(
     return { baselineOomKill, overloadedSince, memAvailPct, memAvailMb, pressure, trigger: null };
   }
 
-  const reason = input.shellFailingSince !== null ? "shell-unresponsive-low-mem" : "sustained-pressure";
+  const reason =
+    lowMemory && input.shellFailingSince !== null
+      ? "shell-unresponsive-low-mem"
+      : lowMemPressure
+        ? "sustained-pressure"
+        : "sustained-high-load";
   const detail = {
     reason,
     sustainedSecs: Math.floor(sustainedMs / 1000),

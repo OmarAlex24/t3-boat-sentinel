@@ -125,13 +125,15 @@ boat:
   # (default 48 = 2 days; Boat itself drops stopped VM disks after 14 days / 336h)
   parkedTtlHours: 48
   # Optional global default: automatically resize an overloaded Hub chat VM in place (same disk,
-  # worktree, files and chat history). The in-VM watchdog reports sustained memory+CPU pressure or an
-  # OOM kill; sentinel stops the VM, resumes the same sandbox on `to`, and can send a continuation
-  # message to interrupted running chats. At most one automatic upsize per sandbox.
+  # worktree, files and chat history). The in-VM watchdog reports sustained memory+CPU pressure,
+  # sustained high CPU/I/O load, or an OOM kill; sentinel stops the VM, resumes the same sandbox
+  # on `to`, and can send a continuation message to interrupted running chats. At most one
+  # automatic upsize per sandbox.
   # autoUpsize:
   #   to: xlarge              # target Boat machine size (required)
   #   minAvailableMemPct: 15  # trigger below this % of MemAvailable/MemTotal (default 15)
-  #   minLoadPerCpu: 2.0      # and 1-minute load >= this multiple of vCPUs (default 2.0)
+  #   minLoadPerCpu: 2.0      # and 1-minute load >= this multiple of vCPUs while memory is low (default 2.0)
+  #   highLoadPerCpu: 3.0     # or 1-minute load >= this multiple of vCPUs regardless of RAM (default 3.0; 0 disables)
   #   sustainSecs: 180        # sustained pressure required before triggering (default 180, minimum 5)
   #   onOomKill: true         # trigger immediately when /proc/vmstat oom_kill increases (default true)
   #   autoContinue: true      # message interrupted running top-level chats after resume (default true)
