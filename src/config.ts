@@ -14,6 +14,52 @@ export interface SlotConfig {
   size?: string;
 }
 
+export interface AutoUpsizeConfig {
+  /** Target machine size to scale up to (e.g. "xlarge"). */
+  to: string;
+  /** Trigger when MemAvailable falls below this % of MemTotal (default 15). */
+  minAvailableMemPct?: number;
+  /** Trigger when 1-min loadavg >= minLoadPerCpu * vCPUs while memory is low (default 2.0). */
+  minLoadPerCpu?: number;
+  /** Seconds of sustained pressure before triggering (default 180). */
+  sustainSecs?: number;
+  /** Immediately trigger when `/proc/vmstat` `oom_kill` increases (default true). */
+  onOomKill?: boolean;
+  /** Automatically send a continuation message to interrupted active top-level threads after resume (default true). */
+  autoContinue?: boolean;
+}
+
+export interface ResolvedAutoUpsizeConfig {
+  to: string;
+  minAvailableMemPct: number;
+  minLoadPerCpu: number;
+  sustainSecs: number;
+  onOomKill: boolean;
+  autoContinue: boolean;
+}
+
+/**
+ * The effective auto-upsize config of one project. A project object replaces the global object;
+ * `autoUpsize: false` on the project disables the feature even when `boat.autoUpsize` is configured.
+ * Returns null when disabled.
+ */
+export function resolveAutoUpsizeConfig(config: SentinelConfig, project?: ProjectConfig): ResolvedAutoUpsizeConfig | null {
+  const global = config.boat.autoUpsize;
+  const local = project?.autoUpsize;
+  if (local === false) return null;
+  const globalObject = typeof global === "object" ? global : undefined;
+  const raw = local ?? globalObject;
+  if (!raw) return null;
+  return {
+    to: raw.to.trim(),
+    minAvailableMemPct: raw.minAvailableMemPct ?? 15,
+    minLoadPerCpu: raw.minLoadPerCpu ?? 2.0,
+    sustainSecs: raw.sustainSecs ?? 180,
+    onOomKill: raw.onOomKill ?? true,
+    autoContinue: raw.autoContinue ?? true,
+  };
+}
+
 export interface ProjectKlavConfig {
   /** For `klav.mode: "proxy"` (ADR 0036 §4): proxy profiles granted to the sandbox (e.g. ["northflank", "github"]). */
   profiles?: string[];
@@ -81,6 +127,8 @@ export interface ProjectConfig {
   envFile?: string;
   envTarget?: string;
   klav?: ProjectKlavConfig;
+  /** Per-repo automatic VM upsizing override; `false` disables it even when `boat.autoUpsize` is set. */
+  autoUpsize?: AutoUpsizeConfig | false;
   bakeHourUtc?: number;
   /**
    * Hub chats (default true): a new chat VM moves `workdir` to the remote's default branch before
@@ -249,6 +297,8 @@ export interface SentinelConfig {
     sandboxPrefix: string;
     /** Optional files on sentinel uploaded into every spawned VM (never frozen into golden snapshots). */
     injectFiles: InjectFileConfig[];
+    /** Global default automatic VM upsizing; undefined/false disables it unless a project overrides it. */
+    autoUpsize?: AutoUpsizeConfig | false;
   };
   klav?: KlavGlobalConfig;
   llmProxy?: LlmProxyConfig;
@@ -312,6 +362,7 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
       : undefined,
   };
 
+  validateAutoUpsizeConfig(parsed.boat?.autoUpsize, "boat.autoUpsize");
   const boat = {
     bin: parsed.boat?.bin,
     hostVisibility: (parsed.boat?.hostVisibility === "public" ? "public" : "private") as "public" | "private",
@@ -338,6 +389,7 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
           mode: f.mode ?? "600",
         }))
       : [],
+    ...(parsed.boat?.autoUpsize !== undefined ? { autoUpsize: parsed.boat.autoUpsize } : {}),
   };
 
   let klav: KlavGlobalConfig | undefined;
@@ -527,6 +579,7 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
     if (proj.syncToRemoteOnStart !== undefined && typeof proj.syncToRemoteOnStart !== "boolean") {
       throw new Error(`Project "${key}": \`syncToRemoteOnStart\` must be true or false`);
     }
+    validateAutoUpsizeConfig(proj.autoUpsize, `projects.${key}.autoUpsize`);
     if (proj.klav && !klav) {
       throw new Error(`Project "${key}" configures \`klav\`, but top-level \`klav\` config is missing`);
     }
@@ -551,6 +604,41 @@ export function loadConfig(configPath = process.env.SENTINEL_CONFIG ?? "./sentin
     slots,
     projects,
   };
+}
+
+function validateAutoUpsizeConfig(raw: unknown, name: string): void {
+  if (raw === undefined || raw === null || raw === false) return;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`Config "${name}" must be an object or false`);
+  }
+  const cfg = raw as Record<string, unknown>;
+  requireString(cfg.to, `${name}.to`);
+
+  const numberField = (key: "minAvailableMemPct" | "minLoadPerCpu" | "sustainSecs"): number | undefined => {
+    const val = cfg[key];
+    if (val === undefined || val === null) return undefined;
+    if (typeof val !== "number" || !Number.isFinite(val)) {
+      throw new Error(`Config "${name}.${key}" must be a finite number`);
+    }
+    return val;
+  };
+  const minAvailableMemPct = numberField("minAvailableMemPct");
+  if (minAvailableMemPct !== undefined && (minAvailableMemPct <= 0 || minAvailableMemPct >= 100)) {
+    throw new Error(`Config "${name}.minAvailableMemPct" must be greater than 0 and less than 100`);
+  }
+  const minLoadPerCpu = numberField("minLoadPerCpu");
+  if (minLoadPerCpu !== undefined && minLoadPerCpu <= 0) {
+    throw new Error(`Config "${name}.minLoadPerCpu" must be greater than 0`);
+  }
+  const sustainSecs = numberField("sustainSecs");
+  if (sustainSecs !== undefined && sustainSecs < 5) {
+    throw new Error(`Config "${name}.sustainSecs" must be at least 5`);
+  }
+  for (const key of ["onOomKill", "autoContinue"] as const) {
+    if (cfg[key] !== undefined && typeof cfg[key] !== "boolean") {
+      throw new Error(`Config "${name}.${key}" must be true or false`);
+    }
+  }
 }
 
 function optionalPositiveInteger(val: unknown, name: string): number | undefined {

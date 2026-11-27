@@ -9,7 +9,7 @@ import {
   type LegacyBoatClient,
   type SandboxProvider,
 } from "./providers/types.ts";
-import type { ProjectConfig, SentinelConfig } from "./config.ts";
+import type { ProjectConfig, ResolvedAutoUpsizeConfig, SentinelConfig } from "./config.ts";
 import type { KlavClient } from "./klav.ts";
 import { ProviderSessionStore, STAGED_SESSIONS_DIR, type StagedCredential } from "./provider-sessions.ts";
 import {
@@ -35,7 +35,7 @@ const SESSIONS_GROUP = "provider-sessions";
 export interface WatchdogEventPayload {
   slot: string;
   sandboxId: string;
-  event: "all-archived" | "idle" | "heartbeat" | "agent-done" | "needs-input";
+  event: "all-archived" | "idle" | "heartbeat" | "agent-done" | "needs-input" | "overloaded";
   detail?: Record<string, unknown>;
 }
 
@@ -1006,6 +1006,8 @@ export class LifecycleManager {
     watchdogSecret: string;
     llmToken: string | null;
     mintToken: boolean;
+    /** Resolved overload thresholds for the in-VM watchdog; omitted when disabled or already at target size. */
+    autoUpsize?: ResolvedAutoUpsizeConfig | null;
     /**
      * Fresh VMs only: stage stored provider sign-ins (`t3.persistProviderSessions`) so T3 starts
      * signed in. Never set on wake, where the VM's own copy may be newer.
@@ -1065,6 +1067,7 @@ export class LifecycleManager {
         archiveGraceSecs: this.config.boat.archiveGraceSecs,
         deleteWhen: this.config.boat.deleteWhen,
         projectWorkdir: project?.workdir ?? null,
+        ...(opts.autoUpsize ? { autoUpsize: opts.autoUpsize } : {}),
       },
       null,
       2,

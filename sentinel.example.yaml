@@ -124,6 +124,17 @@ boat:
   # Hub: hours to keep a parked (settled) VM before deleting it in Boat and marking its chat read only
   # (default 48 = 2 days; Boat itself drops stopped VM disks after 14 days / 336h)
   parkedTtlHours: 48
+  # Optional global default: automatically resize an overloaded Hub chat VM in place (same disk,
+  # worktree, files and chat history). The in-VM watchdog reports sustained memory+CPU pressure or an
+  # OOM kill; sentinel stops the VM, resumes the same sandbox on `to`, and can send a continuation
+  # message to interrupted running chats. At most one automatic upsize per sandbox.
+  # autoUpsize:
+  #   to: xlarge              # target Boat machine size (required)
+  #   minAvailableMemPct: 15  # trigger below this % of MemAvailable/MemTotal (default 15)
+  #   minLoadPerCpu: 2.0      # and 1-minute load >= this multiple of vCPUs (default 2.0)
+  #   sustainSecs: 180        # sustained pressure required before triggering (default 180, minimum 5)
+  #   onOomKill: true         # trigger immediately when /proc/vmstat oom_kill increases (default true)
+  #   autoContinue: true      # message interrupted running top-level chats after resume (default true)
   # How often sentinel reconciles `boat list --all` to kill orphan sandboxes
   reaperIntervalSecs: 300
   # Optional safety cap in hours for sleeping sandboxes (0 = disabled)
@@ -173,6 +184,11 @@ projects:
   my-app:
     snapshot: env-my-app
     # size: large   # optional per-project override (defaults to boat.defaultSize)
+    # Optional per-repo auto-upsize override. An object replaces boat.autoUpsize for this repo;
+    # use `autoUpsize: false` to keep this repo on its original size even when the global default is set.
+    # autoUpsize:
+    #   to: xlarge
+    #   sustainSecs: 120
     repo: https://github.com/your-org/my-app.git
     workdir: /home/user/my-app
     bakeCmd: |
