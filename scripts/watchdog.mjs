@@ -35,6 +35,7 @@ const MAX_SHELL_FAIL_MS = 20 * 60_000;
 const UPSIZE_NOTIFY_RETRY_MS = 15_000;
 const DEFAULT_MIN_AVAILABLE_MEM_PCT = 15;
 const DEFAULT_MIN_LOAD_PER_CPU = 2.0;
+const DEFAULT_HIGH_LOAD_PER_CPU = 3.0;
 const DEFAULT_SUSTAIN_SECS = 180;
 const LIVE_STATUSES = new Set(["queued", "preparing", "starting", "running", "waiting"]);
 const SELF_SETTLED = new Set(["auth_refresh", "dynamic_tool_call"]);
@@ -154,6 +155,7 @@ function readOomKill() {
 function evaluateOverload(auto, input) {
   const minAvailableMemPct = auto.minAvailableMemPct ?? DEFAULT_MIN_AVAILABLE_MEM_PCT;
   const minLoadPerCpu = auto.minLoadPerCpu ?? DEFAULT_MIN_LOAD_PER_CPU;
+  const highLoadPerCpu = auto.highLoadPerCpu ?? Math.max(DEFAULT_HIGH_LOAD_PER_CPU, minLoadPerCpu);
   const sustainSecs = auto.sustainSecs ?? DEFAULT_SUSTAIN_SECS;
   const onOomKill = auto.onOomKill !== false;
 
@@ -191,8 +193,11 @@ function evaluateOverload(auto, input) {
   }
 
   const lowMemory = memAvailPct !== null && memAvailPct < minAvailableMemPct;
-  const saturatedLoad = input.load1 !== null && input.load1 >= minLoadPerCpu * input.cpus;
-  const pressure = lowMemory && (saturatedLoad || input.shellFailingSince !== null);
+  const saturatedLoad = input.cpus > 0 && input.load1 !== null && input.load1 >= minLoadPerCpu * input.cpus;
+  const highLoad =
+    highLoadPerCpu > 0 && input.cpus > 0 && input.load1 !== null && input.load1 >= highLoadPerCpu * input.cpus;
+  const lowMemPressure = lowMemory && (saturatedLoad || input.shellFailingSince !== null);
+  const pressure = lowMemPressure || highLoad;
   if (!pressure) return { baselineOomKill: baseline, overloadedSince: null, memAvailPct, memAvailMb, pressure, trigger: null };
 
   const nextOverloadedSince = input.overloadedSince ?? input.now;
@@ -201,7 +206,12 @@ function evaluateOverload(auto, input) {
     return { baselineOomKill: baseline, overloadedSince: nextOverloadedSince, memAvailPct, memAvailMb, pressure, trigger: null };
   }
 
-  const reason = input.shellFailingSince !== null ? "shell-unresponsive-low-mem" : "sustained-pressure";
+  const reason =
+    lowMemory && input.shellFailingSince !== null
+      ? "shell-unresponsive-low-mem"
+      : lowMemPressure
+        ? "sustained-pressure"
+        : "sustained-high-load";
   return {
     baselineOomKill: baseline,
     overloadedSince: nextOverloadedSince,

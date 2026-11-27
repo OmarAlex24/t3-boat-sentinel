@@ -21,6 +21,8 @@ export interface AutoUpsizeConfig {
   minAvailableMemPct?: number;
   /** Trigger when 1-min loadavg >= minLoadPerCpu * vCPUs while memory is low (default 2.0). */
   minLoadPerCpu?: number;
+  /** Trigger when 1-min loadavg >= highLoadPerCpu * vCPUs regardless of available RAM (default max(3.0, minLoadPerCpu); 0 disables). */
+  highLoadPerCpu?: number;
   /** Seconds of sustained pressure before triggering (default 180). */
   sustainSecs?: number;
   /** Immediately trigger when `/proc/vmstat` `oom_kill` increases (default true). */
@@ -33,6 +35,7 @@ export interface ResolvedAutoUpsizeConfig {
   to: string;
   minAvailableMemPct: number;
   minLoadPerCpu: number;
+  highLoadPerCpu: number;
   sustainSecs: number;
   onOomKill: boolean;
   autoContinue: boolean;
@@ -50,10 +53,12 @@ export function resolveAutoUpsizeConfig(config: SentinelConfig, project?: Projec
   const globalObject = typeof global === "object" ? global : undefined;
   const raw = local ?? globalObject;
   if (!raw) return null;
+  const minLoadPerCpu = raw.minLoadPerCpu ?? 2.0;
   return {
     to: raw.to.trim(),
     minAvailableMemPct: raw.minAvailableMemPct ?? 15,
-    minLoadPerCpu: raw.minLoadPerCpu ?? 2.0,
+    minLoadPerCpu,
+    highLoadPerCpu: raw.highLoadPerCpu ?? Math.max(3.0, minLoadPerCpu),
     sustainSecs: raw.sustainSecs ?? 180,
     onOomKill: raw.onOomKill ?? true,
     autoContinue: raw.autoContinue ?? true,
@@ -614,7 +619,7 @@ function validateAutoUpsizeConfig(raw: unknown, name: string): void {
   const cfg = raw as Record<string, unknown>;
   requireString(cfg.to, `${name}.to`);
 
-  const numberField = (key: "minAvailableMemPct" | "minLoadPerCpu" | "sustainSecs"): number | undefined => {
+  const numberField = (key: "minAvailableMemPct" | "minLoadPerCpu" | "highLoadPerCpu" | "sustainSecs"): number | undefined => {
     const val = cfg[key];
     if (val === undefined || val === null) return undefined;
     if (typeof val !== "number" || !Number.isFinite(val)) {
@@ -629,6 +634,10 @@ function validateAutoUpsizeConfig(raw: unknown, name: string): void {
   const minLoadPerCpu = numberField("minLoadPerCpu");
   if (minLoadPerCpu !== undefined && minLoadPerCpu <= 0) {
     throw new Error(`Config "${name}.minLoadPerCpu" must be greater than 0`);
+  }
+  const highLoadPerCpu = numberField("highLoadPerCpu");
+  if (highLoadPerCpu !== undefined && highLoadPerCpu < 0) {
+    throw new Error(`Config "${name}.highLoadPerCpu" must be 0 or greater`);
   }
   const sustainSecs = numberField("sustainSecs");
   if (sustainSecs !== undefined && sustainSecs < 5) {
