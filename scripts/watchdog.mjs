@@ -32,6 +32,10 @@ const HEARTBEAT_EVERY_MS = 60_000;
 const CPU_BUSY_CORES = 0.5;
 const CPU_HOLD_MS = 30 * 60_000;
 const MAX_SHELL_FAIL_MS = 20 * 60_000;
+const UPSIZE_NOTIFY_RETRY_MS = 15_000;
+const DEFAULT_MIN_AVAILABLE_MEM_PCT = 15;
+const DEFAULT_MIN_LOAD_PER_CPU = 2.0;
+const DEFAULT_SUSTAIN_SECS = 180;
 const LIVE_STATUSES = new Set(["queued", "preparing", "starting", "running", "waiting"]);
 const SELF_SETTLED = new Set(["auth_refresh", "dynamic_tool_call"]);
 const PERSON_EVENTS = [
@@ -79,12 +83,16 @@ let lastUsedAt = Date.now();
 let lastTickAt = Date.now();
 let lastHeartbeatAt = 0;
 let shellFailingSince = null;
+let overloadedSince = null;
+let upsizeNotified = false;
+let lastUpsizeNotifyAttemptAt = 0;
 let wasAgentWorking = false;
 let eventCursor = null;
 
 const CPU_COUNT = availableParallelism();
 let cpuPrev = readCpu();
 let cpuLoad = 0;
+let baselineOomKill = readOomKill();
 
 function markSawThread() {
   if (!everHadTopLevelThread) {
@@ -110,6 +118,137 @@ function sampleCpu() {
   const usage = total > 0 ? ((now.busy - cpuPrev.busy) / total) * CPU_COUNT : 0;
   cpuPrev = now;
   cpuLoad = cpuLoad * 0.8 + usage * 0.2;
+}
+
+function readMemInfo() {
+  try {
+    const text = readFileSync("/proc/meminfo", "utf8");
+    const total = /^MemTotal:\s+(\d+)\s+kB/m.exec(text);
+    const available = /^MemAvailable:\s+(\d+)\s+kB/m.exec(text);
+    if (!total || !available) return null;
+    return { totalKb: Number(total[1]), availableKb: Number(available[1]) };
+  } catch {
+    return null;
+  }
+}
+
+function readLoadAvg() {
+  try {
+    const load1 = Number(readFileSync("/proc/loadavg", "utf8").trim().split(/\s+/)[0]);
+    return Number.isFinite(load1) ? load1 : null;
+  } catch {
+    return null;
+  }
+}
+
+function readOomKill() {
+  try {
+    const match = /^oom_kill\s+(\d+)$/m.exec(readFileSync("/proc/vmstat", "utf8"));
+    return match ? Number(match[1]) : null;
+  } catch {
+    return null;
+  }
+}
+
+// Mirror of src/watchdog-overload.ts (this file must stay self-contained inside the VM).
+function evaluateOverload(auto, input) {
+  const minAvailableMemPct = auto.minAvailableMemPct ?? DEFAULT_MIN_AVAILABLE_MEM_PCT;
+  const minLoadPerCpu = auto.minLoadPerCpu ?? DEFAULT_MIN_LOAD_PER_CPU;
+  const sustainSecs = auto.sustainSecs ?? DEFAULT_SUSTAIN_SECS;
+  const onOomKill = auto.onOomKill !== false;
+
+  const memAvailPct =
+    input.memTotalKb !== null && input.memTotalKb > 0 && input.memAvailableKb !== null
+      ? (input.memAvailableKb / input.memTotalKb) * 100
+      : null;
+  const memAvailMb = input.memAvailableKb !== null ? input.memAvailableKb / 1024 : null;
+
+  let baseline = input.baselineOomKill;
+  if (baseline === null && input.oomKill !== null) {
+    // The first readable value is the baseline: OOM kills that predate this watchdog never trigger.
+    baseline = input.oomKill;
+  }
+  const oomKillsDelta = input.oomKill !== null && baseline !== null ? input.oomKill - baseline : 0;
+  if (onOomKill && oomKillsDelta > 0) {
+    return {
+      baselineOomKill: baseline,
+      overloadedSince: input.overloadedSince,
+      memAvailPct,
+      memAvailMb,
+      pressure: false,
+      trigger: {
+        reason: "oom-kill",
+        detail: {
+          reason: "oom-kill",
+          oomKillsDelta,
+          memAvailPct,
+          memAvailMb,
+          load1: input.load1,
+          cpus: input.cpus,
+        },
+      },
+    };
+  }
+
+  const lowMemory = memAvailPct !== null && memAvailPct < minAvailableMemPct;
+  const saturatedLoad = input.load1 !== null && input.load1 >= minLoadPerCpu * input.cpus;
+  const pressure = lowMemory && (saturatedLoad || input.shellFailingSince !== null);
+  if (!pressure) return { baselineOomKill: baseline, overloadedSince: null, memAvailPct, memAvailMb, pressure, trigger: null };
+
+  const nextOverloadedSince = input.overloadedSince ?? input.now;
+  const sustainedMs = input.now - nextOverloadedSince;
+  if (sustainedMs < sustainSecs * 1000) {
+    return { baselineOomKill: baseline, overloadedSince: nextOverloadedSince, memAvailPct, memAvailMb, pressure, trigger: null };
+  }
+
+  const reason = input.shellFailingSince !== null ? "shell-unresponsive-low-mem" : "sustained-pressure";
+  return {
+    baselineOomKill: baseline,
+    overloadedSince: nextOverloadedSince,
+    memAvailPct,
+    memAvailMb,
+    pressure,
+    trigger: {
+      reason,
+      detail: {
+        reason,
+        sustainedSecs: Math.floor(sustainedMs / 1000),
+        memAvailPct,
+        memAvailMb,
+        load1: input.load1,
+        cpus: input.cpus,
+      },
+    },
+  };
+}
+
+async function checkOverload(now) {
+  const auto = config.autoUpsize;
+  if (!auto || upsizeNotified) return;
+  const mem = readMemInfo();
+  const evaluation = evaluateOverload(auto, {
+    now,
+    cpus: CPU_COUNT,
+    memTotalKb: mem?.totalKb ?? null,
+    memAvailableKb: mem?.availableKb ?? null,
+    load1: readLoadAvg(),
+    oomKill: readOomKill(),
+    baselineOomKill,
+    shellFailingSince,
+    overloadedSince,
+  });
+  baselineOomKill = evaluation.baselineOomKill;
+  overloadedSince = evaluation.overloadedSince;
+  if (!evaluation.trigger) return;
+  if (lastUpsizeNotifyAttemptAt > 0 && now - lastUpsizeNotifyAttemptAt < UPSIZE_NOTIFY_RETRY_MS) return;
+  lastUpsizeNotifyAttemptAt = now;
+  const ok = await notifySentinel("overloaded", evaluation.trigger.detail);
+  if (ok) {
+    upsizeNotified = true;
+    log(`overload reported to sentinel (${evaluation.trigger.reason}); waiting for upsize stop/resume`);
+  } else {
+    logThrottled("overloaded-failed", `overload callback failed (${evaluation.trigger.reason}); retrying`);
+  }
 }
 
 function waitsOnPerson(thread) {
@@ -277,8 +416,12 @@ async function tick() {
     log("resumed after sleep gap, resetting idle timer");
     lastActivityAt = now;
     lastUsedAt = now;
+    overloadedSince = null;
   }
   lastTickAt = now;
+
+  // Check before touching T3's SQLite: memory/CPU pressure can make even local DB reads stall.
+  await checkOverload(now);
 
   sampleCpu();
   const { personActed, sawCreatedEvent } = readDbActivity();
@@ -295,6 +438,8 @@ async function tick() {
   } catch (err) {
     logThrottled("shell-unavailable", "t3 shell unavailable:", err.message);
     shellFailingSince ??= now;
+    // An overloaded VM often freezes T3's SQLite: evaluate memory/load/OOM pressure before returning.
+    await checkOverload(now);
     // Billing backstop: if T3 server stays unreachable/incompatible for 20m, stop self
     if (now - shellFailingSince >= MAX_SHELL_FAIL_MS) {
       await notifySentinel("idle", { reason: "t3-unreachable" });
@@ -302,6 +447,8 @@ async function tick() {
     }
     return;
   }
+
+  await checkOverload(now);
 
   if (shell.activeTopLevelCount > 0) {
     markSawThread();

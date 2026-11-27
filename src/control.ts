@@ -340,6 +340,37 @@ export class ControlPlane {
         });
       }
 
+      const resizeMatch = /^\/api\/hub\/sandboxes\/([^/]+)\/resize$/.exec(path);
+      if (req.method === "POST" && resizeMatch) {
+        if (!this.hub) return Response.json({ ok: false, error: "Hub is not enabled in sentinel.yaml" }, { status: 400 });
+        const sandboxId = decodeURIComponent(resizeMatch[1]);
+        let body: { size?: unknown; autoContinue?: unknown };
+        try {
+          body = (await req.json()) as { size?: unknown; autoContinue?: unknown };
+        } catch {
+          return Response.json({ ok: false, error: "Invalid JSON body" }, { status: 400 });
+        }
+        const size = typeof body.size === "string" ? body.size.trim() : "";
+        if (!size) {
+          return Response.json({ ok: false, error: 'Missing or invalid required string "size"' }, { status: 400 });
+        }
+        if (body.autoContinue !== undefined && typeof body.autoContinue !== "boolean") {
+          return Response.json({ ok: false, error: '"autoContinue" must be true or false' }, { status: 400 });
+        }
+        if (!this.state.getHubSandbox(sandboxId)) {
+          return Response.json({ ok: false, error: `Hub sandbox "${sandboxId}" not found` }, { status: 404 });
+        }
+        const result = await this.hub.upsizeHubSandbox(sandboxId, size, {
+          trigger: "control-api",
+          autoContinue: body.autoContinue as boolean | undefined,
+          force: true,
+        });
+        if (!result.ok && result.skipped === "not-found") {
+          return Response.json({ ...result, error: result.error ?? `Hub sandbox "${sandboxId}" not found` }, { status: 404 });
+        }
+        return Response.json(result);
+      }
+
       if (req.method === "POST" && path === "/api/projects") {
         const body = (await req.json()) as {
           repo: string;

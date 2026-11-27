@@ -81,6 +81,10 @@ export interface HubSandboxRecord {
    * next successful wake and by an idle sleep.
    */
   parkedAt?: string | null;
+  /** Original machine size before the first upsize of this sandbox. */
+  upsizedFrom?: string | null;
+  /** When this sandbox was upsized; also the guard allowing at most one automatic upsize. */
+  upsizedAt?: string | null;
 }
 
 /** True when the sandbox takes a place under `hub.maxSandboxes`: it exists and is not parked. */
@@ -316,6 +320,8 @@ export class StateStore {
           phase: sb.phase === "provisioning" ? "sleeping" : sb.phase,
           threadIds: Array.isArray(sb.threadIds) ? sb.threadIds : [],
           worktreePaths: Array.isArray(sb.worktreePaths) ? sb.worktreePaths : [],
+          upsizedFrom: typeof sb.upsizedFrom === "string" ? sb.upsizedFrom : null,
+          upsizedAt: typeof sb.upsizedAt === "string" ? sb.upsizedAt : null,
         };
       }
       hub = {
