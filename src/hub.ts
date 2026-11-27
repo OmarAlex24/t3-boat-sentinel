@@ -35,7 +35,7 @@ import {
   type ProjectKlavConfig,
   type SentinelConfig,
 } from "./config.ts";
-import { HubMcpHandler, formatRpcFailure, type HubParkRequest, type HubSandboxPhase } from "./hub-mcp.ts";
+import { DEFAULT_DISPATCH_TIMEOUT_MS, HubMcpHandler, formatRpcFailure, type HubParkRequest, type HubSandboxPhase } from "./hub-mcp.ts";
 import { HubMcpOAuthHandler } from "./hub-mcp-oauth.ts";
 import { isChildThreadRow, parkBlocker } from "./hub-park-guard.ts";
 import { HubStagedAttachmentStore } from "./hub-staged-store.ts";
@@ -1080,6 +1080,8 @@ export class HubServer {
   parkCacheRetries = 5;
   /** How long a park waits for the VM to list its chats (the check before the stop). */
   parkCheckTimeoutMs = 5_000;
+  /** How long MCP `t3_thread_send` waits for a VM's `orchestration.dispatchCommand` before checking/retrying. */
+  mcpDispatchTimeoutMs = DEFAULT_DISPATCH_TIMEOUT_MS;
   private readonly parkCacheMisses = new Map<string, number>();
   /** When each parked VM last woke, by sandbox id (see `unparkHoldMs`). */
   private readonly unparkedAt = new Map<string, number>();
@@ -1277,6 +1279,7 @@ export class HubServer {
             console.error(`[hub-mcp] background bake failed for "${projectKey}":`, err);
           });
         },
+        dispatchTimeoutMs: () => this.mcpDispatchTimeoutMs,
         providerName: () => this.boat.name,
         anyRunningSandbox: () => this.anyRunningSandbox(),
         getCachedProjection: (threadId) => this.readProjectionCache(threadId) ?? undefined,

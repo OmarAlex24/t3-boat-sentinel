@@ -136,6 +136,8 @@ interface FakeVmHandle {
   projections: Map<string, Record<string, unknown>>;
   pushShellUpdate: (thread: Record<string, unknown>) => void;
   setThreadCompleted: (threadId: string, assistantText: string, runId?: string) => void;
+  /** Optional interceptor for `message.dispatch`: return `"drop"` to simulate timeout, `{ fail: string }` to reject, or `undefined` to accept normally. */
+  onMessageDispatch?: (payload: Record<string, unknown>) => "drop" | { fail: string } | undefined;
 }
 
 function startFakeVm(name: string): FakeVmHandle {
@@ -463,6 +465,18 @@ function startFakeVm(name: string): FakeVmHandle {
           const type = String(payload.type ?? "");
           seq += 1;
           if (type === "message.dispatch") {
+            const action = handle.onMessageDispatch?.(payload);
+            if (action === "drop") return;
+            if (action && typeof action === "object" && "fail" in action) {
+              ws.send(
+                JSON.stringify({
+                  _tag: "Exit",
+                  requestId: reqId,
+                  exit: { _tag: "Failure", cause: [{ _tag: "Fail", error: { _tag: "DispatchRejectedError", message: action.fail } }] },
+                }),
+              );
+              return;
+            }
             const runId = `run-${tid}-${seq}`;
             return ok({ sequence: seq, runId, status: payload.dispatchMode === "queue_after_active" ? "queued" : "running" });
           }
@@ -522,7 +536,7 @@ function startFakeVm(name: string): FakeVmHandle {
     },
   });
 
-  return {
+  const handle: FakeVmHandle = {
     server,
     baseUrl: `http://127.0.0.1:${server.port}`,
     vmProjectId,
@@ -532,6 +546,7 @@ function startFakeVm(name: string): FakeVmHandle {
     pushShellUpdate,
     setThreadCompleted,
   };
+  return handle;
 }
 
 function makeHubConfig(stateDir: string): SentinelConfig {
@@ -1420,5 +1435,159 @@ describe("Hub Linked Environment (Native T3 Peer Link)", () => {
     );
     const parkedRow = parkedItem?.snapshot?.threads?.find((t) => t.id === tid);
     expect(parkedRow?.delegatedFrom).toEqual(delegatedFrom);
+  });
+
+  test("t3_thread_send checks projection on timeout, retries with same commandId, and never falls back to a new commandId on steer timeout", async () => {
+    const dir = makeTempDir();
+    const cfg = makeHubConfig(dir);
+    const vm = startFakeVm("safe-send");
+    cleanups.push(() => vm.server.stop(true));
+    const boat = new MiniBoatClient();
+    boat.upstreamBaseUrl = vm.baseUrl;
+    const handle = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+    cleanups.push(() => handle.stop());
+    handle.hub!.mcpDispatchTimeoutMs = 80;
+    const base = `http://127.0.0.1:${handle.server.port}`;
+    const hubHost = cfg.hub!.host;
+    const ownerToken = await pairOwnerClient(base, cfg);
+    const peer = await linkPeerViaOAuth(base, hubHost, ownerToken, "full-access", "Mac Coordinator");
+    const mcp = makeMcpCaller(base, hubHost, peer.accessToken);
+
+    const projList = await mcp.callTool("t3_project_list");
+    const hubProjectId = String(projList.parsedText.projects[0].id);
+    const launch = await mcp.callTool("t3_thread_launch", {
+      projectId: hubProjectId,
+      title: "Overloaded VM Chat",
+      message: "Initial prompt",
+    });
+    expect(launch.result?.isError).toBeFalsy();
+    const tid = String(launch.parsedText.threadId);
+    for (let i = 0; i < 60 && !vm.threads.has(tid); i++) await Bun.sleep(20);
+    expect(vm.threads.has(tid)).toBe(true);
+
+    // Put the thread in idle/completed state for scenarios 1 and 2
+    vm.setThreadCompleted(tid, "Ready");
+
+    // 1. Overloaded VM commits the message even though its dispatchCommand RPC reply times out:
+    //    Hub checks projection, sees messageId landed, and returns success without retrying.
+    const msgDispatches = () => vm.dispatches.filter((d) => d.type === "message.dispatch");
+    const before1 = msgDispatches().length;
+    vm.onMessageDispatch = (payload) => {
+      const p = vm.projections.get(tid) as {
+        messages: Array<Record<string, unknown>>;
+        runs: Array<Record<string, unknown>>;
+      };
+      const now = new Date().toISOString();
+      p.messages.push({ id: payload.messageId, role: "user", text: payload.text, createdAt: now, updatedAt: now });
+      p.runs.push({
+        id: "run-landed-late-1",
+        ordinal: 2,
+        status: "running",
+        userMessageId: payload.messageId,
+        mode: "normal",
+        requestedAt: now,
+        startedAt: now,
+        completedAt: null,
+      });
+      return "drop"; // simulate slow RPC response past Hub timeout
+    };
+    const send1 = await mcp.callTool("t3_thread_send", {
+      threadId: tid,
+      message: "Did this land?",
+      mode: "queue",
+      clientRequestId: "slow-commit-1",
+    });
+    expect(send1.result?.isError).toBeFalsy();
+    expect(send1.parsedText.accepted).toBe(true);
+    expect(send1.parsedText.runId).toBe("run-landed-late-1");
+    expect(msgDispatches().length - before1).toBe(1);
+
+    // 2. Transient timeout where message did NOT land on attempt 1:
+    //    Hub checks projection (not found) and retries with the EXACT SAME commandId and messageId.
+    const before2 = msgDispatches().length;
+    let attempt2 = 0;
+    vm.onMessageDispatch = () => {
+      attempt2 += 1;
+      return attempt2 === 1 ? "drop" : undefined;
+    };
+    const send2 = await mcp.callTool("t3_thread_send", {
+      threadId: tid,
+      message: "Retry safely",
+      mode: "queue",
+      clientRequestId: "transient-drop-2",
+    });
+    expect(send2.result?.isError).toBeFalsy();
+    expect(send2.parsedText.accepted).toBe(true);
+    const sent2 = msgDispatches().slice(before2);
+    expect(sent2).toHaveLength(2);
+    expect(sent2[0].commandId).toBe(sent2[1].commandId);
+    expect(sent2[0].messageId).toBe(sent2[1].messageId);
+
+    // 3. `mode: "auto"` with an active run: `steer_active` times out (transport failure).
+    //    Hub retries with the SAME commandId and NEVER switches to `${baseCmdId}_q` (`queue_after_active`).
+    const runningRow = { ...vm.threads.get(tid)!, activeRunId: "run-active-3", status: "running" };
+    vm.pushShellUpdate(runningRow);
+    const proj3 = vm.projections.get(tid) as { thread: Record<string, unknown>; runs: Array<Record<string, unknown>> };
+    proj3.thread = runningRow;
+    proj3.runs.push({ id: "run-active-3", ordinal: 3, status: "running", mode: "normal", requestedAt: new Date().toISOString() });
+    await Bun.sleep(20);
+
+    const before3 = msgDispatches().length;
+    vm.onMessageDispatch = () => "drop";
+    const send3 = await mcp.callTool("t3_thread_send", {
+      threadId: tid,
+      message: "Steer while overloaded",
+      mode: "auto",
+      clientRequestId: "steer-timeout-3",
+    });
+    expect(send3.result?.isError).toBe(true);
+    const sent3 = msgDispatches().slice(before3);
+    expect(sent3).toHaveLength(2);
+    expect(sent3.every((d) => d.commandId === "cmd_steer-timeout-3")).toBe(true);
+    expect(sent3.every((d) => (d.dispatchMode as { type?: string })?.type === "steer_active")).toBe(true);
+    expect(sent3.some((d) => String(d.commandId).endsWith("_q"))).toBe(false);
+
+    // 4. Caller retries `steer-timeout-3` after the message finally landed late on the VM:
+    //    deterministic messageId + commandId detects it in projection and returns success without duplicating.
+    const lateMsgId = String(sent3[0].messageId);
+    const p3 = vm.projections.get(tid) as { messages: Array<Record<string, unknown>> };
+    p3.messages.push({ id: lateMsgId, role: "user", text: "Steer while overloaded", createdAt: new Date().toISOString() });
+    const before4 = msgDispatches().length;
+    const send3Retry = await mcp.callTool("t3_thread_send", {
+      threadId: tid,
+      message: "Steer while overloaded",
+      mode: "auto",
+      clientRequestId: "steer-timeout-3",
+    });
+    expect(send3Retry.result?.isError).toBeFalsy();
+    expect(send3Retry.parsedText.accepted).toBe(true);
+    expect(send3Retry.parsedText.messageId).toBe(lateMsgId);
+    expect(msgDispatches().length - before4).toBe(1);
+
+    // 5. `mode: "auto"` when VM explicitly rejects `steer_active` (NOT a timeout):
+    //    Hub falls back to `queue_after_active` with `${baseCmdId}_q` and succeeds.
+    const before5 = msgDispatches().length;
+    vm.onMessageDispatch = (payload) => {
+      if ((payload.dispatchMode as { type?: string })?.type === "steer_active") {
+        return { fail: "Active run cannot be steered" };
+      }
+      return undefined;
+    };
+    const send5 = await mcp.callTool("t3_thread_send", {
+      threadId: tid,
+      message: "Queue when steer refused",
+      mode: "auto",
+      clientRequestId: "steer-refused-5",
+    });
+    expect(send5.result?.isError).toBeFalsy();
+    expect(send5.parsedText.accepted).toBe(true);
+    expect(send5.parsedText.delivery).toBe("queued");
+    const sent5 = msgDispatches().slice(before5);
+    expect(sent5).toHaveLength(2);
+    expect(sent5[0].commandId).toBe("cmd_steer-refused-5");
+    expect((sent5[0].dispatchMode as { type?: string })?.type).toBe("steer_active");
+    expect(sent5[1].commandId).toBe("cmd_steer-refused-5_q");
+    expect((sent5[1].dispatchMode as { type?: string })?.type).toBe("queue_after_active");
+    vm.onMessageDispatch = undefined;
   });
 });
