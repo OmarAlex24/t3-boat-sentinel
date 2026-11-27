@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   accessRank,
   authenticateClient,
@@ -34,6 +34,8 @@ const SENDER_THREAD_HEADER = "t3-sender-thread";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
 const MAX_WAIT_TIMEOUT_MS = 45_000;
+export const DEFAULT_DISPATCH_TIMEOUT_MS = 45_000;
+const DISPATCH_CHECK_TIMEOUT_MS = 10_000;
 const DEFAULT_PROVIDER_INSTANCE_ID = "claudeAgent";
 const DEFAULT_MODEL_SLUG = "claude-sonnet-4-6";
 
@@ -149,6 +151,8 @@ export interface HubMcpBridge {
   bindWorktreeToSandbox: (worktreePath: string, sandboxId: string) => void;
   notifyProjectAdded: (projectKey: string) => void;
   startProjectBake: (projectKey: string) => void;
+  /** Timeout for `orchestration.dispatchCommand` when sending a message (defaults to `DEFAULT_DISPATCH_TIMEOUT_MS`). */
+  dispatchTimeoutMs?: () => number;
   providerName: () => string;
   anyRunningSandbox: () => HubSandboxRecord | undefined;
 }
@@ -2343,8 +2347,12 @@ export class HubMcpHandler {
     outputSchema?: Record<string, unknown>,
     linkedSender?: HubDelegatedFrom,
   ): Promise<{ messageId: string; runId: string; status: string; delivery: "started" | "queued" | "steered" | "restarted" }> {
-    const messageId = `msg_${randomUUID().replace(/-/g, "")}`;
+    const messageId = clientRequestId
+      ? `msg_${createHash("sha256").update(`${threadId}:${clientRequestId}`).digest("hex").slice(0, 32)}`
+      : `msg_${randomUUID().replace(/-/g, "")}`;
     const deliveryIntent = mode === "steer" || mode === "restart" ? mode : "auto";
+    const dispatchTimeoutMs = this.bridge.dispatchTimeoutMs?.() ?? DEFAULT_DISPATCH_TIMEOUT_MS;
+    const checkTimeoutMs = Math.min(DISPATCH_CHECK_TIMEOUT_MS, Math.max(1_000, dispatchTimeoutMs));
 
     // Inspect current active run so we send the exact `dispatchMode` T3 Code requires.
     let activeRunId: string | null = null;
@@ -2408,41 +2416,119 @@ export class HubMcpHandler {
       ...(linkedSender ? { linkedSender } : {}),
     });
 
-    const baseCmdId = clientRequestId ? `cmd_${clientRequestId}` : randomUUID();
-    let exit = await this.bridge.callVmUnary(sandboxId, "orchestration.dispatchCommand", makeCmd(baseCmdId, dispatchMode), 12_000);
-    // In `auto` mode, if `steer_active` is rejected (e.g. run finished or provider can't steer), fall back to queue/start.
-    if (exit._tag === "Failure" && mode === "auto" && dispatchMode.type === "steer_active") {
-      const fallbackDm = { type: "queue_after_active" };
-      exit = await this.bridge.callVmUnary(
-        sandboxId,
-        "orchestration.dispatchCommand",
-        makeCmd(`${baseCmdId}_q`, fallbackDm),
-        12_000,
-      );
-      if (exit._tag === "Success") delivery = "queued";
-    }
-    if (exit._tag === "Failure") {
-      throw new HubMcpToolError("orchestration_error", `Failed to send message: ${formatRpcFailure(exit.cause)}`);
-    }
-
-    // Read back the run id created/targeted by this message so RemoteDelegation.followUp tracks the exact run.
-    let runId = delivery === "steered" && activeRunId ? activeRunId : `run_${messageId}`;
-    let status = delivery === "queued" ? "queued" : "starting";
-    const postProj = await this.bridge.callVmUnary(sandboxId, "orchestration.getThreadProjection", { threadId }, 6_000);
-    if (postProj._tag === "Success" && postProj.value && typeof postProj.value === "object") {
-      const runs = Array.isArray((postProj.value as Record<string, unknown>).runs)
-        ? ((postProj.value as Record<string, unknown>).runs as Array<Record<string, unknown>>)
-        : [];
+    const extractResultFromProjection = (
+      proj: Record<string, unknown>,
+      curDelivery: "started" | "queued" | "steered" | "restarted",
+    ): { runId: string; status: string; delivery: "started" | "queued" | "steered" | "restarted" } => {
+      let runId = curDelivery === "steered" && activeRunId ? activeRunId : `run_${messageId}`;
+      let status = curDelivery === "queued" ? "queued" : "starting";
+      let resolvedDelivery = curDelivery;
+      const runs = Array.isArray(proj.runs) ? (proj.runs as Array<Record<string, unknown>>) : [];
+      const turnItems = Array.isArray(proj.turnItems) ? (proj.turnItems as Array<Record<string, unknown>>) : [];
+      const matchedItem = turnItems.find((item) => item.messageId === messageId);
       const matched =
         runs.find((r) => r.userMessageId === messageId) ??
-        (delivery === "steered" && activeRunId ? runs.find((r) => r.id === activeRunId) : undefined) ??
+        (typeof matchedItem?.runId === "string" ? runs.find((r) => r.id === matchedItem.runId) : undefined) ??
+        (curDelivery === "steered" && activeRunId ? runs.find((r) => r.id === activeRunId) : undefined) ??
         runs[runs.length - 1];
       if (matched && typeof matched.id === "string" && matched.id) {
         runId = matched.id;
         if (typeof matched.status === "string" && VALID_THREAD_STATUSES.has(matched.status) && matched.status !== "idle") {
           status = matched.status;
-          if (status === "queued" && delivery === "started") delivery = "queued";
+          if (status === "queued" && resolvedDelivery === "started") resolvedDelivery = "queued";
         }
+      }
+      return { runId, status, delivery: resolvedDelivery };
+    };
+
+    const checkMessageLanded = async (
+      curDelivery: "started" | "queued" | "steered" | "restarted",
+    ): Promise<{ runId: string; status: string; delivery: "started" | "queued" | "steered" | "restarted" } | null> => {
+      const projExit = await this.bridge.callVmUnary(sandboxId, "orchestration.getThreadProjection", { threadId }, checkTimeoutMs);
+      if (projExit._tag !== "Success" || !projExit.value || typeof projExit.value !== "object") return null;
+      const proj = projExit.value as Record<string, unknown>;
+      const messages = Array.isArray(proj.messages) ? (proj.messages as Array<Record<string, unknown>>) : [];
+      const turnItems = Array.isArray(proj.turnItems) ? (proj.turnItems as Array<Record<string, unknown>>) : [];
+      const runs = Array.isArray(proj.runs) ? (proj.runs as Array<Record<string, unknown>>) : [];
+      const landed =
+        messages.some((m) => m.id === messageId) ||
+        turnItems.some((item) => item.messageId === messageId) ||
+        runs.some((r) => r.userMessageId === messageId);
+      if (!landed) return null;
+      return extractResultFromProjection(proj, curDelivery);
+    };
+
+    type DispatchOutcome =
+      | { ok: true; landed: { runId: string; status: string; delivery: "started" | "queued" | "steered" | "restarted" } | null }
+      | { ok: false; transportFailure: boolean; cause: unknown };
+
+    // On a transport failure (timeout/disconnect), the VM may still have committed the message (e.g.
+    // slow SQLite COMMIT under load). Check the thread projection before retrying, and retry with the
+    // exact same commandId so T3 replays its receipt without creating a duplicate message.
+    const sendWithSafeRetry = async (
+      cmdId: string,
+      dm: Record<string, unknown>,
+      curDelivery: "started" | "queued" | "steered" | "restarted",
+    ): Promise<DispatchOutcome> => {
+      const cmd = makeCmd(cmdId, dm);
+      const first = await this.bridge.callVmUnary(sandboxId, "orchestration.dispatchCommand", cmd, dispatchTimeoutMs);
+      if (first._tag === "Success") return { ok: true, landed: null };
+      if (!isRpcTransportFailure(first.cause)) {
+        return { ok: false, transportFailure: false, cause: first.cause };
+      }
+
+      const landedAfterFirst = await checkMessageLanded(curDelivery);
+      if (landedAfterFirst) {
+        return { ok: true, landed: landedAfterFirst };
+      }
+
+      const retry = await this.bridge.callVmUnary(sandboxId, "orchestration.dispatchCommand", cmd, dispatchTimeoutMs);
+      if (retry._tag === "Success") return { ok: true, landed: null };
+      if (!isRpcTransportFailure(retry.cause)) {
+        return { ok: false, transportFailure: false, cause: retry.cause };
+      }
+
+      const landedAfterRetry = await checkMessageLanded(curDelivery);
+      if (landedAfterRetry) {
+        return { ok: true, landed: landedAfterRetry };
+      }
+      return { ok: false, transportFailure: true, cause: retry.cause };
+    };
+
+    const baseCmdId = clientRequestId ? `cmd_${clientRequestId}` : randomUUID();
+    let outcome = await sendWithSafeRetry(baseCmdId, dispatchMode, delivery);
+    // In `auto` mode, only fall back from `steer_active` to `queue_after_active` when the VM
+    // explicitly rejected steering (e.g. run finished or provider can't steer). Never switch to a
+    // different commandId after a timeout/transport failure, or a slow commit would deliver twice.
+    if (!outcome.ok && !outcome.transportFailure && mode === "auto" && dispatchMode.type === "steer_active") {
+      const alreadyLanded = await checkMessageLanded("steered");
+      if (alreadyLanded) {
+        outcome = { ok: true, landed: alreadyLanded };
+      } else {
+        delivery = "queued";
+        outcome = await sendWithSafeRetry(`${baseCmdId}_q`, { type: "queue_after_active" }, delivery);
+      }
+    }
+    if (!outcome.ok) {
+      throw new HubMcpToolError("orchestration_error", `Failed to send message: ${formatRpcFailure(outcome.cause)}`);
+    }
+
+    // Read back the run id created/targeted by this message so RemoteDelegation.followUp tracks the exact run.
+    let runId: string;
+    let status: string;
+    if (outcome.landed) {
+      runId = outcome.landed.runId;
+      status = outcome.landed.status;
+      delivery = outcome.landed.delivery;
+    } else {
+      runId = delivery === "steered" && activeRunId ? activeRunId : `run_${messageId}`;
+      status = delivery === "queued" ? "queued" : "starting";
+      const postProj = await this.bridge.callVmUnary(sandboxId, "orchestration.getThreadProjection", { threadId }, 6_000);
+      if (postProj._tag === "Success" && postProj.value && typeof postProj.value === "object") {
+        const extracted = extractResultFromProjection(postProj.value as Record<string, unknown>, delivery);
+        runId = extracted.runId;
+        status = extracted.status;
+        delivery = extracted.delivery;
       }
     }
 
@@ -3546,6 +3632,22 @@ function extractPullRequests(
     : null;
   const openPullRequestCount = out.filter((p) => p.state !== "merged" && p.state !== "closed").length;
   return { pullRequests: out, linkedPullRequest, openPullRequestCount };
+}
+
+/** True for Hub transport failures (timeout / disconnect / stopped VM), as opposed to a VM refusal. */
+export function isRpcTransportFailure(cause: unknown): boolean {
+  const reasons = Array.isArray(cause) ? cause : cause ? [cause] : [];
+  return reasons.some((r) => {
+    if (!r || typeof r !== "object") return false;
+    const obj = r as Record<string, unknown>;
+    if (obj._tag !== "Die" || typeof obj.defect !== "string") return false;
+    return (
+      obj.defect === "VM not connected" ||
+      obj.defect === "Upstream VM disconnected" ||
+      obj.defect === "Sandbox stopped" ||
+      obj.defect.endsWith(" timed out")
+    );
+  });
 }
 
 /**
