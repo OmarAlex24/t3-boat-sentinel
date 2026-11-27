@@ -466,6 +466,23 @@ function startFakeVm(name: string): FakeVmHandle {
             const runId = `run-${tid}-${seq}`;
             return ok({ sequence: seq, runId, status: payload.dispatchMode === "queue_after_active" ? "queued" : "running" });
           }
+          if (type === "thread.settle") {
+            const existing = threads.get(tid);
+            if (existing) {
+              const now = new Date().toISOString();
+              const updated = {
+                ...existing,
+                updatedAt: now,
+                settled: true,
+                settledAt: now,
+                settledOverride: "settled",
+              };
+              const p = projections.get(tid) as { thread?: Record<string, unknown> } | undefined;
+              if (p) p.thread = updated;
+              pushShellUpdate(updated);
+            }
+            return ok({ sequence: seq });
+          }
           if (type === "thread.stop" || type === "run.interrupt") {
             const existing = threads.get(tid);
             if (existing) {
@@ -1282,5 +1299,126 @@ describe("Hub Linked Environment (Native T3 Peer Link)", () => {
       expect(checked).toBeGreaterThan(0);
       expect(failures).toEqual([]);
     }
+  });
+
+  test("sidebar shell serves delegatedFrom for peer-delegated chats without blocking VM park on settle", async () => {
+    const dir = makeTempDir();
+    const cfg = makeHubConfig(dir);
+    const vm = startFakeVm("sidebar-delegated");
+    cleanups.push(() => vm.server.stop(true));
+    const boat = new MiniBoatClient();
+    boat.upstreamBaseUrl = vm.baseUrl;
+    const handle = createSentinelServer(cfg, boat, { startBackgroundLoops: false });
+    cleanups.push(() => handle.stop());
+    const base = `http://127.0.0.1:${handle.server.port}`;
+    const hubHost = cfg.hub!.host;
+    const ownerToken = await pairOwnerClient(base, cfg);
+    const peer = await linkPeerViaOAuth(base, hubHost, ownerToken, "full-access", "Mac Coordinator");
+
+    const connectShellClient = async () => {
+      const tickRes = await fetch(`${base}/api/auth/websocket-ticket/rpc`, {
+        method: "POST",
+        headers: { host: hubHost, authorization: `Bearer ${ownerToken}` },
+      });
+      expect(tickRes.status).toBe(200);
+      const { ticket } = (await tickRes.json()) as { ticket: string };
+      const ws = new WebSocket(`ws://127.0.0.1:${handle.server.port}/ws?wsTicket=${ticket}&orchestrationProtocol=2`, {
+        headers: { host: hubHost },
+      } as unknown as string[]);
+      cleanups.push(() => ws.close());
+      const inbox: Array<Record<string, unknown>> = [];
+      const waiters: Array<() => void> = [];
+      await new Promise<void>((resolve, reject) => {
+        ws.addEventListener("open", () => resolve());
+        ws.addEventListener("error", () => reject(new Error("hub ws failed")));
+        ws.addEventListener("message", (ev) => {
+          inbox.push(JSON.parse(String(ev.data)) as Record<string, unknown>);
+          for (const w of waiters.splice(0)) w();
+        });
+      });
+      ws.send(JSON.stringify({ _tag: "Request", id: "shell-1", tag: "orchestration.subscribeShell", payload: {} }));
+      const waitForFrame = async (pred: (f: Record<string, unknown>) => boolean, timeoutMs = 5_000) => {
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+          const idx = inbox.findIndex(pred);
+          if (idx >= 0) return inbox.splice(idx, 1)[0];
+          await new Promise<void>((r) => {
+            waiters.push(r);
+            setTimeout(r, 25);
+          });
+        }
+        throw new Error("Timed out waiting for shell frame");
+      };
+      return { ws, waitForFrame };
+    };
+
+    const liveClient = await connectShellClient();
+    await liveClient.waitForFrame(
+      (f) => f._tag === "Chunk" && Array.isArray(f.values) && f.values.some((v) => (v as { kind?: string }).kind === "snapshot"),
+    );
+
+    const delegatedFrom = {
+      environmentId: "env-mac-local",
+      threadId: "coord-thread-1",
+      title: "Master Coordinator",
+    };
+    const mcp = makeMcpCaller(base, hubHost, peer.accessToken);
+    const projList = await mcp.callTool("t3_project_list");
+    const hubProjectId = String(projList.parsedText.projects[0].id);
+
+    const launch = await mcp.callTool("t3_thread_launch", {
+      projectId: hubProjectId,
+      title: "Phase 1 Worker",
+      message: "Implement phase 1",
+      delegatedFrom,
+    });
+    expect(launch.result?.isError).toBeFalsy();
+    const tid = String(launch.parsedText.threadId);
+
+    // 1. Live subscribed sidebar client sees delegatedFrom on the streamed thread.updated item
+    const liveUpdate = await liveClient.waitForFrame(
+      (f) =>
+        f._tag === "Chunk" &&
+        Array.isArray(f.values) &&
+        f.values.some(
+          (v) =>
+            (v as { kind?: string; thread?: { id?: string } }).kind === "thread.updated" &&
+            (v as { thread?: { id?: string } }).thread?.id === tid,
+        ),
+    );
+    const liveItem = (liveUpdate.values as Array<{ kind?: string; thread?: Record<string, unknown> }>).find(
+      (v) => v.kind === "thread.updated" && v.thread?.id === tid,
+    );
+    expect(liveItem?.thread?.delegatedFrom).toEqual(delegatedFrom);
+
+    // 2. Fresh reconnect snapshot also serves delegatedFrom on the thread row
+    const snapshotClient = await connectShellClient();
+    const snapFrame = await snapshotClient.waitForFrame(
+      (f) => f._tag === "Chunk" && Array.isArray(f.values) && f.values.some((v) => (v as { kind?: string }).kind === "snapshot"),
+    );
+    const snapItem = (snapFrame.values as Array<{ kind?: string; snapshot?: { threads?: Array<Record<string, unknown>> } }>).find(
+      (v) => v.kind === "snapshot",
+    );
+    const snapRow = snapItem?.snapshot?.threads?.find((t) => t.id === tid);
+    expect(snapRow?.delegatedFrom).toEqual(delegatedFrom);
+
+    // 3. Complete and settle the delegated chat: its own VM must still park (stored row stays top-level)
+    vm.setThreadCompleted(tid, "Phase 1 complete");
+    const settled = await mcp.callTool("t3_thread_organize", { threadId: tid, action: "settle" });
+    expect(settled.result?.isError).toBeFalsy();
+    expect(settled.parsedText.sandboxParked).toBe(true);
+    const sb = handle.state.listHubSandboxes().find((s) => s.threadIds.includes(tid));
+    expect(sb?.parkedAt).toBeTruthy();
+
+    // 4. Parked snapshot still carries delegatedFrom for the sidebar
+    const parkedClient = await connectShellClient();
+    const parkedFrame = await parkedClient.waitForFrame(
+      (f) => f._tag === "Chunk" && Array.isArray(f.values) && f.values.some((v) => (v as { kind?: string }).kind === "snapshot"),
+    );
+    const parkedItem = (parkedFrame.values as Array<{ kind?: string; snapshot?: { threads?: Array<Record<string, unknown>> } }>).find(
+      (v) => v.kind === "snapshot",
+    );
+    const parkedRow = parkedItem?.snapshot?.threads?.find((t) => t.id === tid);
+    expect(parkedRow?.delegatedFrom).toEqual(delegatedFrom);
   });
 });

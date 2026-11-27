@@ -3128,7 +3128,12 @@ export class HubServer {
     this.persistPendingLaunch(pending.record);
     this.pinStagedAttachments(payload);
     const sequence = this.state.nextHubSequence();
-    this.broadcastShellItem({ kind: "thread.updated", sequence, location: "active", thread: placeholder.shell });
+    this.broadcastShellItem({
+      kind: "thread.updated",
+      sequence,
+      location: "active",
+      thread: this.servedShellRow(input.threadId, placeholder.shell),
+    });
     console.log(`[hub] chat ${input.threadId} answered at once; booting its VM in the background (project=${projectKey})`);
     void this.runPendingLaunch(pending);
     return { pending, sequence };
@@ -3289,7 +3294,7 @@ export class HubServer {
       kind: "thread.updated",
       sequence: this.state.nextHubSequence(),
       location: "active",
-      thread: failed.shell,
+      thread: this.servedShellRow(threadId, failed.shell),
     });
     this.pushLocalThreadSnapshot(threadId, failed.projection);
     pending.rejectReady(new Error(message));
@@ -4359,10 +4364,16 @@ export class HubServer {
   /**
    * A chat's sidebar row as the Hub serves it. A run its stopped VM was in the middle of is shown
    * ended, as the VM itself shows it once it wakes (T3 restarts and the run is dead), so the app sends
-   * a new message instead of waiting on a turn that will never finish. The stored row is unchanged.
+   * a new message instead of waiting on a turn that will never finish. A chat launched over a peer
+   * link with `delegatedFrom` carries that provenance so T3 nests it under its parent in the sidebar.
+   * The stored row is unchanged so parking and close guards keep treating the VM's top-level chat as
+   * its own (not a sub-thread of another chat on the same VM).
    */
   private servedShellRow(threadId: string, row: Record<string, unknown>): Record<string, unknown> {
-    return this.vmIsStopped(threadId) && wasStoppedMidRun(row) ? withStoppedRunShell(row) : row;
+    const base = this.vmIsStopped(threadId) && wasStoppedMidRun(row) ? withStoppedRunShell(row) : row;
+    if (base.delegatedFrom !== undefined) return base;
+    const delegatedFrom = this.state.getHub()?.threadLinkOrigins?.[threadId]?.delegatedFrom;
+    return delegatedFrom ? { ...base, delegatedFrom } : base;
   }
 
   /** After a VM stopped: chats it stopped mid-run are shown ended, in the sidebar and in open views. */
@@ -6309,7 +6320,7 @@ export class HubServer {
               kind: "thread.updated",
               sequence: this.state.nextHubSequence(),
               location: "active",
-              thread: rewritten,
+              thread: this.servedShellRow(tid, rewritten),
             });
           }
         }
@@ -6337,7 +6348,7 @@ export class HubServer {
           kind: "thread.updated",
           sequence: this.state.nextHubSequence(),
           location: item.location ?? "active",
-          thread: rewritten,
+          thread: this.servedShellRow(tid, rewritten),
         });
       } else if (item.kind === "thread.removed" && typeof item.threadId === "string") {
         if (item.location !== "archive") this.deleteThreadShell(item.threadId);
