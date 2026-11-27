@@ -6323,9 +6323,6 @@ export class HubServer {
         if (s.phase === "sleeping") s.sleepReason = scaleReason;
       });
       this.pushSleepingSandboxViews(sandboxId);
-      // Boat's `stop` returns while the VM is still stopping; resuming then fails with `sandbox_stopping`.
-      // Waited for before the new size is recorded, so a VM stuck stopping needs no rollback.
-      await this.waitForSandboxStopped(sandboxId);
 
       const upsizedAt = new Date().toISOString();
       console.log(`[hub] upsizing sandbox ${sandboxId} (${slept.project}) from ${previousSize} to ${targetSize} — trigger: ${opts.trigger}`);
@@ -6337,6 +6334,9 @@ export class HubServer {
 
       let woken: HubSandboxRecord;
       try {
+        // Boat's `stop` returns while the VM is still stopping; resuming then fails with `sandbox_stopping`.
+        // Waited for after the new size is recorded, so a wake arriving meanwhile resumes at the target size.
+        await this.waitForSandboxStopped(sandboxId);
         woken = await this.wakeHubSandbox(sandboxId);
       } catch (err) {
         // If Boat refuses the target size (e.g. shrink rejected or plan cap) or resume fails,

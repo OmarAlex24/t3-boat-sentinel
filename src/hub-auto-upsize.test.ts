@@ -707,6 +707,21 @@ describe("resume after a stop that is still stopping", () => {
     expect(record.wakeFailure ?? null).toBeNull();
   });
 
+  test("a wake that arrives while the upsize waits for the stop resumes at the target size", async () => {
+    const { handle, boat } = await setupHub();
+    handle.hub!.stopSettlePollMs = 5;
+    boat.stopPolls = 10;
+
+    const upsize = handle.hub!.upsizeHubSandbox("sb-1", "xlarge", { trigger: "test" });
+    await waitFor(() => boat.stopped.length > 0 && handle.state.getHubSandbox("sb-1")!.phase === "sleeping");
+    const wake = handle.hub!.wakeHubSandbox("sb-1");
+    const [result] = await Promise.all([upsize, wake]);
+
+    expect(result.ok).toBe(true);
+    expect(boat.resumed).toEqual([{ id: "sb-1", size: "xlarge" }]);
+    expect(handle.state.getHubSandbox("sb-1")).toMatchObject({ size: "xlarge", phase: "running" });
+  });
+
   test("a wake right after a sleep retries the refused resume once the stop finishes", async () => {
     const { handle, boat } = await setupHub();
     handle.hub!.stopSettlePollMs = 5;
